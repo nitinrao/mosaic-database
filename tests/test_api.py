@@ -3493,6 +3493,138 @@ def test_deploy_check_grammar_rejects_unbounded_functions():
     main.validate_check_expression("(id IN (1, 2, 3) OR id IS NULL) AND NOT active = false")
 
 
+def test_deploy_check_sql_is_reconstructed_from_validated_tokens():
+    operations = [
+        main.AddConstraintOperation(
+            op="add_constraint",
+            table="events",
+            kind="check",
+            expression="lower(name) = 'alice' AND id BETWEEN 1 AND 10",
+        )
+    ]
+    assert main.compile_deploy_operations(operations) == [
+        'ALTER TABLE "events" ADD CONSTRAINT "ck_events_0013468987" '
+        "CHECK (lower(name) = 'alice' AND id BETWEEN 1 AND 10)"
+    ]
+
+
+def test_apply_retry_does_not_schedule_a_second_task(client, monkeypatch):
+    created, database, branch = _deploy_database(client, monkeypatch)
+    headers = {"X-API-Key": created["api_key"]}
+    deploy = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys",
+        headers=headers,
+        json={
+            "branch": branch["id"],
+            "operations": [{"op": "create_table", "name": "events", "columns": [{"name": "id", "type": "bigint"}]}],
+        },
+    ).json()
+    calls = []
+    monkeypatch.setattr(main, "_apply_deploy", lambda deploy_id, tid: calls.append((deploy_id, tid)))
+    path = f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys/{deploy['id']}/apply"
+    first = client.post(path, headers=headers)
+    second = client.post(path, headers=headers)
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert calls == [(deploy["id"], created["tenant_id"])]
+
+
+def test_apply_terminal_deploy_returns_conflict_and_runs_once(client, monkeypatch):
+    created, database, branch = _deploy_database(client, monkeypatch)
+    headers = {"X-API-Key": created["api_key"]}
+    deploy = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys",
+        headers=headers,
+        json={
+            "branch": branch["id"],
+            "operations": [{"op": "create_table", "name": "events", "columns": [{"name": "id", "type": "bigint"}]}],
+        },
+    ).json()
+
+    class Connection:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement, params=()):
+            self.statements.append(statement)
+            return self
+
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
+        def close(self):
+            return None
+
+    connection = Connection()
+
+    class FakePsycopg:
+        def connect(self, **kwargs):
+            return connection
+
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    path = f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys/{deploy['id']}/apply"
+    first = client.post(path, headers=headers)
+    second = client.post(path, headers=headers)
+    assert first.status_code == 202
+    assert second.status_code == 409
+    assert connection.statements.count('CREATE TABLE "events" ("id" bigint)') == 1
+    failed = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys",
+        headers=headers,
+        json={
+            "branch": branch["id"],
+            "operations": [{"op": "create_table", "name": "other", "columns": [{"name": "id", "type": "bigint"}]}],
+        },
+    ).json()
+    c = main.db()
+    c.execute("UPDATE deploy_requests SET status='failed' WHERE id=?", (failed["id"],))
+    c.commit()
+    c.close()
+    failed_retry = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys/{failed['id']}/apply",
+        headers=headers,
+    )
+    assert failed_retry.status_code == 409
+
+
+def test_apply_early_return_closes_control_plane_connection(client, monkeypatch):
+    created, database, branch = _deploy_database(client, monkeypatch)
+    headers = {"X-API-Key": created["api_key"]}
+    deploy = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys",
+        headers=headers,
+        json={
+            "branch": branch["id"],
+            "operations": [{"op": "create_table", "name": "events", "columns": [{"name": "id", "type": "bigint"}]}],
+        },
+    ).json()
+    c = main.db()
+    c.execute("UPDATE deploy_requests SET status='applied' WHERE id=?", (deploy["id"],))
+    c.commit()
+    c.close()
+    original = main.db()
+
+    class TrackingConnection:
+        def __init__(self, connection):
+            self.connection = connection
+            self.closed = False
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+        def close(self):
+            self.closed = True
+            self.connection.close()
+
+    tracked = TrackingConnection(original)
+    monkeypatch.setattr(main, "db", lambda: tracked)
+    main._apply_deploy(deploy["id"], created["tenant_id"])
+    assert tracked.closed is True
+
+
 def test_stranded_deploy_lease_is_recovered_and_branch_reaped(tmp_path, monkeypatch):
     main.DB_PATH = tmp_path / "lease-recovery.db"
     c = main.db()
