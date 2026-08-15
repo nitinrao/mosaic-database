@@ -22,7 +22,13 @@ MOSAIC_NODE_AGENT_TOKEN=<shared-internal-token>
 Every configured node must have an explicit private address. Public host
 addresses are not inferred, and PostgreSQL never binds to `0.0.0.0`.
 The node agent exposes lifecycle operations only through its authenticated
-internal API. Existing branch rows migrate to the `local` node.
+internal API. Agent traffic is plaintext HTTP carrying the shared token, so
+the agent listener and firewall must be confined to the private peer network;
+it must not be exposed on a public interface. Requests are rejected unless
+they arrive from loopback or one of the configured private node addresses.
+The node agent does not access the control-plane ledger; the control plane
+passes operation details and remains the only ledger writer. Existing branch
+rows migrate to the `local` node.
 
 V0 remains single-primary per host with no HA, PITR, or DR promise.
 Replication across the three production pools is a follow-up, not built here.

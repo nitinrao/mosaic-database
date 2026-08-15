@@ -184,6 +184,27 @@ def test_placement_is_deterministic(monkeypatch):
     assert first in {"sv1", "sv2", "sv3"}
 
 
+def test_unknown_branch_host_does_not_resolve_to_loopback(monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local")
+    with pytest.raises(RuntimeError, match="unknown database node"):
+        main.node_address("mch-sv2")
+
+
+def test_hba_managed_block_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "sv1,sv2")
+    monkeypatch.setenv("MOSAIC_NODE_PRIVATE_ADDRESSES", "sv1=10.0.0.1,sv2=10.0.0.2")
+    (tmp_path / "postgresql.conf").write_text("")
+    hba = tmp_path / "pg_hba.conf"
+    hba.write_text("local all all trust\n")
+    main._rewrite_postgres_config(tmp_path, 55432, "sv1")
+    main._rewrite_postgres_config(tmp_path, 55432, "sv1")
+    text = hba.read_text()
+    assert text.count("# BEGIN MOSAIC DATABASE PEERS") == 1
+    assert text.count("# END MOSAIC DATABASE PEERS") == 1
+    assert text.count("host all postgres 10.0.0.1/32 scram-sha-256") == 1
+    assert text.count("host all postgres 10.0.0.2/32 scram-sha-256") == 1
+
+
 def test_existing_ledger_migrates_branch_host(tmp_path):
     path = tmp_path / "legacy.db"
     raw = main.sqlite3.connect(path)
@@ -221,7 +242,7 @@ def test_query_routes_to_non_local_branch(client, monkeypatch):
         def call(self, node_id, operation, payload):
             assert node_id == "sv2"
             assert operation == "start"
-            return {"status": "running"}
+            return {"status": "running", "pid": 1234}
 
     class Description:
         name = "answer"
