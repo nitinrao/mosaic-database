@@ -1,13 +1,56 @@
 # Deployment
 
-Production storage uses the documented `mosaic/db` ZFS dataset mounted at
-`/var/lib/mosaic-database`. Configure:
+Mosaic Database is provisioned on three Proxmox hosts:
+
+| Host | Address |
+| --- | --- |
+| `mch-sv1` | `152.236.1.61` |
+| `mch-sv2` | `152.236.1.51` |
+| `mch-sv3` | `206.223.239.247` |
+
+Each host runs Proxmox 9.2 with kernel `7.0.14-8-pve`, ZFS
+`2.4.3-pve1`, 32 cores, and 125 GB RAM. The hosts also run the
+Mosaic ClickHouse cluster and its control-plane PostgreSQL container. That
+workload remains on the approximately 94 GB root LV; Mosaic Database uses the
+dedicated ZFS pool below.
+
+## Storage
+
+Each host has a `mosaic` pool built as a mirror of `nvme2n1` and `nvme3n1`,
+the two 1.9 TB Micron 7450 NVMe devices referenced through
+`/dev/disk/by-id`. The pool has 1.68 TB usable capacity and these properties:
+
+- `ashift=12`
+- `compression=lz4`
+- `atime=off`
+- `xattr=sa`
+- `acltype=posixacl`
+- `recordsize=8k`
+- `logbias=throughput`
+- `mountpoint=none`
+- `autotrim=on`
+
+The `mosaic/db` dataset is mounted at `/var/lib/mosaic-database`. Configure
+the service with:
 
 ```text
 MOSAIC_BRANCH_ROOT=/var/lib/mosaic-database
 MOSAIC_BRANCH_ENGINE=zfs
 MOSAIC_ZFS_POOL=mosaic/db
 ```
+
+Branches therefore use datasets and mountpoints of the form:
+
+```text
+mosaic/db/<database>/<branch>
+/var/lib/mosaic-database/<database>/<branch>
+```
+
+This matches the ZFS mountpoint contract implemented by the service. The
+remaining 447 GB of NVMe capacity on each host is unpartitioned and
+unclaimed.
+
+## Nodes
 
 The host-aware control plane defaults to one `local` node and loopback-only
 PostgreSQL. For multiple nodes, set `MOSAIC_NODE_HOSTS` to comma-separated
@@ -29,6 +72,32 @@ they arrive from loopback or one of the configured private node addresses.
 The node agent does not access the control-plane ledger; the control plane
 passes operation details and remains the only ledger writer. Existing branch
 rows migrate to the `local` node.
+
+## Co-tenancy
+
+ZFS ARC is capped at 8 GiB through
+`/etc/modprobe.d/zfs.conf` (`options zfs zfs_arc_max=8589934592`), and the
+cap is applied live.
+
+`/etc/systemd/system/mosaic-database.slice` defines:
+
+```text
+CPUWeight=50
+CPUQuota=800%
+MemoryHigh=24G
+MemoryMax=32G
+IOWeight=50
+TasksMax=4096
+```
+
+PostgreSQL units must set `Slice=mosaic-database.slice` to join it.
+
+## Boot and availability
+
+`zfs-import-cache`, `zfs-mount`, and `zfs.target` are enabled, so the pools
+import and mount during boot.
+
+## V0 boundaries
 
 V0 remains single-primary per host with no HA, PITR, or DR promise.
 Replication across the three production pools is a follow-up, not built here.
