@@ -558,6 +558,36 @@ def test_replication_loop_survives_reconciliation_error(tmp_path, monkeypatch):
     assert calls["reconcile"] == 1
 
 
+def test_replication_loop_survives_ledger_connection_error(monkeypatch):
+    calls = {"sleep": 0, "db": 0, "reconcile": 0}
+
+    async def fake_sleep(_):
+        calls["sleep"] += 1
+        if calls["sleep"] > 2:
+            raise asyncio.CancelledError
+
+    class Connection:
+        def close(self):
+            return None
+
+    def fake_db():
+        calls["db"] += 1
+        if calls["db"] == 1:
+            raise RuntimeError("ledger unavailable")
+        return Connection()
+
+    def fake_reconcile(connection):
+        calls["reconcile"] += 1
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(main, "db", fake_db)
+    monkeypatch.setattr(main, "reconcile_replicas", fake_reconcile)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(main._replication_loop())
+    assert calls["db"] == 2
+    assert calls["reconcile"] == 1
+
+
 def test_repeated_primary_preparation_is_idempotent(tmp_path, monkeypatch):
     root = tmp_path / "branches"
     root.mkdir()

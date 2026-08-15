@@ -903,15 +903,19 @@ async def _reaper_loop():
 
 async def _replication_loop():
     while True:
-        await asyncio.sleep(max(1, int(os.getenv("MOSAIC_REPLICATION_RETRY_INTERVAL", "10"))))
-        c = db()
         try:
+            await asyncio.sleep(max(1, int(os.getenv("MOSAIC_REPLICATION_RETRY_INTERVAL", "10"))))
+            c = db()
             try:
                 reconcile_replicas(c)
             except Exception:
-                pass
-        finally:
-            c.close()
+                logger.exception("replica reconciliation failed")
+            finally:
+                c.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("replication loop iteration failed")
 
 
 def reap_branches(c: Conn) -> int:
