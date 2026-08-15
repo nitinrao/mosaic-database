@@ -333,6 +333,104 @@ def test_reaper_loop_invalid_interval_still_yields(monkeypatch):
     assert calls["sleep"] == 2
 
 
+def test_standby_build_argv(tmp_path, monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2")
+    monkeypatch.setenv("MOSAIC_NODE_PRIVATE_ADDRESSES", "local=10.0.0.1,sv2=10.0.0.2")
+    target = tmp_path / "standby"
+    target.mkdir()
+    (target / "postgresql.conf").write_text("")
+    (target / "pg_hba.conf").write_text("")
+    calls = []
+    main.NodeAgent(calls.append).handle("build_standby", {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "sv2",
+        "primary_address": "10.0.0.1",
+        "primary_port": 55432,
+        "replication_user": "mosaic_repl_db",
+        "replication_password": "secret",
+        "replication_slot": "mosaic_db_sv2",
+    })
+    assert calls[0] == [
+        main.pg_bin("pg_basebackup"), "-D", str(target), "-h", "10.0.0.1",
+        "-p", "55432", "-U", "mosaic_repl_db", "-Fp", "-X", "stream", "-R",
+        "-S", "mosaic_db_sv2",
+    ]
+    assert calls[1] == [
+        main.pg_bin("pg_ctl"), "-D", str(target), "-l",
+        str(target / "postgres.log"), "-w", "start",
+    ]
+
+
+def test_reaper_ignores_standbys(tmp_path, monkeypatch):
+    main.DB_PATH = tmp_path / "reaper-replica.db"
+    c = main.db()
+    main.initialize_schema(c)
+    c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_r", "r", "shared", "h", "active", main.now()))
+    c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_r", "ten_r", "r", str(tmp_path), "ready", main.now()))
+    old = "2000-01-01T00:00:00+00:00"
+    c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("br_r", "db_r", "main", None, str(tmp_path / "main"), 55432, 123, "running", "x", old, old, "local"))
+    c.execute("INSERT INTO replicas VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("rep_r", "db_r", "br_r", "sv2", str(tmp_path / "standby"), 55433, "ready", 99, old, old, "slot_r"))
+    c.commit()
+    calls = []
+
+    class FakeTransport:
+        def call(self, host_id, operation, payload):
+            calls.append((host_id, operation, payload))
+            return {"status": "stopped", "pid": None}
+
+    monkeypatch.setattr(main, "node_transport", FakeTransport())
+    assert main.reap_branches(c) == 1
+    assert len(calls) == 1 and calls[0][1] == "stop"
+    assert c.execute("SELECT status FROM replicas").fetchone()["status"] == "ready"
+    c.close()
+
+
+def test_replica_lag_surfaces_through_api(client, monkeypatch):
+    created = tenant(client)
+    database = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "lag"},
+    ).json()
+    c = main.db()
+    main_row = c.execute("SELECT * FROM branches WHERE database_id=?", (database["id"],)).fetchone()
+    c.execute("UPDATE branches SET host_id='local' WHERE id=?", (main_row["id"],))
+    c.execute(
+        "INSERT INTO replication_credentials VALUES(?,?,?,?)",
+        (database["id"], "mosaic_repl_lag", main.cipher().encrypt(b"repl").decode(), main.now()),
+    )
+    c.execute(
+        "INSERT INTO replicas VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("rep_lag", database["id"], main_row["id"], "sv2", "/standby", 55433, "ready", None, None, main.now(), "slot_lag"),
+    )
+    c.commit()
+    c.close()
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2")
+    monkeypatch.setenv("MOSAIC_NODE_PRIVATE_ADDRESSES", "local=10.0.0.1,sv2=10.0.0.2")
+
+    class FakeTransport:
+        def call(self, host_id, operation, payload):
+            assert operation == "inspect_replication"
+            return {"sampled_at": "2025-01-01T00:00:00+00:00", "replicas": [{"client_addr": "10.0.0.2", "lag_bytes": 42}]}
+
+    monkeypatch.setattr(main, "node_transport", FakeTransport())
+    response = client.get(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/replicas",
+        headers={"X-API-Key": created["api_key"]},
+    )
+    assert response.status_code == 200
+    assert response.json()["replicas"][0]["lag_bytes"] == 42
+    assert response.json()["lag_unit"] == "bytes behind primary WAL replay position"
+
+
+def test_plaintext_remote_transport_requires_opt_out(monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2=http://10.0.0.2:8000")
+    monkeypatch.setattr(main, "ALLOW_PLAINTEXT_NODE_AGENT", False)
+    with pytest.raises(RuntimeError, match="plaintext node-agent transport"):
+        main.NodeTransport(main.NodeAgent()).call("sv2", "inspect", {})
+
+
 def test_existing_ledger_migrates_branch_host(tmp_path):
     path = tmp_path / "legacy.db"
     raw = main.sqlite3.connect(path)

@@ -9,6 +9,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -46,6 +47,10 @@ PORT_MIN = int(os.getenv("MOSAIC_POSTGRES_PORT_MIN", "55432"))
 RATE_LIMIT_REQUESTS = int(os.getenv("MOSAIC_RATE_LIMIT_REQUESTS", "120"))
 NODE_ID = os.getenv("MOSAIC_NODE_ID", "local")
 NODE_AGENT_TOKEN = os.getenv("MOSAIC_NODE_AGENT_TOKEN", "")
+NODE_AGENT_CA_BUNDLE = os.getenv("MOSAIC_NODE_AGENT_CA_BUNDLE", "")
+ALLOW_PLAINTEXT_NODE_AGENT = os.getenv("MOSAIC_ALLOW_PLAINTEXT_NODE_AGENT", "").lower() == "true"
+REPLICATION_WAL_RETENTION_BYTES = int(os.getenv("MOSAIC_REPLICATION_WAL_RETENTION_BYTES", str(10 * 1024**3)))
+REPLICATION_USER_PREFIX = "mosaic_repl_"
 PLANS = {
     "shared": {"monthly_cents": 10000, "max_databases": 5, "max_branches": 20, "max_rows": 10000, "max_bytes": 1000000, "statement_timeout_ms": 5000},
     "dedicated": {"monthly_cents": 50000, "max_databases": 20, "max_branches": 100, "max_rows": 100000, "max_bytes": 10000000, "statement_timeout_ms": 30000},
@@ -188,6 +193,8 @@ def initialize_schema(c: Conn):
     CREATE TABLE IF NOT EXISTS tenants (id TEXT PRIMARY KEY, name TEXT NOT NULL, plan TEXT NOT NULL, api_key_hash TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS databases (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id), name TEXT NOT NULL, root_path TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(tenant_id,name));
     CREATE TABLE IF NOT EXISTS branches (id TEXT PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id), name TEXT NOT NULL, parent_id TEXT, path TEXT NOT NULL, port INTEGER NOT NULL, pid INTEGER, status TEXT NOT NULL, credential_encrypted TEXT NOT NULL, last_query_at TEXT NOT NULL, created_at TEXT NOT NULL, host_id TEXT NOT NULL DEFAULT 'local', UNIQUE(database_id,name));
+    CREATE TABLE IF NOT EXISTS replication_credentials (database_id TEXT PRIMARY KEY REFERENCES databases(id), username TEXT NOT NULL, credential_encrypted TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS replicas (id TEXT PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id), primary_branch_id TEXT NOT NULL REFERENCES branches(id), host_id TEXT NOT NULL, path TEXT NOT NULL, port INTEGER NOT NULL, status TEXT NOT NULL, lag_bytes INTEGER, lag_sampled_at TEXT, created_at TEXT NOT NULL, slot_name TEXT NOT NULL DEFAULT '', UNIQUE(database_id,host_id));
     CREATE TABLE IF NOT EXISTS usage_events (id {integer}, tenant_id TEXT NOT NULL REFERENCES tenants(id), kind TEXT NOT NULL, quantity INTEGER NOT NULL, unit TEXT NOT NULL, occurred_at TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{{}}', idempotency_key TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS audit_log (id {integer}, tenant_id TEXT, action TEXT NOT NULL, actor TEXT NOT NULL, details TEXT NOT NULL DEFAULT '{{}}', created_at TEXT NOT NULL);
     """)
@@ -200,8 +207,18 @@ def initialize_schema(c: Conn):
     )
     if "host_id" not in columns:
         c.execute("ALTER TABLE branches ADD COLUMN host_id TEXT NOT NULL DEFAULT 'local'")
+    replica_columns = (
+        [row["column_name"] for row in c.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name='replicas'"
+        ).fetchall()]
+        if c.postgres
+        else [row["name"] for row in c.execute("PRAGMA table_info(replicas)").fetchall()]
+    )
+    if "slot_name" not in replica_columns:
+        c.execute("ALTER TABLE replicas ADD COLUMN slot_name TEXT NOT NULL DEFAULT ''")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS usage_idempotency ON usage_events(tenant_id,idempotency_key) WHERE idempotency_key <> ''")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS branches_port_unique ON branches(port)")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS replicas_port_unique ON replicas(port)")
     c.commit()
 
 
@@ -299,19 +316,31 @@ def _initdb(path: Path, password: str, port: int, run: CommandRunner, host_id: s
     _rewrite_postgres_config(path, port, host_id)
 
 
-def _rewrite_postgres_config(path: Path, port: int, host_id: str = "local"):
+def _rewrite_postgres_config(
+    path: Path,
+    port: int,
+    host_id: str = "local",
+    *,
+    replication_user: str | None = None,
+    replication_addresses: list[str] | None = None,
+    standby: bool = False,
+):
     config = path / "postgresql.conf"
     if not config.exists():
         return
     listen_address = node_address(host_id)
     lines = config.read_text().splitlines()
-    settings = re.compile(r"^\s*(?:port|listen_addresses|unix_socket_directories)\s*=")
+    settings = re.compile(r"^\s*(?:port|listen_addresses|unix_socket_directories|max_slot_wal_keep_size|synchronous_standby_names|hot_standby)\s*=")
     retained = [line for line in lines if not settings.match(line)]
     retained.extend([
         f"port = {port}",
         f"listen_addresses = '{listen_address}'",
         f"unix_socket_directories = '{path.resolve()}'",
+        "synchronous_standby_names = ''",
+        f"hot_standby = {'off' if standby else 'on'}",
     ])
+    if replication_user:
+        retained.append(f"max_slot_wal_keep_size = {REPLICATION_WAL_RETENTION_BYTES}")
     config.write_text("\n".join(retained) + "\n")
     if listen_address not in {"127.0.0.1", "::1"}:
         addresses = node_private_addresses()
@@ -331,7 +360,24 @@ def _rewrite_postgres_config(path: Path, port: int, host_id: str = "local"):
             f"host all postgres {address}/32 scram-sha-256"
             for address in addresses.values()
         ), end]
-        hba_lines.extend(managed)
+        hba_lines = hba_lines + managed
+        replication_begin = "# BEGIN MOSAIC DATABASE REPLICATION"
+        replication_end = "# END MOSAIC DATABASE REPLICATION"
+        try:
+            start = hba_lines.index(replication_begin)
+            finish = hba_lines.index(replication_end, start)
+            hba_lines = hba_lines[:start] + hba_lines[finish + 1:]
+        except ValueError:
+            pass
+        if replication_user and replication_addresses:
+            hba_lines.extend([
+                replication_begin,
+                *(
+                    f"host replication {replication_user} {address}/32 scram-sha-256"
+                    for address in replication_addresses
+                ),
+                replication_end,
+            ])
         hba.write_text("\n".join(hba_lines) + "\n")
 
 
@@ -384,7 +430,7 @@ def record_stop(c: Conn, row, result: dict):
 
 class Supervisor:
     def allocate_port(self, c: Conn) -> int:
-        used = {int(row["port"]) for row in c.execute("SELECT port FROM branches").fetchall()}
+        used = {int(row["port"]) for row in c.execute("SELECT port FROM branches UNION ALL SELECT port FROM replicas").fetchall()}
         port = PORT_MIN
         while port in used:
             port += 1
@@ -448,6 +494,9 @@ class Supervisor:
 
 
 class NodeAgent:
+    def __init__(self, runner: CommandRunner | None = None):
+        self.run = runner or (lambda argv: subprocess.run(argv, check=True, capture_output=True, text=True))
+
     def handle(self, operation: str, payload: dict):
         if operation not in {"provision", "clone", "start", "stop", "inspect", "destroy"}:
             raise RuntimeError(f"unknown node operation {operation}")
@@ -478,6 +527,102 @@ class NodeAgent:
                 target_host_id=payload.get("target_host_id", current_node_id()),
             )
             return {"status": "cloned"}
+        if operation == "build_standby":
+            target = Path(payload["target_path"])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            argv = [
+                pg_bin("pg_basebackup"), "-D", str(target),
+                "-h", payload["primary_address"], "-p", str(payload["primary_port"]),
+                "-U", payload["replication_user"], "-Fp", "-X", "stream", "-R",
+            ]
+            if payload.get("replication_slot"):
+                argv.extend(["-S", payload["replication_slot"]])
+            old_password = os.environ.get("PGPASSWORD")
+            os.environ["PGPASSWORD"] = payload["replication_password"]
+            try:
+                self.run(argv)
+            finally:
+                if old_password is None:
+                    os.environ.pop("PGPASSWORD", None)
+                else:
+                    os.environ["PGPASSWORD"] = old_password
+            _rewrite_postgres_config(
+                target,
+                int(payload["target_port"]),
+                payload["target_host_id"],
+                standby=True,
+            )
+            self.run([
+                pg_bin("pg_ctl"), "-D", str(target),
+                "-l", str(target / "postgres.log"), "-w", "start",
+            ])
+            return {"status": "ready"}
+        if operation == "prepare_primary":
+            _rewrite_postgres_config(
+                Path(payload["path"]),
+                int(payload["port"]),
+                payload["host_id"],
+                replication_user=payload["replication_user"],
+                replication_addresses=payload["replication_addresses"],
+            )
+            result = supervisor.start_local({
+                "branch_id": payload["branch_id"],
+                "path": payload["path"],
+                "port": payload["port"],
+                "pid": payload.get("pid"),
+                "status": payload.get("status", "stopped"),
+                "host_id": payload["host_id"],
+                "password": payload["postgres_password"],
+                "parent_passwords": [],
+            })
+            with psycopg.connect(
+                host=node_address(payload["host_id"]),
+                port=payload["port"],
+                user="postgres",
+                password=payload["postgres_password"],
+                dbname="postgres",
+                connect_timeout=5,
+            ) as connection:
+                connection.execute(
+                    psycopg_sql.SQL("CREATE ROLE {} WITH REPLICATION LOGIN PASSWORD {}").format(
+                        psycopg_sql.Identifier(payload["replication_user"]),
+                        psycopg_sql.Literal(payload["replication_password"]),
+                    )
+                )
+                for slot in payload["replication_slots"]:
+                    connection.execute(
+                        "SELECT pg_create_physical_replication_slot(%s) "
+                        "WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=%s)",
+                        (slot, slot),
+                    )
+                connection.commit()
+            return result
+        if operation == "inspect_replication":
+            with psycopg.connect(
+                host=node_address(payload["primary_host_id"]),
+                port=payload["primary_port"],
+                user="postgres",
+                password=payload["postgres_password"],
+                dbname="postgres",
+                connect_timeout=5,
+                row_factory=dict_row,
+            ) as connection:
+                rows = connection.execute(
+                    "SELECT client_addr::text AS client_addr, application_name, "
+                    "COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0)::bigint AS lag_bytes "
+                    "FROM pg_stat_replication"
+                ).fetchall()
+                slots = connection.execute(
+                    "SELECT slot_name, wal_status FROM pg_replication_slots "
+                    "WHERE slot_type='physical'"
+                ).fetchall()
+            return {
+                "sampled_at": now(),
+                "replicas": [dict(row) for row in rows],
+                "invalid_slots": [
+                    row["slot_name"] for row in slots if row["wal_status"] == "lost"
+                ],
+            }
         if operation == "start":
             return supervisor.start_local({**payload, "path": str(confined(payload["path"], "path"))})
         if operation == "stop":
@@ -514,10 +659,109 @@ class NodeTransport:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
+            if base_url.startswith("http://") and len(node_ids()) > 1 and not ALLOW_PLAINTEXT_NODE_AGENT:
+                raise RuntimeError("plaintext node-agent transport requires MOSAIC_ALLOW_PLAINTEXT_NODE_AGENT=true")
+            context = None
+            if base_url.startswith("https://") and NODE_AGENT_CA_BUNDLE:
+                context = ssl.create_default_context(cafile=NODE_AGENT_CA_BUNDLE)
+            with urllib.request.urlopen(request, timeout=15, context=context) as response:
                 return json.loads(response.read())
         except (urllib.error.URLError, urllib.error.HTTPError) as exc:
             raise RuntimeError(f"node agent {node_id} unavailable: {exc}") from exc
+
+
+def replica_nodes(primary_host_id: str) -> list[str]:
+    return [node_id for node_id in node_ids() if node_id != primary_host_id]
+
+
+def create_replicas(c: Conn, database_id: str, main_row, postgres_password: str):
+    peers = replica_nodes(main_row["host_id"])
+    if not peers:
+        return
+    replication_user = REPLICATION_USER_PREFIX + database_id.removeprefix("db_")[:24]
+    replication_password = secrets.token_urlsafe(24)
+    primary_addresses = [node_address(node_id) for node_id in peers]
+    slots = {
+        node_id: f"mosaic_{database_id.removeprefix('db_')[:16]}_{node_id}".replace("-", "_")
+        for node_id in peers
+    }
+    prepared = node_transport.call(main_row["host_id"], "prepare_primary", {
+        "branch_id": main_row["id"],
+        "path": main_row["path"],
+        "port": main_row["port"],
+        "pid": main_row["pid"],
+        "status": main_row["status"],
+        "host_id": main_row["host_id"],
+        "postgres_password": postgres_password,
+        "replication_user": replication_user,
+        "replication_password": replication_password,
+        "replication_addresses": primary_addresses,
+        "replication_slots": list(slots.values()),
+    })
+    c.execute("UPDATE branches SET status=?,pid=? WHERE id=?", (prepared["status"], prepared["pid"], main_row["id"]))
+    c.execute(
+        "INSERT INTO replication_credentials(database_id,username,credential_encrypted,created_at) VALUES(?,?,?,?)",
+        (database_id, replication_user, cipher().encrypt(replication_password.encode()).decode(), now()),
+    )
+    for node_id in peers:
+        replica_id = token("rep_")
+        replica_port = supervisor.allocate_port(c)
+        replica_path = Path(main_row["path"]).parent / "replicas" / node_id
+        c.execute(
+            "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (replica_id, database_id, main_row["id"], node_id, str(replica_path), replica_port, "building", None, None, now(), slots[node_id]),
+        )
+        node_transport.call(node_id, "build_standby", {
+            "target_path": str(replica_path),
+            "target_port": replica_port,
+            "target_host_id": node_id,
+            "primary_address": node_address(main_row["host_id"]),
+            "primary_port": main_row["port"],
+            "replication_user": replication_user,
+            "replication_password": replication_password,
+            "replication_slot": slots[node_id],
+        })
+        c.execute("UPDATE replicas SET status='ready' WHERE id=?", (replica_id,))
+
+
+def refresh_replica_lag(c: Conn, database_id: str):
+    main_row = c.execute(
+        "SELECT * FROM branches WHERE database_id=? AND name='main'",
+        (database_id,),
+    ).fetchone()
+    credential = c.execute(
+        "SELECT username,credential_encrypted FROM replication_credentials WHERE database_id=?",
+        (database_id,),
+    ).fetchone()
+    if not main_row or not credential:
+        return
+    try:
+        postgres_password = cipher().decrypt(main_row["credential_encrypted"].encode()).decode()
+        sampled = node_transport.call(main_row["host_id"], "inspect_replication", {
+            "primary_host_id": main_row["host_id"],
+            "primary_port": main_row["port"],
+            "postgres_password": postgres_password,
+        })
+    except (InvalidToken, RuntimeError):
+        return
+    by_address = {node_address(row["host_id"]): row for row in c.execute(
+        "SELECT host_id FROM replicas WHERE database_id=?", (database_id,)
+    ).fetchall()}
+    for replica in sampled.get("replicas", []):
+        row = by_address.get(replica.get("client_addr"))
+        if row:
+            c.execute(
+                "UPDATE replicas SET lag_bytes=?,lag_sampled_at=? WHERE database_id=? AND host_id=?",
+                (int(replica.get("lag_bytes", 0)), sampled["sampled_at"], database_id, row["host_id"]),
+            )
+    if sampled.get("invalid_slots"):
+        placeholders = ",".join("?" for _ in sampled["invalid_slots"])
+        c.execute(
+            f"UPDATE replicas SET status='rebuild_required' "
+            f"WHERE database_id=? AND slot_name IN ({placeholders})",
+            (database_id, *sampled["invalid_slots"]),
+        )
+    c.commit()
 
 
 supervisor = Supervisor()
@@ -823,6 +1067,8 @@ def create_database(tid: str, payload: DatabaseCreate, tenant=Depends(tenant_aut
             })
             c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", (did, tid, payload.name, str(root), "ready", now()))
             c.execute("INSERT INTO branches(id,database_id,name,parent_id,path,port,pid,status,credential_encrypted,last_query_at,created_at,host_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (bid, did, "main", None, str(root / "main"), main_port, None, "stopped", cipher().encrypt(password.encode()).decode(), now(), now(), host_id))
+            main_row = c.execute("SELECT * FROM branches WHERE id=?", (bid,)).fetchone()
+            create_replicas(c, did, main_row, password)
         audit(c, tid, "database.created", {"database_id": did})
         c.commit()
         return {"id": did, "name": payload.name, "status": "ready", "main_branch": {"id": bid, "name": "main", "password": password}}
@@ -897,6 +1143,22 @@ def list_branches(tid: str, did: str, tenant):
 @app.get("/v1/tenants/{tid}/databases/{did}/branches")
 def branches_get(tid: str, did: str, tenant=Depends(tenant_auth)):
     return list_branches(tid, did, tenant)
+
+
+@app.get("/v1/tenants/{tid}/databases/{did}/replicas")
+def replicas_get(tid: str, did: str, tenant=Depends(tenant_auth)):
+    c = db()
+    try:
+        database(c, tid, did)
+        refresh_replica_lag(c, did)
+        rows = c.execute(
+            "SELECT id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at "
+            "FROM replicas WHERE database_id=? ORDER BY host_id",
+            (did,),
+        ).fetchall()
+        return {"replicas": [dict(row) for row in rows], "lag_unit": "bytes behind primary WAL replay position"}
+    finally:
+        c.close()
 
 
 @app.delete("/v1/tenants/{tid}/databases/{did}/branches/{bid}")
