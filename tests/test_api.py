@@ -338,6 +338,8 @@ def test_zfs_lazy_unmount_refuses_path_outside_branch_root(tmp_path, monkeypatch
     with pytest.raises(RuntimeError, match="outside MOSAIC_BRANCH_ROOT"):
         engine.prepare_standby(standby, is_stopped=lambda path: True)
     assert not any(call[0] == "mosaic-umount" for call in calls)
+
+
 def test_zfs_busy_standby_destroy_does_not_unmount_unverified_target(tmp_path):
     calls = []
     standby = tmp_path / "cluster" / ".replicas" / "sv2"
