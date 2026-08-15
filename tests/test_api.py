@@ -105,6 +105,45 @@ def test_public_signup_has_tighter_rate_limit(client, monkeypatch):
     assert second.status_code == 429
 
 
+def test_public_signup_ignores_forwarded_ip_by_default(client, monkeypatch):
+    monkeypatch.setattr(main, "PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS", 1)
+    first = client.post(
+        "/v1/public/signup",
+        headers={"CF-Connecting-IP": "198.51.100.10"},
+        json={"email": "socket-first@example.com"},
+    )
+    second = client.post(
+        "/v1/public/signup",
+        headers={"CF-Connecting-IP": "198.51.100.11"},
+        json={"email": "socket-second@example.com"},
+    )
+    assert first.status_code == 200
+    assert second.status_code == 429
+
+
+def test_public_signup_honors_forwarded_ip_when_trusted(client, monkeypatch):
+    monkeypatch.setattr(main, "PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS", 1)
+    monkeypatch.setattr(main, "TRUST_CLOUDFLARE_IP", True)
+    first = client.post(
+        "/v1/public/signup",
+        headers={"CF-Connecting-IP": "198.51.100.20"},
+        json={"email": "forwarded-first@example.com"},
+    )
+    second = client.post(
+        "/v1/public/signup",
+        headers={"CF-Connecting-IP": "198.51.100.21"},
+        json={"email": "forwarded-second@example.com"},
+    )
+    limited = client.post(
+        "/v1/public/signup",
+        headers={"CF-Connecting-IP": "198.51.100.20"},
+        json={"email": "forwarded-third@example.com"},
+    )
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert limited.status_code == 429
+
+
 def test_database_capacity_ceiling_applies_to_all_callers(client, monkeypatch):
     first = tenant(client)
     created = client.post(

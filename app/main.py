@@ -48,6 +48,7 @@ RATE_LIMIT_REQUESTS = int(os.getenv("MOSAIC_RATE_LIMIT_REQUESTS", "120"))
 PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS = int(os.getenv("MOSAIC_PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS", "5"))
 MAX_DATABASES_TOTAL = int(os.getenv("MOSAIC_MAX_DATABASES_TOTAL", "50"))
 MOSAIC_PUBLIC_ENDPOINT = os.getenv("MOSAIC_PUBLIC_ENDPOINT", "https://database-api.mosaicos.com")
+TRUST_CLOUDFLARE_IP = os.getenv("MOSAIC_TRUST_CLOUDFLARE_IP", "").lower() == "true"
 NODE_ID = os.getenv("MOSAIC_NODE_ID", "local")
 PROMOTION_MAX_LAG_BYTES = int(os.getenv("MOSAIC_PROMOTION_MAX_LAG_BYTES", str(10 * 1024 * 1024 * 1024)))
 PROMOTION_MAX_LAG_AGE_SECONDS = int(os.getenv("MOSAIC_PROMOTION_MAX_LAG_AGE_SECONDS", "300"))
@@ -1651,6 +1652,15 @@ def check_rate_limit(tid: str, limit: int | None = None):
     _rate[tid] = values + [time.time()]
 
 
+def public_signup_client_ip(request: Request) -> str:
+    peer = request.client.host if request.client else "unknown"
+    if TRUST_CLOUDFLARE_IP:
+        forwarded = request.headers.get("CF-Connecting-IP", "").strip()
+        if forwarded:
+            return forwarded
+    return peer
+
+
 class TenantCreate(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     plan: str = "shared"
@@ -1798,7 +1808,7 @@ def create_tenant(payload: TenantCreate):
 @app.post("/v1/public/signup")
 def public_signup(payload: PublicSignupCreate, request: Request):
     email = normalize_email(payload.email)
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = public_signup_client_ip(request)
     check_rate_limit(f"public-signup-ip:{client_ip}", PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS)
     check_rate_limit(f"public-signup-email:{email}", PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS)
     if payload.plan != "shared":

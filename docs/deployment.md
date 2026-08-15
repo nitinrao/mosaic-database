@@ -22,6 +22,11 @@ conversation. Set `MOSAIC_PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS` for its
 per-minute IP and email limit (default `5`). Set
 `MOSAIC_MAX_DATABASES_TOTAL` for the global database ceiling (default `50`);
 the service returns `503` and audits the refusal when that ceiling is reached.
+When the control plane is reachable only through a Cloudflare tunnel, set
+`MOSAIC_TRUST_CLOUDFLARE_IP=true` to bucket signup requests by Cloudflare's
+`CF-Connecting-IP` header. It is off by default; when off, or when the header
+is absent, the service uses the socket peer address. This setting affects only
+signup rate-limit bucketing, not authentication or authorization.
 
 ## Storage
 
