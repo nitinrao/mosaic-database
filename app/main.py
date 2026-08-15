@@ -749,24 +749,27 @@ class NodeAgent:
 
     def _start_standby_build(self, target: Path, payload: dict) -> dict:
         force_rebuild = bool(payload.get("force_rebuild"))
-        with self._standby_jobs_lock:
-            job = self._standby_jobs.get(target)
-            if force_rebuild:
+        if force_rebuild:
+            with self._standby_jobs_lock:
+                job = self._standby_jobs.get(target)
                 if job and job["status"] == "building":
                     job["superseded"] = True
                     return {"status": "building", "superseded": True}
                 self._standby_jobs.pop(target, None)
-            elif job and job["status"] == "building":
-                return {"status": "building"}
-        if not force_rebuild:
+                self._standby_jobs[target] = {"status": "building"}
+        else:
+            with self._standby_jobs_lock:
+                job = self._standby_jobs.get(target)
+                if job and job["status"] == "building":
+                    return {"status": "building"}
             existing = self._standby_status(target)
             if existing["status"] == "ready":
                 return existing
-        with self._standby_jobs_lock:
-            job = self._standby_jobs.get(target)
-            if not force_rebuild and job and job["status"] == "building":
-                return {"status": "building"}
-            self._standby_jobs[target] = {"status": "building"}
+            with self._standby_jobs_lock:
+                job = self._standby_jobs.get(target)
+                if job and job["status"] == "building":
+                    return {"status": "building"}
+                self._standby_jobs[target] = {"status": "building"}
         threading.Thread(
             target=self._run_standby_build,
             args=(target, dict(payload)),

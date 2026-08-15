@@ -611,6 +611,55 @@ def test_forced_standby_rebuild_supersedes_inflight_build(tmp_path, monkeypatch)
     assert sum(call[0] == main.pg_bin("pg_basebackup") for call in calls) == 1
 
 
+def test_concurrent_forced_rebuilds_start_one_build(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
+    target.mkdir()
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[0] == main.pg_bin("pg_basebackup"):
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "postgresql.conf").write_text("")
+            started.set()
+            release.wait(timeout=2)
+
+    agent = main.NodeAgent(run)
+    payload = {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "local",
+        "primary_address": "127.0.0.1",
+        "primary_port": 55432,
+        "replication_user": "mosaic_repl_db",
+        "replication_password": "secret",
+        "force_rebuild": True,
+    }
+    results = []
+    barrier = threading.Barrier(3)
+
+    def request():
+        barrier.wait()
+        results.append(agent.handle("build_standby", payload))
+
+    threads = [threading.Thread(target=request) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+    assert started.wait(timeout=2)
+    release.set()
+    assert len(results) == 2
+    assert sum(call[0] == main.pg_bin("pg_basebackup") for call in calls) == 1
+    assert all(result["status"] == "building" for result in results)
+
+
 def test_zfs_standby_dataset_is_reusable_and_promoted_path_can_clone(tmp_path, monkeypatch):
     root = tmp_path / "branches"
     root.mkdir()
