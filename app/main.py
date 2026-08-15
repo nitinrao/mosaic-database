@@ -2066,11 +2066,23 @@ class _CheckExpressionParser:
         self.parse_or()
         if self.current()[0] != "eof":
             raise HTTPException(400, "constraint expression is not a supported predicate")
-        expression = " ".join(value for kind, value in self.tokens if kind != "eof")
-        expression = re.sub(r"\s+\(", "(", expression)
-        expression = re.sub(r"\(\s+", "(", expression)
-        expression = re.sub(r"\s+\)", ")", expression)
-        return re.sub(r",\s+", ",", expression)
+        rendered = []
+        previous = None
+        for token in self.tokens:
+            if token[0] == "eof":
+                break
+            separator = ""
+            if previous is not None:
+                previous_kind, previous_value = previous
+                current_kind, current_value = token
+                tight_after = previous_kind == "punct" and previous_value in {"(", ","}
+                tight_before = current_kind == "punct" and current_value in {"(", ",", ")"}
+                if not tight_after and not tight_before:
+                    separator = " "
+            rendered.append(separator)
+            rendered.append(token[1])
+            previous = token
+        return "".join(rendered)
 
     def parse_or(self) -> None:
         self.parse_and()

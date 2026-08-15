@@ -3508,6 +3508,28 @@ def test_deploy_check_sql_is_reconstructed_from_validated_tokens():
     ]
 
 
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("label = 'a (b)'", "label = 'a (b)'"),
+        ("label IN ('x, y')", "label IN('x, y')"),
+        ("label = 'it''s'", "label = 'it''s'"),
+    ],
+)
+def test_deploy_check_rendering_preserves_string_literals(expression, expected):
+    compiled = main.compile_deploy_operations(
+        [
+            main.AddConstraintOperation(
+                op="add_constraint",
+                table="events",
+                kind="check",
+                expression=expression,
+            )
+        ]
+    )[0]
+    assert f"CHECK ({expected})" in compiled
+
+
 def test_apply_retry_does_not_schedule_a_second_task(client, monkeypatch):
     created, database, branch = _deploy_database(client, monkeypatch)
     headers = {"X-API-Key": created["api_key"]}
