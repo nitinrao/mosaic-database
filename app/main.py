@@ -53,7 +53,7 @@ NODE_AGENT_CA_BUNDLE = os.getenv("MOSAIC_NODE_AGENT_CA_BUNDLE", "")
 ALLOW_PLAINTEXT_NODE_AGENT = os.getenv("MOSAIC_ALLOW_PLAINTEXT_NODE_AGENT", "").lower() == "true"
 REPLICATION_WAL_RETENTION_BYTES = int(os.getenv("MOSAIC_REPLICATION_WAL_RETENTION_BYTES", str(10 * 1024**3)))
 REPLICATION_USER_PREFIX = "mosaic_repl_"
-REPLICATION_SLOT_INACTIVE_POLLS = 3
+REPLICATION_SLOT_INACTIVE_POLLS = 20
 REPLICATION_SLOT_INACTIVE_POLL_SECONDS = 0.05
 RESERVED_BRANCH_NAMES = {".replicas", "replicas"}
 PLANS = {
@@ -922,20 +922,25 @@ class NodeAgent:
                     (active_pid,),
                 )
                 connection.commit()
-                time.sleep(REPLICATION_SLOT_INACTIVE_POLL_SECONDS)
-                row = connection.execute(
-                    "SELECT active, active_pid FROM pg_replication_slots WHERE slot_name=%s",
-                    (slot,),
-                ).fetchone()
-                if row is not None:
+                for _ in range(REPLICATION_SLOT_INACTIVE_POLLS):
+                    row = connection.execute(
+                        "SELECT active, active_pid FROM pg_replication_slots WHERE slot_name=%s",
+                        (slot,),
+                    ).fetchone()
+                    if row is None:
+                        active = False
+                        break
                     if isinstance(row, dict):
                         active, active_pid = row["active"], row["active_pid"]
                     else:
                         active, active_pid = row[0], row[1]
-                    if active:
-                        raise RuntimeError(
-                            f"replication slot {slot} remained active after terminating backend"
-                        )
+                    if not active:
+                        break
+                    time.sleep(REPLICATION_SLOT_INACTIVE_POLL_SECONDS)
+                if active:
+                    raise RuntimeError(
+                        f"replication slot {slot} remained active after terminating backend"
+                    )
             try:
                 connection.execute(
                     "SELECT pg_drop_replication_slot(%s)",

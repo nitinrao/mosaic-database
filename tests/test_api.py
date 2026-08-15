@@ -729,9 +729,13 @@ def test_standby_build_replaces_existing_slot_before_backup(tmp_path, monkeypatc
     sql = []
     events = []
     terminated = [False]
+    release_polls = [2]
 
     class Result:
         def fetchone(self):
+            if terminated[0] and release_polls[0]:
+                release_polls[0] -= 1
+                return (True, 123)
             return (not terminated[0], None if terminated[0] else 123)
 
     class Connection:
@@ -784,7 +788,7 @@ def test_standby_build_replaces_existing_slot_before_backup(tmp_path, monkeypatc
         "replication_slot": "mosaic_db_sv2",
     }
     assert agent.handle("build_standby", payload) == {"status": "building"}
-    for _ in range(100):
+    for _ in range(300):
         result = agent.handle("inspect_standby", {"target_path": str(target)})
         if result["status"] == "ready":
             break
