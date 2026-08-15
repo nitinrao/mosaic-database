@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ def client(tmp_path, monkeypatch):
     main.DATABASE_URLS = []
     main._rate.clear()
     main._rate_last_sweep = 0.0
+    main._mosaic_identity_cache.clear()
     class FakeEngine:
         def create_database(self, path, password, port, host_id="local"): Path(path).mkdir(parents=True, exist_ok=True)
         def clone(self, parent, target, parent_port=None, parent_password=None, target_port=None, parent_host_id="local", target_host_id="local"): Path(target).mkdir(parents=True, exist_ok=True)
@@ -122,7 +124,7 @@ def test_public_signup_insert_collision_refuses_existing_email(client, monkeypat
                 competing_tenant_id = "ten_competing"
                 created = main.now()
                 competing.execute(
-                    "INSERT INTO tenants VALUES(?,?,?,?,?,?)",
+                    "INSERT INTO tenants(id,name,plan,api_key_hash,status,created_at) VALUES(?,?,?,?,?,?)",
                     (
                         competing_tenant_id,
                         "Competing workspace",
@@ -376,6 +378,35 @@ def test_auth_limits_and_key_rotation(client):
     assert client.get(f"/v1/tenants/{tid}/usage", headers={"X-API-Key": rotated}).status_code == 200
 
 
+def test_sandbox_tenant_rejects_local_key_lifecycle_but_local_rotation_works(client, monkeypatch):
+    monkeypatch.setattr(main, "MOSAIC_INTROSPECTION_URL", "https://sandbox.test/v1/introspect")
+    mosaic_urlopen(monkeypatch, [FakeIntrospectionResponse(200, {
+        "organization_id": "org-managed",
+        "scopes": ["database:read", "database:write"],
+        "resource_profile": "standard",
+        "status": "active",
+    })])
+    discovered = client.post(
+        "/v1/tenants/discover",
+        headers={"Authorization": "Bearer msk_live_managed"},
+    ).json()
+    tid = discovered["tenant_id"]
+    headers = {"Authorization": "Bearer msk_live_managed"}
+    for method in ("post", "delete"):
+        response = getattr(client, method)(
+            f"/v1/tenants/{tid}/api-key",
+            headers=headers,
+        )
+        assert response.status_code == 409
+        assert "managed in Sandbox" in response.json()["detail"]
+    local = tenant(client)
+    rotated = client.post(
+        f"/v1/tenants/{local['tenant_id']}/api-key",
+        headers={"X-API-Key": local["api_key"]},
+    )
+    assert rotated.status_code == 200
+
+
 def request_with_client(client_ip, forwarded_ip=None):
     headers = []
     if forwarded_ip:
@@ -432,6 +463,295 @@ def test_public_read_only_routes_remain_public(client):
     assert client.get("/readyz").status_code == 200
     assert client.get("/v1/plans").status_code == 200
     assert client.get("/.well-known/mcp.json").status_code == 200
+
+
+class FakeIntrospectionResponse:
+    def __init__(self, status, body):
+        self.status = status
+        self.body = json.dumps(body).encode() if isinstance(body, dict) else body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return self.body
+
+
+def mosaic_urlopen(monkeypatch, responses):
+    calls = []
+
+    def urlopen(request, timeout):
+        calls.append((request, timeout))
+        response = responses.pop(0) if responses else FakeIntrospectionResponse(
+            503, {"error": "unavailable"}
+        )
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(main.urllib.request, "urlopen", urlopen)
+    return calls
+
+
+def test_mosaic_key_provisions_and_reuses_tenant(client, monkeypatch):
+    monkeypatch.setattr(main, "MOSAIC_INTROSPECTION_URL", "https://sandbox.test/v1/introspect")
+    calls = mosaic_urlopen(monkeypatch, [
+        FakeIntrospectionResponse(200, {
+            "organization_id": "org-123",
+            "scopes": ["database:read", "database:write"],
+            "resource_profile": "standard",
+            "status": "active",
+        }),
+    ])
+    key = "msk_live_test"
+    first = client.post("/v1/tenants/discover", headers={"Authorization": f"Bearer {key}"})
+    second = client.post("/v1/tenants/discover", headers={"Authorization": f"Bearer {key}"})
+    assert first.status_code == second.status_code == 200
+    assert first.json()["tenant_id"] == second.json()["tenant_id"]
+    assert first.json()["origin"] == "sandbox"
+    assert len(calls) == 1
+    request = calls[0][0]
+    assert request.get_header("Authorization") == f"Bearer {key}"
+    c = main.db()
+    try:
+        assert c.execute("SELECT COUNT(*) AS n FROM tenants").fetchone()["n"] == 1
+        assert c.execute(
+            "SELECT origin FROM tenants WHERE id=?",
+            (first.json()["tenant_id"],),
+        ).fetchone()["origin"] == "sandbox"
+    finally:
+        c.close()
+
+
+def test_mosaic_key_mapping_mismatch_is_refused(client, monkeypatch):
+    monkeypatch.setattr(main, "MOSAIC_INTROSPECTION_URL", "https://sandbox.test/v1/introspect")
+    mosaic_urlopen(monkeypatch, [FakeIntrospectionResponse(200, {
+        "organization_id": "org-owner",
+        "scopes": ["database:read", "database:write"],
+        "resource_profile": "standard",
+        "status": "active",
+    })])
+    key = "msk_live_owner"
+    owner = client.post("/v1/tenants/discover", headers={"Authorization": f"Bearer {key}"}).json()
+    other = tenant(client)
+    response = client.get(
+        f"/v1/tenants/{other['tenant_id']}/databases",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    assert response.status_code == 401
+    assert owner["tenant_id"] != other["tenant_id"]
+
+
+def test_mosaic_tenant_path_does_not_provision_before_ownership_check(client, monkeypatch):
+    monkeypatch.setattr(main, "MOSAIC_INTROSPECTION_URL", "https://sandbox.test/v1/introspect")
+    calls = mosaic_urlopen(monkeypatch, [FakeIntrospectionResponse(200, {
+        "organization_id": "org-unmapped",
+        "scopes": ["database:read"],
+        "resource_profile": "standard",
+        "status": "active",
+    })])
+    response = client.get(
+        "/v1/tenants/ten-not-owned/databases",
+        headers={"Authorization": "Bearer msk_live_unmapped"},
+    )
+    assert response.status_code == 401
+    assert len(calls) == 1
+    c = main.db()
+    try:
+        assert c.execute("SELECT COUNT(*) AS n FROM tenants").fetchone()["n"] == 0
+        assert c.execute(
+            "SELECT COUNT(*) AS n FROM mosaic_organization_tenants",
+        ).fetchone()["n"] == 0
+        assert c.execute(
+            "SELECT COUNT(*) AS n FROM audit_log",
+        ).fetchone()["n"] == 0
+    finally:
+        c.close()
+
+
+def test_mosaic_read_scope_can_discover_tenant(client, monkeypatch):
+    monkeypatch.setattr(main, "MOSAIC_INTROSPECTION_URL", "https://sandbox.test/v1/introspect")
+    mosaic_urlopen(monkeypatch, [FakeIntrospectionResponse(200, {
+        "organization_id": "org-read-discovery",
+        "scopes": ["database:read"],
+        "resource_profile": "standard",
+        "status": "active",
+    })])
+    response = client.post(
+        "/v1/tenants/discover",
+        headers={"Authorization": "Bearer msk_live_read_discovery"},
+    )
+    assert response.status_code == 200
+    assert response.json()["origin"] == "sandbox"
+
+
+def test_discovery_rate_limits_anonymous_attempts_before_introspection(client, monkeypatch):
+    monkeypatch.setattr(main, "MOSAIC_INTROSPECTION_URL", "https://sandbox.test/v1/introspect")
+    calls = mosaic_urlopen(monkeypatch, [
+        urllib.error.HTTPError(
+            "https://sandbox.test/v1/introspect",
+            401,
+            "unauthorized",
+            {},
+            None,
+        )
+        for _ in range(main.PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS)
+    ])
+    responses = [
+        client.post(
+            "/v1/tenants/discover",
+            headers={"Authorization": f"Bearer msk_live_junk_{index}"},
+        )
+        for index in range(main.PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS + 1)
+    ]
+    assert [response.status_code for response in responses[:-1]] == [401] * main.PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS
+    assert responses[-1].status_code == 429
+    assert len(calls) == main.PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS
+
+
+@pytest.mark.parametrize(
+    ("identity", "expected_status"),
+    [
+        (None, 401),
+        ({
+            "organization_id": "org-inactive",
+            "scopes": ["database:read", "database:write"],
+            "resource_profile": "standard",
+            "status": "revoked",
+        }, 401),
+    ],
+)
+def test_mosaic_key_rejected_for_invalid_or_inactive_identity(client, monkeypatch, identity, expected_status):
+    monkeypatch.setattr(main, "MOSAIC_INTROSPECTION_URL", "https://sandbox.test/v1/introspect")
+    if identity is None:
+        response = urllib.error.HTTPError(
+            "https://sandbox.test/v1/introspect",
+            401,
+            "unauthorized",
+            {},
+            None,
+        )
+    else:
+        response = FakeIntrospectionResponse(200, identity)
+    mosaic_urlopen(monkeypatch, [response])
+    result = client.post(
+        "/v1/tenants/discover",
+        headers={"Authorization": "Bearer msk_live_invalid"},
+    )
+    assert result.status_code == expected_status
+
+
+def test_mosaic_key_scope_enforcement(client, monkeypatch):
+    monkeypatch.setattr(main, "MOSAIC_INTROSPECTION_URL", "https://sandbox.test/v1/introspect")
+    mosaic_urlopen(monkeypatch, [FakeIntrospectionResponse(200, {
+        "organization_id": "org-read-only",
+        "scopes": ["database:read"],
+        "resource_profile": "standard",
+        "status": "active",
+    })])
+    c = main.db()
+    try:
+        c.execute(
+            "INSERT INTO tenants(id,name,plan,api_key_hash,status,created_at,origin) "
+            "VALUES(?,?,?,?,?,?,?)",
+            ("ten-read", "Read workspace", "shared", "", "active", main.now(), "sandbox"),
+        )
+        c.execute(
+            "INSERT INTO mosaic_organization_tenants(organization_id,tenant_id,created_at) "
+            "VALUES(?,?,?)",
+            ("org-read-only", "ten-read", main.now()),
+        )
+        c.commit()
+    finally:
+        c.close()
+    headers = {"Authorization": "Bearer msk_live_read"}
+    assert client.get("/v1/tenants/ten-read/databases", headers=headers).status_code == 200
+    response = client.post(
+        "/v1/tenants/ten-read/databases",
+        headers=headers,
+        json={"name": "events"},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "required scope database:write"
+
+
+def test_mosaic_introspection_outage_uses_warm_cache_but_cold_cache_fails(client, monkeypatch):
+    monkeypatch.setattr(main, "MOSAIC_INTROSPECTION_URL", "https://sandbox.test/v1/introspect")
+    clock = [100.0]
+    monkeypatch.setattr(main.time, "time", lambda: clock[0])
+    responses = [FakeIntrospectionResponse(200, {
+        "organization_id": "org-warm",
+        "scopes": ["database:read", "database:write"],
+        "resource_profile": "standard",
+        "status": "active",
+    })]
+    calls = mosaic_urlopen(monkeypatch, responses)
+    key = "msk_live_warm"
+    assert client.post("/v1/tenants/discover", headers={"Authorization": f"Bearer {key}"}).status_code == 200
+    responses.append(urllib.error.URLError("offline"))
+    clock[0] = 150.0
+    assert client.post("/v1/tenants/discover", headers={"Authorization": f"Bearer {key}"}).status_code == 200
+    main._mosaic_identity_cache.clear()
+    cold = client.post(
+        "/v1/tenants/discover",
+        headers={"Authorization": "Bearer msk_live_cold"},
+    )
+    assert cold.status_code == 503
+    assert cold.json()["detail"] == "identity service unavailable"
+    assert len(calls) == 3
+
+
+def test_mosaic_introspection_cache_ttls_and_cap(monkeypatch):
+    monkeypatch.setattr(main, "MOSAIC_INTROSPECTION_URL", "https://sandbox.test/v1/introspect")
+    monkeypatch.setenv("MOSAIC_INTROSPECTION_CACHE_TTL_SECONDS", "3")
+    monkeypatch.setenv("MOSAIC_INTROSPECTION_NEGATIVE_TTL_SECONDS", "2")
+    monkeypatch.setenv("MOSAIC_INTROSPECTION_CACHE_CAP", "2")
+    clock = [100.0]
+    monkeypatch.setattr(main.time, "time", lambda: clock[0])
+    responses = [
+        FakeIntrospectionResponse(200, {"organization_id": "org-1", "scopes": [], "status": "active"}),
+        urllib.error.HTTPError("https://sandbox.test", 401, "unauthorized", {}, None),
+        FakeIntrospectionResponse(200, {"organization_id": "org-2", "scopes": [], "status": "active"}),
+        FakeIntrospectionResponse(200, {"organization_id": "org-3", "scopes": [], "status": "active"}),
+    ]
+    calls = mosaic_urlopen(monkeypatch, responses)
+    assert main.introspect_mosaic_key("msk_live_one")["organization_id"] == "org-1"
+    clock[0] = 102.0
+    with pytest.raises(main.HTTPException) as exc_info:
+        main.introspect_mosaic_key("msk_live_bad")
+    assert exc_info.value.status_code == 401
+    clock[0] = 103.0
+    assert main.introspect_mosaic_key("msk_live_one")["organization_id"] == "org-1"
+    clock[0] = 106.0
+    assert main.introspect_mosaic_key("msk_live_one")["organization_id"] == "org-2"
+    assert main.introspect_mosaic_key("msk_live_three")["organization_id"] == "org-3"
+    assert len(main._mosaic_identity_cache) == 2
+    assert len(calls) == 4
+
+
+def test_mcp_accepts_mosaic_key(client, monkeypatch):
+    monkeypatch.setattr(main, "MOSAIC_INTROSPECTION_URL", "https://sandbox.test/v1/introspect")
+    mosaic_urlopen(monkeypatch, [FakeIntrospectionResponse(200, {
+        "organization_id": "org-mcp",
+        "scopes": ["database:read", "database:write"],
+        "resource_profile": "standard",
+        "status": "active",
+    })])
+    discovered = client.post(
+        "/v1/tenants/discover",
+        headers={"Authorization": "Bearer msk_live_mcp"},
+    )
+    assert discovered.status_code == 200
+    response = client.post(
+        "/mcp",
+        headers={"Authorization": "Bearer msk_live_mcp"},
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+    assert response.status_code == 200
+    assert response.json()["result"]["tools"]
 
 
 def test_revoke_key_does_not_revoke_tenant(client):
@@ -764,7 +1084,7 @@ def test_reaper_stop_cycle(tmp_path, monkeypatch):
     main.DB_PATH = tmp_path / "reaper.db"
     c = main.db()
     main.initialize_schema(c)
-    c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_x", "x", "shared", "h", "active", main.now()))
+    c.execute("INSERT INTO tenants(id,name,plan,api_key_hash,status,created_at) VALUES(?,?,?,?,?,?)", ("ten_x", "x", "shared", "h", "active", main.now()))
     c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_x", "ten_x", "x", str(tmp_path), "ready", main.now()))
     old = "2000-01-01T00:00:00+00:00"
     c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("br_x", "db_x", "main", None, str(tmp_path), 55432, 999999, "running", "x", old, old, "local"))
@@ -781,7 +1101,7 @@ def test_reaper_treats_missing_branch_directory_as_stopped(tmp_path):
     main.initialize_schema(c)
     main_path = tmp_path / "gone"
     main_path.mkdir()
-    c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_x", "x", "shared", "h", "active", main.now()))
+    c.execute("INSERT INTO tenants(id,name,plan,api_key_hash,status,created_at) VALUES(?,?,?,?,?,?)", ("ten_x", "x", "shared", "h", "active", main.now()))
     c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_x", "ten_x", "x", str(tmp_path), "ready", main.now()))
     old = "2000-01-01T00:00:00+00:00"
     c.execute(
@@ -894,7 +1214,7 @@ def test_reaper_skips_unreachable_host_and_continues(tmp_path, monkeypatch):
     main.DB_PATH = tmp_path / "reaper-unreachable.db"
     c = main.db()
     main.initialize_schema(c)
-    c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_r", "r", "shared", "h", "active", main.now()))
+    c.execute("INSERT INTO tenants(id,name,plan,api_key_hash,status,created_at) VALUES(?,?,?,?,?,?)", ("ten_r", "r", "shared", "h", "active", main.now()))
     c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_r", "ten_r", "r", str(tmp_path), "ready", main.now()))
     old = "2000-01-01T00:00:00+00:00"
     for bid, host, port in (("br_bad", "sv2", 55432), ("br_good", "local", 55433)):
@@ -2540,7 +2860,7 @@ def test_reaper_ignores_standbys(tmp_path, monkeypatch):
     main.DB_PATH = tmp_path / "reaper-replica.db"
     c = main.db()
     main.initialize_schema(c)
-    c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_r", "r", "shared", "h", "active", main.now()))
+    c.execute("INSERT INTO tenants(id,name,plan,api_key_hash,status,created_at) VALUES(?,?,?,?,?,?)", ("ten_r", "r", "shared", "h", "active", main.now()))
     c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_r", "ten_r", "r", str(tmp_path), "ready", main.now()))
     old = "2000-01-01T00:00:00+00:00"
     c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("br_r", "db_r", "main", None, str(tmp_path / "main"), 55432, 123, "running", "x", old, old, "local"))
@@ -2570,7 +2890,7 @@ def test_supervisor_reaper_skips_replicated_primary(tmp_path, monkeypatch):
     main.DB_PATH = tmp_path / "supervisor-reaper-replica.db"
     c = main.db()
     main.initialize_schema(c)
-    c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_r", "r", "shared", "h", "active", main.now()))
+    c.execute("INSERT INTO tenants(id,name,plan,api_key_hash,status,created_at) VALUES(?,?,?,?,?,?)", ("ten_r", "r", "shared", "h", "active", main.now()))
     c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_r", "ten_r", "r", str(tmp_path), "ready", main.now()))
     old = "2000-01-01T00:00:00+00:00"
     for branch_id, name in (("br_r", "main"), ("br_e", "ephemeral")):
@@ -3107,7 +3427,7 @@ def test_replica_retry_error_redacts_credentials(tmp_path):
     c = main.db()
     main.initialize_schema(c)
     c.execute(
-        "INSERT INTO tenants VALUES(?,?,?,?,?,?)",
+        "INSERT INTO tenants(id,name,plan,api_key_hash,status,created_at) VALUES(?,?,?,?,?,?)",
         ("ten_redact", "redact", "shared", "h", "active", main.now()),
     )
     c.execute(
@@ -3460,7 +3780,7 @@ def test_reaper_does_not_stop_branch_with_deploy_lock(tmp_path, monkeypatch):
     main.DB_PATH = tmp_path / "deploy-reaper.db"
     c = main.db()
     main.initialize_schema(c)
-    c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_r", "r", "shared", "h", "active", main.now()))
+    c.execute("INSERT INTO tenants(id,name,plan,api_key_hash,status,created_at) VALUES(?,?,?,?,?,?)", ("ten_r", "r", "shared", "h", "active", main.now()))
     c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_r", "ten_r", "r", str(tmp_path), "ready", main.now()))
     c.execute(
         "INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -3651,7 +3971,7 @@ def test_stranded_deploy_lease_is_recovered_and_branch_reaped(tmp_path, monkeypa
     main.DB_PATH = tmp_path / "lease-recovery.db"
     c = main.db()
     main.initialize_schema(c)
-    c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_l", "l", "shared", "h", "active", main.now()))
+    c.execute("INSERT INTO tenants(id,name,plan,api_key_hash,status,created_at) VALUES(?,?,?,?,?,?)", ("ten_l", "l", "shared", "h", "active", main.now()))
     c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_l", "ten_l", "l", str(tmp_path), "ready", main.now()))
     c.execute(
         "INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -3681,7 +4001,7 @@ def test_supervisor_reap_also_respects_deploy_lock(tmp_path, monkeypatch):
     main.DB_PATH = tmp_path / "supervisor-reaper.db"
     c = main.db()
     main.initialize_schema(c)
-    c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_s", "s", "shared", "h", "active", main.now()))
+    c.execute("INSERT INTO tenants(id,name,plan,api_key_hash,status,created_at) VALUES(?,?,?,?,?,?)", ("ten_s", "s", "shared", "h", "active", main.now()))
     c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_s", "ten_s", "s", str(tmp_path), "ready", main.now()))
     c.execute(
         "INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",

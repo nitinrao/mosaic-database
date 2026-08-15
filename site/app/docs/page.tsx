@@ -87,6 +87,18 @@ Content-Type: application/json
  "params":{"name":"query","arguments":{"tenant_id":"ten_…",
  "database_id":"db_…","sql":"SELECT 1 AS ok"}}}`;
 
+const mosaicKey = `export MOSAIC_API_KEY=msk_live_…
+
+# Discover (or provision) this Mosaic organization’s database tenant.
+curl -fsS -X POST https://database-api.mosaicos.com/v1/tenants/discover \\
+  -H "Authorization: Bearer $MOSAIC_API_KEY"
+
+{"tenant_id":"ten_…","plan":"shared","origin":"sandbox"}
+
+# Use the returned tenant ID on the normal tenant-scoped endpoints.
+curl -fsS "https://database-api.mosaicos.com/v1/tenants/ten_…/databases" \\
+  -H "Authorization: Bearer $MOSAIC_API_KEY"`;
+
 export default function DocsPage() {
   return (
     <>
@@ -132,6 +144,25 @@ export default function DocsPage() {
             <p>
               Tenant routes accept <code>X-API-Key</code> or <code>Authorization: Bearer</code>. Keys use the{" "}
               <code>mdb_live_</code> prefix; only a SHA-256 hash is persisted. Keep the returned secret in a secret manager.
+            </p>
+            <Heading level={3} id="mosaic-key">Authenticating with a Mosaic key</Heading>
+            <p>
+              A Sandbox-issued <code>msk_live_…</code> key is an alternative to a local{" "}
+              <code>mdb_live_…</code> key. Call <code>POST /v1/tenants/discover</code> to introspect the
+              credential and obtain (or provision) the database tenant for its Mosaic organization, then use
+              that tenant ID on the normal scoped endpoints.
+            </p>
+            <CodeBlock value={mosaicKey} />
+            <p>
+              Mosaic-key reads, including discovery, require <code>database:read</code>; every non-GET request, including{" "}
+              <code>/query</code>, requires <code>database:write</code>. Sandbox availability becomes this
+              service&apos;s availability for new Mosaic-key credentials. Revocation propagates within a few
+              seconds, while a warm identity may be served for up to 60 seconds during a Sandbox outage.
+            </p>
+            <p>
+              Tenants provisioned from a Mosaic organization do not have a local <code>mdb_live_…</code> key.
+              Their credential lifecycle is managed by Sandbox, so revoke it there instead of rotating or
+              revoking a local database key.
             </p>
           </section>
 
