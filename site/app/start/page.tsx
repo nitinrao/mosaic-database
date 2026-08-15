@@ -27,7 +27,9 @@ export default function StartPage() {
     event.preventDefault();
     setState("sending");
     setErrorMessage("");
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    let shouldReset = false;
     try {
       const response = await fetch(API_ENDPOINT, {
         method: "POST",
@@ -47,11 +49,12 @@ export default function StartPage() {
       }
       setResult(payload as SignupResult);
       setState("success");
-      event.currentTarget.reset();
+      shouldReset = true;
     } catch {
       setState("error");
       setErrorMessage("The signup service could not be reached. Please try again.");
     }
+    if (shouldReset) formElement.reset();
   }
 
   return (

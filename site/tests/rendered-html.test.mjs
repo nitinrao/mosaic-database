@@ -79,8 +79,16 @@ test("publishes database crawler files", async () => {
 test("sets security headers on rendered responses", async () => {
   const response = await render();
   assert.match(response.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
+  assert.match(response.headers.get("content-security-policy") ?? "", /https:\/\/sandbox\.mosaicos\.com/);
   assert.equal(response.headers.get("strict-transport-security"), "max-age=31536000; includeSubDomains");
   assert.equal(response.headers.get("x-content-type-options"), "nosniff");
   assert.equal(response.headers.get("x-frame-options"), "DENY");
   assert.ok(response.headers.get("x-request-id"));
+});
+
+test("captures the signup form before awaiting the response", async () => {
+  const source = await readFile(new URL("../app/start/page.tsx", import.meta.url), "utf8");
+  assert.match(source, /const formElement = event\.currentTarget;/);
+  assert.match(source, /new FormData\(formElement\)/);
+  assert.doesNotMatch(source, /event\.currentTarget\.reset\(\)/);
 });
