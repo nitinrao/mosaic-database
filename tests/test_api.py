@@ -134,6 +134,12 @@ def test_database_branch_lifecycle_and_main_protection(client):
     assert branch["id"].startswith("br_")
     assert len(client.get(f"/v1/tenants/{tid}/databases/{did}/branches", headers={"X-API-Key": key}).json()["branches"]) == 2
     assert client.delete(f"/v1/tenants/{tid}/databases/{did}/branches/{database['main_branch']['id']}", headers={"X-API-Key": key}).status_code == 400
+    c = main.db()
+    branch_path = c.execute(
+        "SELECT path FROM branches WHERE id=?", (branch["id"],)
+    ).fetchone()["path"]
+    c.close()
+    shutil.rmtree(branch_path)
     assert client.delete(f"/v1/tenants/{tid}/databases/{did}/branches/{branch['id']}", headers={"X-API-Key": key}).status_code == 200
 
 

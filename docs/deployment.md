@@ -126,8 +126,9 @@ node. Standbys use `hot_standby=off` and are not readable; no query routing
 targets them. The tenant replica API reports observed bytes behind the
 primary's WAL replay position and the timestamp of the last sample. Standby
 base backups run asynchronously on the node agent; replica rows report
-`pending`, `building`, `ready`, or retryable failure states while the control
-plane polls job status. Replica data directories live under the reserved
+`pending`, `building`, `ready`, `rebuild_required`, or retryable failure
+states while the control plane polls job status. Replica data directories live
+under the reserved
 `.replicas` directory beside the primary branch, outside the tenant branch
 namespace. A replica is not a branch and is never selected by the idle branch
 reaper. HTTPS node-agent connections always use certificate verification via
@@ -139,12 +140,20 @@ a host loses its ephemeral branches. Standbys remain dark until a later manual
 or scripted promotion. Automatic failover, leader election, watchdogs,
 synchronous replication, and PITR are not implemented. Promotion is
 operator-triggered through `POST /v1/admin/databases/{database_id}/promote`
-with the `X-Admin-Key` header. The control plane stops the old primary before
-promoting a reachable standby; an unreachable old-primary host requires
-`force=true`, which is the operator's explicit assertion that it is dead. The
-response's observed lag is the RPO for that promotion event. Every surviving
-standby, including the old primary when it returns, is rebuilt from a fresh
-base backup instead of being reattached to the new timeline.
+with the `X-Admin-Key` header. The control plane verifies the old primary's
+actual cluster state from its data directory, rather than trusting the
+recorded PID, and stops it before promoting a reachable standby. Promotion
+refuses while that cluster is still running unless the operator uses
+`force=true`; an unreachable old-primary host also requires `force=true`,
+which is the operator's explicit assertion that it is dead. The response's
+observed lag is the RPO for that promotion event. Every surviving standby,
+including the old primary when it returns, is marked `rebuild_required` and
+forced through a full teardown and fresh `pg_basebackup` rather than reusing
+anything found at the target path or being reattached to the new timeline.
+This prevents a stale standby on a diverged timeline from being reported
+healthy. If that forced rebuild fails, it remains `rebuild_required` and
+retries with backoff. Slot-invalidated replicas are automatically reconciled
+through the same rebuild path.
 Promotion rejects missing or stale lag samples and lag above
 `MOSAIC_PROMOTION_MAX_LAG_BYTES` (10 GiB by default); configure the freshness
 window with `MOSAIC_PROMOTION_MAX_LAG_AGE_SECONDS` (five minutes by default).
