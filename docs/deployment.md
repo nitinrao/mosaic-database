@@ -75,6 +75,12 @@ MOSAIC_NODE_AGENT_TOKEN=<shared-internal-token>
 MOSAIC_NODE_AGENT_CA_BUNDLE=/etc/mosaic-database/node-agent-ca.pem
 ```
 
+`MOSAIC_NODE_ID` identifies which configured node this process runs on. If
+`MOSAIC_NODE_HOSTS` contains one node and `MOSAIC_NODE_ID` is unset, it defaults
+to that sole node. Every host in a multi-node deployment must set
+`MOSAIC_NODE_ID` to its own ID from `MOSAIC_NODE_HOSTS`; an unknown identity is
+rejected during startup.
+
 Every configured node must have an explicit private address. Public host
 addresses are not inferred, and PostgreSQL never binds to `0.0.0.0`.
 The node agent exposes lifecycle operations only through its authenticated

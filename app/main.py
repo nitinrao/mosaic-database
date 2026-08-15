@@ -750,7 +750,24 @@ class NodeAgent:
 
 
 def current_node_id() -> str:
+    configured = os.getenv("MOSAIC_NODE_ID")
+    if configured is not None:
+        return configured
+    nodes = configured_nodes()
+    if len(nodes) == 1 and not nodes[0][1]:
+        return nodes[0][0]
     return NODE_ID
+
+
+def validate_node_identity():
+    configured = os.getenv("MOSAIC_NODE_ID")
+    if configured is None:
+        return
+    nodes = node_ids()
+    if configured not in nodes:
+        raise RuntimeError(
+            f"MOSAIC_NODE_ID={configured!r} is not present in MOSAIC_NODE_HOSTS"
+        )
 
 
 class NodeTransport:
@@ -1053,6 +1070,7 @@ def reap_branches(c: Conn) -> int:
 @app.on_event("startup")
 async def startup():
     global _reaper_task, _replication_task
+    validate_node_identity()
     if not CREDENTIAL_ENCRYPTION_KEY:
         if os.getenv("MOSAIC_ALLOW_EPHEMERAL_CREDENTIAL_KEY", "").lower() == "true":
             key_path = BRANCH_ROOT / ".credential.key"

@@ -35,6 +35,9 @@ deterministic hash of the database ID, while child branches remain on their
 parent's node. Lifecycle operations use the same node-agent path for local
 and remote nodes: local calls are in-process and remote calls use the
 authenticated internal HTTP agent with `MOSAIC_NODE_AGENT_TOKEN`.
+`MOSAIC_NODE_ID` identifies the node running this process. It resolves to the
+sole configured node when `MOSAIC_NODE_HOSTS` has one entry and the variable is
+unset; multi-node deployments must set it to this host's configured node ID.
 
 In multi-host mode PostgreSQL listens only on the configured private address
 for its node, and `pg_hba.conf` permits the configured peer addresses; it
