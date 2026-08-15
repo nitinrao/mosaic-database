@@ -797,6 +797,7 @@ def test_starting_standby_signal_does_not_promote(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "psycopg", FakePsycopg())
     monkeypatch.setattr(main, "subprocess", type("Subprocess", (), {"run": staticmethod(run)}))
     monkeypatch.setattr(main, "alive", lambda pid: False)
+    monkeypatch.setattr(main.Supervisor, "_cluster_is_running", lambda self, path, require_path=False: False)
     result = main.Supervisor().start_local({
         "path": str(path),
         "branch_id": "br",
@@ -809,6 +810,64 @@ def test_starting_standby_signal_does_not_promote(tmp_path, monkeypatch):
     })
     assert result == {"status": "running", "pid": 456}
     assert not any(call[-1] == "promote" for call in calls)
+
+
+def test_start_local_adopts_running_cluster_with_stale_ledger_pid(tmp_path, monkeypatch):
+    path = tmp_path / "branch"
+    path.mkdir()
+    (path / "PG_VERSION").write_text("14\n")
+    (path / "postmaster.pid").write_text("456\n")
+    calls = []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, query):
+            return self
+
+        def commit(self):
+            return None
+
+    class FakePsycopg:
+        def connect(self, **kwargs):
+            return Connection()
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    monkeypatch.setattr(main, "subprocess", type("Subprocess", (), {"run": staticmethod(run)}))
+    monkeypatch.setattr(main.Supervisor, "_cluster_is_running", lambda self, path, require_path=False: True)
+    result = main.Supervisor().start_local({
+        "path": str(path),
+        "branch_id": "br",
+        "port": 55432,
+        "host_id": "local",
+        "pid": 123,
+        "status": "running",
+        "password": "secret",
+        "parent_passwords": [],
+    })
+    assert result == {"status": "running", "pid": 456}
+    assert calls == []
+
+
+def test_start_local_requires_cluster_directory(tmp_path):
+    with pytest.raises(RuntimeError, match="no PostgreSQL cluster"):
+        main.Supervisor().start_local({
+            "path": str(tmp_path / "missing"),
+            "branch_id": "br",
+            "port": 55432,
+            "host_id": "local",
+            "pid": None,
+            "status": "stopped",
+            "password": "secret",
+            "parent_passwords": [],
+        })
 
 
 def test_promotion_requires_ready_replica_and_fresh_lag(client, monkeypatch):

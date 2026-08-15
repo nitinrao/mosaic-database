@@ -502,26 +502,42 @@ class Supervisor:
         branch_id = payload["branch_id"]
         port = int(payload["port"])
         host_id = payload["host_id"]
-        if payload.get("status") == "running" and alive(payload.get("pid")):
-            return {"status": "running", "pid": payload["pid"]}
         if not (path / "PG_VERSION").exists():
             raise RuntimeError(f"branch {branch_id} has no PostgreSQL cluster at {path}")
         if psycopg is None:
             raise RuntimeError("psycopg is required to supervise PostgreSQL branches")
-        subprocess.run([pg_bin("pg_ctl"), "-D", str(path), "-o", f"-p {port}", "-l", str(path / "postgres.log"), "-w", "start"], check=True, capture_output=True)
         branch_password = payload["password"]
-        for candidate in [branch_password, *payload.get("parent_passwords", [])]:
+        if not self._cluster_is_running(str(path)):
+            subprocess.run([pg_bin("pg_ctl"), "-D", str(path), "-o", f"-p {port}", "-l", str(path / "postgres.log"), "-w", "start"], check=True, capture_output=True)
+        self._reconcile_password(
+            path,
+            port,
+            host_id,
+            branch_id,
+            branch_password,
+            payload.get("parent_passwords", []),
+        )
+        pid = int((path / "postmaster.pid").read_text().splitlines()[0])
+        return {"status": "running", "pid": pid}
+
+    def _reconcile_password(
+        self,
+        path: Path,
+        port: int,
+        host_id: str,
+        branch_id: str,
+        branch_password: str,
+        parent_passwords: list[str],
+    ) -> None:
+        for candidate in [branch_password, *parent_passwords]:
             try:
                 with psycopg.connect(host=node_address(host_id), port=port, user="postgres", password=candidate, dbname="postgres", connect_timeout=5) as connection:
                     connection.execute(psycopg_sql.SQL("ALTER ROLE postgres PASSWORD {}").format(psycopg_sql.Literal(branch_password)))
                     connection.commit()
-                break
+                return
             except Exception:
                 continue
-        else:
-            raise RuntimeError(f"unable to set password for branch {branch_id}")
-        pid = int((path / "postmaster.pid").read_text().splitlines()[0])
-        return {"status": "running", "pid": pid}
+        raise RuntimeError(f"unable to set password for branch {branch_id}")
 
     def _cluster_is_running(self, path: str, require_path: bool = False) -> bool:
         if not Path(path).exists():
