@@ -818,6 +818,7 @@ def test_start_local_adopts_running_cluster_with_stale_ledger_pid(tmp_path, monk
     (path / "PG_VERSION").write_text("14\n")
     (path / "postmaster.pid").write_text("456\n")
     calls = []
+    connections = []
 
     class Connection:
         def __enter__(self):
@@ -827,6 +828,7 @@ def test_start_local_adopts_running_cluster_with_stale_ledger_pid(tmp_path, monk
             return False
 
         def execute(self, query):
+            connections.append(query)
             return self
 
         def commit(self):
@@ -854,6 +856,46 @@ def test_start_local_adopts_running_cluster_with_stale_ledger_pid(tmp_path, monk
     })
     assert result == {"status": "running", "pid": 456}
     assert calls == []
+    assert connections == []
+
+
+def test_start_local_fast_path_skips_status_and_password_reconciliation(tmp_path, monkeypatch):
+    path = tmp_path / "branch"
+    path.mkdir()
+    (path / "PG_VERSION").write_text("14\n")
+
+    monkeypatch.setattr(main, "alive", lambda pid: True)
+    monkeypatch.setattr(
+        main.Supervisor,
+        "_cluster_is_running",
+        lambda *args, **kwargs: pytest.fail("status check should not run on the fast path"),
+    )
+    monkeypatch.setattr(
+        main,
+        "subprocess",
+        type(
+            "Subprocess",
+            (),
+            {"run": staticmethod(lambda *args, **kwargs: pytest.fail("pg_ctl should not run on the fast path"))},
+        ),
+    )
+
+    class FakePsycopg:
+        def connect(self, **kwargs):
+            pytest.fail("password reconciliation should not run on the fast path")
+
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    result = main.Supervisor().start_local({
+        "path": str(path),
+        "branch_id": "br",
+        "port": 55432,
+        "host_id": "local",
+        "pid": 123,
+        "status": "running",
+        "password": "secret",
+        "parent_passwords": [],
+    })
+    assert result == {"status": "running", "pid": 123}
 
 
 def test_start_local_requires_cluster_directory(tmp_path):

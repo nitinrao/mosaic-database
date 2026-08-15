@@ -502,6 +502,8 @@ class Supervisor:
         branch_id = payload["branch_id"]
         port = int(payload["port"])
         host_id = payload["host_id"]
+        if payload.get("status") == "running" and alive(payload.get("pid")):
+            return {"status": "running", "pid": payload["pid"]}
         if not (path / "PG_VERSION").exists():
             raise RuntimeError(f"branch {branch_id} has no PostgreSQL cluster at {path}")
         if psycopg is None:
@@ -529,7 +531,12 @@ class Supervisor:
         branch_password: str,
         parent_passwords: list[str],
     ) -> None:
-        for candidate in [branch_password, *parent_passwords]:
+        try:
+            with psycopg.connect(host=node_address(host_id), port=port, user="postgres", password=branch_password, dbname="postgres", connect_timeout=5):
+                return
+        except Exception:
+            pass
+        for candidate in parent_passwords:
             try:
                 with psycopg.connect(host=node_address(host_id), port=port, user="postgres", password=candidate, dbname="postgres", connect_timeout=5) as connection:
                     connection.execute(psycopg_sql.SQL("ALTER ROLE postgres PASSWORD {}").format(psycopg_sql.Literal(branch_password)))
