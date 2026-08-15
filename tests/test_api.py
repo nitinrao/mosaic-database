@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -344,7 +345,11 @@ def test_standby_build_argv(tmp_path, monkeypatch):
     (target / "postgresql.conf").write_text("")
     (target / "pg_hba.conf").write_text("")
     calls = []
-    main.NodeAgent(calls.append).handle("build_standby", {
+
+    def run(argv):
+        calls.append(argv)
+
+    main.NodeAgent(run).handle("build_standby", {
         "target_path": str(target),
         "target_port": 55433,
         "target_host_id": "sv2",
@@ -361,8 +366,9 @@ def test_standby_build_argv(tmp_path, monkeypatch):
     ]
     assert calls[1] == [
         main.pg_bin("pg_ctl"), "-D", str(target), "-l",
-        str(target / "postgres.log"), "-w", "start",
+        str(target / "postgres.log"), "start",
     ]
+    assert calls[2] == [main.pg_bin("pg_ctl"), "-D", str(target), "status"]
 
 
 def test_reaper_ignores_standbys(tmp_path, monkeypatch):
@@ -431,7 +437,7 @@ def test_replica_lag_surfaces_through_api(client, monkeypatch):
 
 
 def test_plaintext_remote_transport_requires_opt_out(monkeypatch):
-    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2=http://10.0.0.2:8000")
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "sv2=http://10.0.0.2:8000")
     monkeypatch.setattr(main, "ALLOW_PLAINTEXT_NODE_AGENT", False)
     with pytest.raises(RuntimeError, match="plaintext node-agent transport"):
         main.NodeTransport(main.NodeAgent()).call("sv2", "inspect", {})
@@ -642,6 +648,127 @@ def test_repeated_primary_preparation_is_idempotent(tmp_path, monkeypatch):
     agent.handle("prepare_primary", payload)
     assert sum("ALTER ROLE" in query for query in calls) == 2
     assert not any("CREATE ROLE" in query for query in calls)
+    assert f"max_slot_wal_keep_size = {main.REPLICATION_WAL_RETENTION_BYTES}B" in config.read_text()
+
+
+def test_replication_identifiers_are_valid_and_database_specific():
+    first = main.replication_identifier("db_Ab-cD", "sv2-west")
+    second = main.replication_identifier("db_Ab-cE", "sv2-west")
+    assert re.fullmatch(r"[a-z0-9_]+", first)
+    assert len(first) <= 63
+    assert first != second
+
+
+def test_standby_build_clears_partial_target_before_backup(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
+    target.mkdir()
+    (target / "partial").write_text("stale")
+    seen = []
+
+    def run(argv):
+        if argv[0] == main.pg_bin("pg_basebackup"):
+            seen.append(target.exists())
+            raise RuntimeError("backup failed")
+
+    with pytest.raises(RuntimeError, match="backup failed"):
+        main.NodeAgent(run).handle("build_standby", {
+            "target_path": str(target),
+            "target_port": 55433,
+            "target_host_id": "local",
+            "primary_address": "127.0.0.1",
+            "primary_port": 55432,
+            "replication_user": "mosaic_repl_db",
+            "replication_password": "secret",
+        })
+    assert seen == [False]
+
+
+def test_prepare_primary_refreshes_pid_after_restart(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    primary = root / "primary"
+    primary.mkdir()
+    (primary / "postgresql.conf").write_text("listen_addresses = '10.0.0.2'\n")
+    calls = []
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, query, params=None):
+            if "FROM pg_roles" in str(query):
+                return type("Result", (), {"fetchone": lambda self: {"?column?": 1}})()
+            return self
+
+        def fetchall(self):
+            return []
+
+        def commit(self):
+            return None
+
+    class FakePsycopg:
+        def connect(self, **kwargs):
+            return FakeConnection()
+
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    monkeypatch.setattr(main.supervisor, "start_local", lambda payload: {"status": "running", "pid": 111})
+    monkeypatch.setattr(main, "alive", lambda pid: True)
+
+    def run(argv):
+        calls.append(argv)
+        if argv[-1] == "restart":
+            (primary / "postmaster.pid").write_text("222\n")
+
+    result = main.NodeAgent(run).handle("prepare_primary", {
+        "path": str(primary),
+        "port": 55432,
+        "host_id": "local",
+        "branch_id": "br",
+        "pid": 111,
+        "status": "running",
+        "postgres_password": "postgres",
+        "replication_user": "mosaic_repl",
+        "replication_password": "secret",
+        "replication_addresses": [],
+        "replication_slots": [],
+    })
+    assert result["pid"] == 222
+
+
+def test_replica_retry_error_redacts_credentials(tmp_path):
+    main.DB_PATH = tmp_path / "redaction.db"
+    c = main.db()
+    main.initialize_schema(c)
+    c.execute(
+        "INSERT INTO tenants VALUES(?,?,?,?,?,?)",
+        ("ten_redact", "redact", "shared", "h", "active", main.now()),
+    )
+    c.execute(
+        "INSERT INTO databases VALUES(?,?,?,?,?,?)",
+        ("db_redact", "ten_redact", "redact", str(tmp_path), "ready", main.now()),
+    )
+    c.execute(
+        "INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("br_redact", "db_redact", "main", None, str(tmp_path / "main"), 55432, None, "stopped", "x", main.now(), main.now(), "local"),
+    )
+    c.execute(
+        "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("rep_redact", "db_redact", "br_redact", "sv2", str(tmp_path / "standby"), 55433, "pending", None, None, main.now(), "slot_redact"),
+    )
+    row = c.execute("SELECT * FROM replicas WHERE id=?", ("rep_redact",)).fetchone()
+    main._retry_replica(c, row, RuntimeError("failed postgres=pg-secret replication=repl-secret"), ("pg-secret", "repl-secret"))
+    stored = c.execute("SELECT last_error FROM replicas WHERE id=?", ("rep_redact",)).fetchone()["last_error"]
+    assert "pg-secret" not in stored
+    assert "repl-secret" not in stored
+    assert "[REDACTED]" in stored
+    c.close()
 
 
 def test_failed_lag_sample_is_visible(client, monkeypatch):
