@@ -20,11 +20,11 @@ from glob import glob
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Annotated, Any, Callable, Literal, Protocol
 
 from cryptography.fernet import Fernet, InvalidToken
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response
+from pydantic import BaseModel, ConfigDict, Field
 
 try:
     import psycopg
@@ -65,12 +65,13 @@ REPLICATION_SLOT_INACTIVE_POLLS = 20
 REPLICATION_SLOT_INACTIVE_POLL_SECONDS = 0.05
 RESERVED_BRANCH_NAMES = {".replicas", "replicas"}
 PLANS = {
-    "shared": {"monthly_cents": 10000, "max_databases": 5, "max_branches": 20, "max_rows": 10000, "max_bytes": 1000000, "statement_timeout_ms": 5000},
-    "dedicated": {"monthly_cents": 50000, "max_databases": 20, "max_branches": 100, "max_rows": 100000, "max_bytes": 10000000, "statement_timeout_ms": 30000},
+    "shared": {"monthly_cents": 10000, "max_databases": 5, "max_branches": 20, "max_rows": 10000, "max_bytes": 1000000, "statement_timeout_ms": 5000, "max_deploy_operations": 20, "max_deploys_per_day": 50},
+    "dedicated": {"monthly_cents": 50000, "max_databases": 20, "max_branches": 100, "max_rows": 100000, "max_bytes": 10000000, "statement_timeout_ms": 30000, "max_deploy_operations": 100, "max_deploys_per_day": 200},
 }
 MCP_PROTOCOL_VERSION = "2025-03-26"
 MCP_TOOLS = [{"name": n, "description": d, "inputSchema": {"type": "object"}} for n, d in (
     ("inspect_schema", "Inspect branch schema"), ("query", "Execute one governed statement"),
+    ("deploy", "Create a declarative schema deploy"), ("get_deploy", "Get a schema deploy"),
     ("create_branch", "Create a branch"), ("list_branches", "List branches"))]
 _rate: dict[str, list[float]] = {}
 _rate_lock = threading.Lock()
@@ -234,6 +235,8 @@ def initialize_schema(c: Conn):
     CREATE TABLE IF NOT EXISTS abandoned_clusters (id TEXT PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id), host_id TEXT NOT NULL, path TEXT NOT NULL, port INTEGER NOT NULL, created_at TEXT NOT NULL, reason TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS usage_events (id {integer}, tenant_id TEXT NOT NULL REFERENCES tenants(id), kind TEXT NOT NULL, quantity INTEGER NOT NULL, unit TEXT NOT NULL, occurred_at TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{{}}', idempotency_key TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS audit_log (id {integer}, tenant_id TEXT, action TEXT NOT NULL, actor TEXT NOT NULL, details TEXT NOT NULL DEFAULT '{{}}', created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS deploy_requests (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id), database_id TEXT NOT NULL REFERENCES databases(id), branch_id TEXT NOT NULL REFERENCES branches(id), operations TEXT NOT NULL, sql_preview TEXT NOT NULL, status TEXT NOT NULL, schema_version INTEGER NOT NULL DEFAULT 0, error TEXT, idempotency_key TEXT NOT NULL DEFAULT '', source_deploy_id TEXT, created_at TEXT NOT NULL, applied_at TEXT);
+    CREATE TABLE IF NOT EXISTS deploy_locks (branch_id TEXT PRIMARY KEY REFERENCES branches(id), deploy_id TEXT NOT NULL UNIQUE REFERENCES deploy_requests(id), started_at TEXT NOT NULL);
     """)
     columns = (
         [row["column_name"] for row in c.execute(
@@ -261,6 +264,7 @@ def initialize_schema(c: Conn):
         if column not in replica_columns:
             c.execute(f"ALTER TABLE replicas ADD COLUMN {column} {definition}")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS usage_idempotency ON usage_events(tenant_id,idempotency_key) WHERE idempotency_key <> ''")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS deploy_idempotency ON deploy_requests(tenant_id,idempotency_key) WHERE idempotency_key <> ''")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS branches_port_unique ON branches(port)")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS replicas_port_unique ON replicas(port)")
     c.commit()
@@ -1654,6 +1658,7 @@ app = FastAPI(title="Mosaic Database", version="0.1.0")
 _reaper_task: asyncio.Task | None = None
 _replication_task: asyncio.Task | None = None
 _branch_mutation_lock = threading.Lock()
+_deploy_lock = threading.Lock()
 
 
 async def _reaper_loop():
@@ -1704,6 +1709,7 @@ def reap_branches(c: Conn) -> int:
     for row in c.execute(
         "SELECT b.* FROM branches b "
         "WHERE b.status='running' "
+        "AND NOT EXISTS (SELECT 1 FROM deploy_locks l WHERE l.branch_id=b.id) "
         "AND NOT EXISTS ("
         "SELECT 1 FROM replicas r WHERE r.primary_branch_id=b.id"
         ")"
@@ -1858,6 +1864,84 @@ class Query(BaseModel):
     branch: str = "main"
 
 
+class DeployModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class DeployColumn(DeployModel):
+    name: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
+    type: str = Field(min_length=1, max_length=32)
+    nullable: bool = True
+    pk: bool = False
+    identity: bool = False
+    default: str | None = None
+
+
+class CreateTableOperation(DeployModel):
+    op: Literal["create_table"]
+    name: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
+    columns: list[DeployColumn] = Field(min_length=1, max_length=100)
+
+
+class AddColumnOperation(DeployModel):
+    op: Literal["add_column"]
+    table: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
+    column: DeployColumn
+
+
+class CreateIndexOperation(DeployModel):
+    op: Literal["create_index"]
+    table: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
+    columns: list[str] = Field(min_length=1, max_length=32)
+    unique: bool = False
+
+
+class AddConstraintOperation(DeployModel):
+    op: Literal["add_constraint"]
+    table: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
+    kind: Literal["check"]
+    expression: str = Field(min_length=1, max_length=1000)
+
+
+class RenameColumnOperation(DeployModel):
+    op: Literal["rename_column"]
+    table: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
+    from_: str = Field(alias="from", pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
+    to: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
+
+
+class DropColumnOperation(DeployModel):
+    op: Literal["drop_column"]
+    table: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
+    column: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
+    confirm_destructive: bool = False
+
+
+class DropTableOperation(DeployModel):
+    op: Literal["drop_table"]
+    name: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
+    confirm_destructive: bool = False
+
+
+DeployOperation = Annotated[
+    CreateTableOperation
+    | AddColumnOperation
+    | CreateIndexOperation
+    | AddConstraintOperation
+    | RenameColumnOperation
+    | DropColumnOperation
+    | DropTableOperation,
+    Field(discriminator="op"),
+]
+
+
+class DeployCreate(DeployModel):
+    branch: str = "main"
+    operations: list[DeployOperation] = Field(min_length=1, max_length=100)
+    idempotency_key: str = Field(default="", max_length=200)
+    source_deploy_id: str | None = Field(default=None, max_length=100)
+
+
 class Usage(BaseModel):
     kind: str
     quantity: int = Field(ge=0)
@@ -1867,6 +1951,119 @@ class Usage(BaseModel):
 
 def audit(c: Conn, tenant_id: str | None, action: str, details: dict, actor: str = "api"):
     c.execute("INSERT INTO audit_log(tenant_id,action,actor,details,created_at) VALUES(?,?,?,?,?)", (tenant_id, action, actor, json.dumps(details), now()))
+
+
+DEPLOY_TYPES = {
+    "smallint",
+    "integer",
+    "bigint",
+    "numeric",
+    "real",
+    "double precision",
+    "boolean",
+    "text",
+    "varchar",
+    "date",
+    "timestamp",
+    "timestamptz",
+    "uuid",
+    "json",
+    "jsonb",
+}
+DEPLOY_DEFAULT = re.compile(r"^(?:now\(\)|current_timestamp|true|false|null|-?\d+(?:\.\d+)?|'(?:[^']|'')*')$", re.IGNORECASE)
+DEPLOY_EXPRESSION = re.compile(r"^[A-Za-z0-9_.'\"()\s=<>!+\-*/%,:]+$")
+
+
+def quote_identifier(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", value):
+        raise HTTPException(400, "invalid identifier")
+    return '"' + value.replace('"', '""') + '"'
+
+
+def deploy_type(value: str) -> str:
+    normalized = " ".join(value.strip().lower().split())
+    if normalized not in DEPLOY_TYPES:
+        raise HTTPException(400, f"unsupported column type: {value}")
+    return normalized
+
+
+def deploy_column_sql(column: DeployColumn) -> str:
+    column_type = deploy_type(column.type)
+    if column.identity and column.default is not None:
+        raise HTTPException(400, f"identity column {column.name} cannot have a default")
+    parts = [quote_identifier(column.name), column_type]
+    if column.identity:
+        parts.append("GENERATED BY DEFAULT AS IDENTITY")
+    if not column.nullable:
+        parts.append("NOT NULL")
+    if column.default is not None:
+        default = column.default.strip()
+        if not DEPLOY_DEFAULT.fullmatch(default):
+            raise HTTPException(400, f"unsupported default for column {column.name}")
+        parts.extend(("DEFAULT", default))
+    if column.pk:
+        parts.extend(("PRIMARY", "KEY"))
+    return " ".join(parts)
+
+
+def compile_deploy_operations(operations: list[DeployOperation]) -> list[str]:
+    compiled = []
+    for operation in operations:
+        if isinstance(operation, CreateTableOperation):
+            columns = [deploy_column_sql(column) for column in operation.columns]
+            if len({column.name.lower() for column in operation.columns}) != len(operation.columns):
+                raise HTTPException(400, "duplicate column in create_table")
+            if sum(column.pk for column in operation.columns) > 1:
+                raise HTTPException(400, "create_table supports one primary key column")
+            compiled.append(f"CREATE TABLE {quote_identifier(operation.name)} ({', '.join(columns)})")
+        elif isinstance(operation, AddColumnOperation):
+            compiled.append(f"ALTER TABLE {quote_identifier(operation.table)} ADD COLUMN {deploy_column_sql(operation.column)}")
+        elif isinstance(operation, CreateIndexOperation):
+            columns = [quote_identifier(column) for column in operation.columns]
+            index_name = f"idx_{operation.table}_{'_'.join(operation.columns)}"[:63]
+            compiled.append(
+                f"CREATE {'UNIQUE ' if operation.unique else ''}INDEX {quote_identifier(index_name)} "
+                f"ON {quote_identifier(operation.table)} ({', '.join(columns)})"
+            )
+        elif isinstance(operation, AddConstraintOperation):
+            if not DEPLOY_EXPRESSION.fullmatch(operation.expression) or any(
+                marker in operation.expression.lower() for marker in ("--", "/*", "*/", ";")
+            ):
+                raise HTTPException(400, "constraint expression contains unsupported SQL")
+            suffix = hashlib.sha256(operation.expression.encode()).hexdigest()[:10]
+            name = f"ck_{operation.table}_{suffix}"[:63]
+            compiled.append(
+                f"ALTER TABLE {quote_identifier(operation.table)} ADD CONSTRAINT {quote_identifier(name)} "
+                f"CHECK ({operation.expression})"
+            )
+        elif isinstance(operation, RenameColumnOperation):
+            compiled.append(
+                f"ALTER TABLE {quote_identifier(operation.table)} RENAME COLUMN "
+                f"{quote_identifier(operation.from_)} TO {quote_identifier(operation.to)}"
+            )
+        elif isinstance(operation, DropColumnOperation):
+            if not operation.confirm_destructive:
+                raise HTTPException(400, "drop_column requires confirm_destructive=true")
+            compiled.append(f"ALTER TABLE {quote_identifier(operation.table)} DROP COLUMN {quote_identifier(operation.column)}")
+        elif isinstance(operation, DropTableOperation):
+            if not operation.confirm_destructive:
+                raise HTTPException(400, "drop_table requires confirm_destructive=true")
+            compiled.append(f"DROP TABLE {quote_identifier(operation.name)}")
+        else:
+            raise HTTPException(400, "unsupported deploy operation")
+    return compiled
+
+
+def deploy_is_destructive(operations: list[DeployOperation]) -> bool:
+    return any(isinstance(operation, (DropColumnOperation, DropTableOperation)) for operation in operations)
+
+
+def deploy_operations_json(operations: list[DeployOperation]) -> str:
+    return json.dumps(
+        [operation.model_dump(by_alias=True, mode="json") for operation in operations],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def is_unique_violation(exc: Exception) -> bool:
@@ -1978,6 +2175,24 @@ def mcp(payload: dict, request: Request, response: Response, x_api_key: str | No
             result = database_schema(tenant["id"], args["database_id"], args.get("branch", "main"), tenant)
         elif name == "query":
             result = execute_query(tenant["id"], args["database_id"], Query(sql=args["sql"], params=args.get("params", []), branch=args.get("branch", "main")), tenant)
+        elif name == "deploy":
+            result = create_deploy_request(
+                c,
+                tenant["id"],
+                args["database_id"],
+                DeployCreate(
+                    branch=args.get("branch", "main"),
+                    operations=args["operations"],
+                    idempotency_key=args.get("idempotency_key", ""),
+                    source_deploy_id=args.get("source_deploy_id"),
+                ),
+                tenant,
+            )
+        elif name == "get_deploy":
+            row = deploy_row(c, args["deploy_id"], tenant["id"])
+            if row["database_id"] != args["database_id"]:
+                raise HTTPException(404, "deploy request not found")
+            result = deploy_response(row)
         elif name == "create_branch":
             result = _create_branch(c, tenant["id"], args["database_id"], BranchCreate(name=args["name"], parent=args.get("parent", "main")), tenant)
         elif name == "list_branches":
@@ -2657,6 +2872,257 @@ def database_schema(tid: str, did: str, branch_name: str, tenant):
 @app.get("/v1/tenants/{tid}/databases/{did}/schema")
 def schema(tid: str, did: str, branch: str = "main", tenant=Depends(tenant_auth)):
     return database_schema(tid, did, branch, tenant)
+
+
+def deploy_response(row, *, duplicate: bool = False):
+    result = {
+        "id": row["id"],
+        "database_id": row["database_id"],
+        "branch": row["branch_name"],
+        "status": row["status"],
+        "operations": json.loads(row["operations"]),
+        "sql_preview": json.loads(row["sql_preview"]),
+        "schema_version": row["schema_version"],
+        "error": row["error"],
+        "source_deploy_id": row["source_deploy_id"],
+        "created_at": row["created_at"],
+        "applied_at": row["applied_at"],
+    }
+    if duplicate:
+        result["duplicate"] = True
+    return result
+
+
+def deploy_row(c: Conn, deploy_id: str, tid: str):
+    row = c.execute(
+        "SELECT r.*, b.name AS branch_name "
+        "FROM deploy_requests r JOIN branches b ON b.id=r.branch_id "
+        "WHERE r.id=? AND r.tenant_id=?",
+        (deploy_id, tid),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "deploy request not found")
+    return row
+
+
+def create_deploy_request(c: Conn, tid: str, did: str, payload: DeployCreate, tenant):
+    database_row = database(c, tid, did)
+    branch_row = branch(c, did, payload.branch)
+    operations_json = deploy_operations_json(payload.operations)
+    sql_preview = compile_deploy_operations(payload.operations)
+    plan = PLANS[tenant["plan"]]
+    if len(payload.operations) > plan["max_deploy_operations"]:
+        raise HTTPException(403, "deploy operation limit exceeded")
+    if payload.idempotency_key:
+        existing = c.execute(
+            "SELECT r.*, b.name AS branch_name FROM deploy_requests r JOIN branches b ON b.id=r.branch_id "
+            "WHERE r.tenant_id=? AND r.idempotency_key=?",
+            (tid, payload.idempotency_key),
+        ).fetchone()
+        if existing:
+            return deploy_response(existing, duplicate=True)
+    if branch_row["name"] == "main":
+        if deploy_is_destructive(payload.operations):
+            raise HTTPException(400, "destructive deploys are not allowed on main")
+        if not payload.source_deploy_id:
+            raise HTTPException(400, "main deploy requires a successful branch deploy reference")
+        source = c.execute(
+            "SELECT * FROM deploy_requests WHERE id=? AND tenant_id=? AND database_id=?",
+            (payload.source_deploy_id, tid, did),
+        ).fetchone()
+        if (
+            not source
+            or source["status"] != "applied"
+            or source["branch_id"] == branch_row["id"]
+            or source["operations"] != operations_json
+        ):
+            raise HTTPException(400, "main deploy must reference a matching successful branch deploy")
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    recent = c.execute(
+        "SELECT COUNT(*) AS n FROM deploy_requests WHERE tenant_id=? AND created_at>=?",
+        (tid, cutoff),
+    ).fetchone()
+    if recent["n"] >= plan["max_deploys_per_day"]:
+        raise HTTPException(403, "daily deploy limit exceeded")
+    deploy_id = token("dep_")
+    created_at = now()
+    c.execute(
+        "INSERT INTO deploy_requests(id,tenant_id,database_id,branch_id,operations,sql_preview,status,schema_version,error,idempotency_key,source_deploy_id,created_at,applied_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (deploy_id, tid, did, branch_row["id"], operations_json, json.dumps(sql_preview), "pending", 0, None, payload.idempotency_key, payload.source_deploy_id, created_at, None),
+    )
+    audit(c, tid, "deploy.created", {"deploy_id": deploy_id, "database_id": did, "branch_id": branch_row["id"]})
+    c.commit()
+    return deploy_response(c.execute(
+        "SELECT r.*, b.name AS branch_name FROM deploy_requests r JOIN branches b ON b.id=r.branch_id WHERE r.id=?",
+        (deploy_id,),
+    ).fetchone())
+
+
+def _begin_deploy(c: Conn, tid: str, deploy_id: str):
+    with _deploy_lock:
+        row = deploy_row(c, deploy_id, tid)
+        if row["status"] != "pending":
+            return row
+        active = c.execute(
+            "SELECT 1 FROM deploy_requests WHERE database_id=? AND status='applying' AND id<>?",
+            (row["database_id"], deploy_id),
+        ).fetchone()
+        if active:
+            raise HTTPException(409, "another deploy is already applying for this database")
+        c.execute("UPDATE deploy_requests SET status='applying' WHERE id=?", (deploy_id,))
+        c.execute(
+            "INSERT INTO deploy_locks(branch_id,deploy_id,started_at) VALUES(?,?,?)",
+            (row["branch_id"], deploy_id, now()),
+        )
+        audit(c, tid, "deploy.applying", {"deploy_id": deploy_id, "database_id": row["database_id"], "branch_id": row["branch_id"]})
+        c.commit()
+        return deploy_row(c, deploy_id, tid)
+
+
+def _finish_deploy(c: Conn, row, status: str, schema_version: int, error: str | None = None):
+    c.execute(
+        "UPDATE deploy_requests SET status=?,schema_version=?,error=?,applied_at=? WHERE id=?",
+        (status, schema_version, error, now() if status == "applied" else None, row["id"]),
+    )
+    c.execute("DELETE FROM deploy_locks WHERE deploy_id=?", (row["id"],))
+    audit(c, row["tenant_id"], f"deploy.{status}", {
+        "deploy_id": row["id"],
+        "database_id": row["database_id"],
+        "branch_id": row["branch_id"],
+        "schema_version": schema_version,
+        "error": error,
+    })
+    c.commit()
+
+
+def _apply_deploy(deploy_id: str, tid: str):
+    c = db()
+    conn = None
+    password = ""
+    try:
+        row = deploy_row(c, deploy_id, tid)
+        branch_row = c.execute("SELECT * FROM branches WHERE id=?", (row["branch_id"],)).fetchone()
+        if row["status"] != "applying":
+            return
+        try:
+            start_result = node_transport.call(branch_row["host_id"], "start", branch_start_payload(c, branch_row))
+            c.execute("UPDATE branches SET status=?,pid=? WHERE id=?", (start_result["status"], start_result["pid"], branch_row["id"]))
+            c.commit()
+            password = cipher().decrypt(branch_row["credential_encrypted"].encode()).decode()
+            if psycopg is None:
+                raise RuntimeError("PostgreSQL driver unavailable")
+            conn = psycopg.connect(
+                host=node_address(branch_row["host_id"]),
+                port=branch_row["port"],
+                user="postgres",
+                password=password,
+                dbname="postgres",
+                connect_timeout=5,
+            )
+            timeout = PLANS[c.execute("SELECT plan FROM tenants WHERE id=?", (tid,)).fetchone()["plan"]]["statement_timeout_ms"]
+            conn.execute(f"SET statement_timeout = {timeout}")
+            conn.execute("SET lock_timeout = 2000")
+            for statement in json.loads(row["sql_preview"]):
+                conn.execute(statement)
+            conn.commit()
+            database_row = c.execute(
+                "SELECT COALESCE(MAX(schema_version),0) AS schema_version FROM deploy_requests WHERE database_id=? AND status='applied'",
+                (row["database_id"],),
+            ).fetchone()
+            schema_version = database_row["schema_version"] + 1
+            _finish_deploy(c, row, "applied", schema_version)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            if _is_psycopg_error(exc, "DataError", "IntegrityError", "ProgrammingError", "NotSupportedError"):
+                sensitive = (
+                    password,
+                    str(branch_row["path"]),
+                    node_address(branch_row["host_id"]),
+                    str(branch_row["port"]),
+                )
+                error = _statement_error_detail(exc, sensitive)
+            elif _is_psycopg_error(exc, "OperationalError", "InterfaceError", "InternalError"):
+                error = "database unavailable"
+            elif isinstance(exc, RuntimeError):
+                error = "branch unavailable"
+            else:
+                error = redact_error(str(exc), (str(branch_row["path"]), str(branch_row["port"])))
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            _finish_deploy(c, row, "failed", row["schema_version"], error)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    logger.warning("failed to close deploy connection for %s", deploy_id)
+    except Exception:
+        logger.exception("deploy apply failed for %s", deploy_id)
+        try:
+            row = deploy_row(c, deploy_id, tid)
+            if row["status"] == "applying":
+                _finish_deploy(c, row, "failed", row["schema_version"], "deploy failed")
+        finally:
+            c.close()
+    else:
+        c.close()
+
+
+@app.post("/v1/tenants/{tid}/databases/{did}/deploys", status_code=201)
+def create_deploy(tid: str, did: str, payload: DeployCreate, tenant=Depends(tenant_auth)):
+    c = db()
+    try:
+        return create_deploy_request(c, tid, did, payload, tenant)
+    finally:
+        c.close()
+
+
+@app.post("/v1/tenants/{tid}/databases/{did}/deploys/{deploy_id}/apply")
+def apply_deploy(tid: str, did: str, deploy_id: str, response: Response, background_tasks: BackgroundTasks, tenant=Depends(tenant_auth)):
+    c = db()
+    try:
+        row = deploy_row(c, deploy_id, tid)
+        if row["database_id"] != did:
+            raise HTTPException(404, "deploy request not found")
+        row = _begin_deploy(c, tid, deploy_id)
+        response.status_code = 202
+        if row["status"] == "applying":
+            background_tasks.add_task(_apply_deploy, deploy_id, tid)
+        return deploy_response(row)
+    finally:
+        c.close()
+
+
+@app.get("/v1/tenants/{tid}/databases/{did}/deploys/{deploy_id}")
+def get_deploy(tid: str, did: str, deploy_id: str, tenant=Depends(tenant_auth)):
+    c = db()
+    try:
+        row = deploy_row(c, deploy_id, tid)
+        if row["database_id"] != did:
+            raise HTTPException(404, "deploy request not found")
+        return deploy_response(row)
+    finally:
+        c.close()
+
+
+@app.get("/v1/tenants/{tid}/databases/{did}/deploys")
+def list_deploys(tid: str, did: str, tenant=Depends(tenant_auth)):
+    c = db()
+    try:
+        database(c, tid, did)
+        rows = c.execute(
+            "SELECT r.*, b.name AS branch_name FROM deploy_requests r JOIN branches b ON b.id=r.branch_id "
+            "WHERE r.tenant_id=? AND r.database_id=? ORDER BY r.created_at DESC",
+            (tid, did),
+        ).fetchall()
+        return {"deploys": [deploy_response(row) for row in rows]}
+    finally:
+        c.close()
 
 
 @app.post("/v1/tenants/{tid}/usage")
