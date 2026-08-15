@@ -1,6 +1,9 @@
 import asyncio
 import os
 import re
+import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -346,10 +349,20 @@ def test_standby_build_argv(tmp_path, monkeypatch):
     (target / "pg_hba.conf").write_text("")
     calls = []
 
+    started = threading.Event()
+    release = threading.Event()
+
     def run(argv):
         calls.append(argv)
+        if argv[0] == main.pg_bin("pg_basebackup"):
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "postgresql.conf").write_text("")
+            (target / "pg_hba.conf").write_text("")
+            started.set()
+            release.wait(timeout=2)
 
-    main.NodeAgent(run).handle("build_standby", {
+    agent = main.NodeAgent(run)
+    assert agent.handle("build_standby", {
         "target_path": str(target),
         "target_port": 55433,
         "target_host_id": "sv2",
@@ -358,7 +371,25 @@ def test_standby_build_argv(tmp_path, monkeypatch):
         "replication_user": "mosaic_repl_db",
         "replication_password": "secret",
         "replication_slot": "mosaic_db_sv2",
-    })
+    }) == {"status": "building"}
+    assert started.wait(timeout=2)
+    assert agent.handle("build_standby", {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "sv2",
+        "primary_address": "10.0.0.1",
+        "primary_port": 55432,
+        "replication_user": "mosaic_repl_db",
+        "replication_password": "secret",
+        "replication_slot": "mosaic_db_sv2",
+    }) == {"status": "building"}
+    release.set()
+    for _ in range(100):
+        result = agent.handle("inspect_standby", {"target_path": str(target)})
+        if result["status"] == "ready":
+            break
+        time.sleep(0.01)
+    assert result == {"status": "ready"}
     assert calls[0] == [
         main.pg_bin("pg_basebackup"), "-D", str(target), "-h", "10.0.0.1",
         "-p", "55432", "-U", "mosaic_repl_db", "-Fp", "-X", "stream", "-R",
@@ -369,6 +400,145 @@ def test_standby_build_argv(tmp_path, monkeypatch):
         str(target / "postgres.log"), "start",
     ]
     assert calls[2] == [main.pg_bin("pg_ctl"), "-D", str(target), "status"]
+
+
+def test_standby_build_stops_before_removing_target(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
+    target.mkdir()
+    (target / "postmaster.pid").write_text("123\n")
+    calls = []
+
+    def run(argv):
+        calls.append(argv)
+        if argv[-1] == "status":
+            raise RuntimeError("stale postmaster")
+        if argv[0] == main.pg_bin("pg_basebackup"):
+            raise RuntimeError("backup failed")
+
+    agent = main.NodeAgent(run)
+    agent.handle("build_standby", {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "local",
+        "primary_address": "127.0.0.1",
+        "primary_port": 55432,
+        "replication_user": "mosaic_repl_db",
+        "replication_password": "secret",
+    })
+    for _ in range(100):
+        result = agent.handle("inspect_standby", {"target_path": str(target)})
+        if result["status"] == "failed":
+            break
+        time.sleep(0.01)
+    assert result["status"] == "failed"
+    assert calls[1] == [
+        main.pg_bin("pg_ctl"), "-D", str(target), "-m", "immediate", "stop"
+    ]
+    assert calls[2][0] == main.pg_bin("pg_basebackup")
+    assert not target.exists()
+
+
+def test_replica_build_failure_does_not_downgrade_ready_sibling(client, monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2,sv3")
+    monkeypatch.setenv(
+        "MOSAIC_NODE_PRIVATE_ADDRESSES",
+        "local=10.0.0.1,sv2=10.0.0.2,sv3=10.0.0.3",
+    )
+    created = tenant(client)
+
+    class FakeTransport:
+        failure_host = None
+
+        def call(self, host_id, operation, payload):
+            if operation == "provision":
+                return {"status": "provisioned"}
+            if operation == "prepare_primary":
+                return {"status": "running", "pid": 123}
+            if operation == "build_standby" and host_id == self.failure_host:
+                raise subprocess.CalledProcessError(1, "pg_basebackup", stderr="bad backup")
+            if operation == "build_standby":
+                return {"status": "ready"}
+            raise AssertionError(operation)
+
+    monkeypatch.setattr(main, "node_transport", FakeTransport())
+    response = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "sibling-failure"},
+    )
+    c = main.db()
+    replica_hosts = [
+        row["host_id"] for row in c.execute(
+            "SELECT host_id FROM replicas WHERE database_id=?",
+            (response.json()["id"],),
+        ).fetchall()
+    ]
+    FakeTransport.failure_host = replica_hosts[0]
+    main.reconcile_replicas(c)
+    statuses = {
+        row["host_id"]: row["status"]
+        for row in c.execute(
+            "SELECT host_id,status FROM replicas WHERE database_id=?",
+            (response.json()["id"],),
+        ).fetchall()
+    }
+    assert statuses[FakeTransport.failure_host] == "retryable"
+    assert all(
+        status == "ready"
+        for host, status in statuses.items()
+        if host != FakeTransport.failure_host
+    )
+    c.close()
+
+
+def test_replica_directories_are_reserved_outside_branch_namespace(client, monkeypatch):
+    created = tenant(client)
+    database = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "reserved-path"},
+    ).json()
+    response = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/branches",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "replicas"},
+    )
+    assert response.status_code == 400
+    c = main.db()
+    main_row = c.execute(
+        "SELECT * FROM branches WHERE database_id=? AND name='main'",
+        (database["id"],),
+    ).fetchone()
+    assert Path(main_row["path"]).parent / ".replicas" != Path(main_row["path"]).parent / "replicas"
+    c.close()
+
+
+def test_https_transport_always_uses_verifying_context(monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "sv2=https://10.0.0.2:8000")
+    monkeypatch.setenv("MOSAIC_NODE_PRIVATE_ADDRESSES", "sv2=10.0.0.2")
+    monkeypatch.setattr(main, "NODE_AGENT_CA_BUNDLE", "")
+    contexts = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"status":"ok"}'
+
+    monkeypatch.setattr(
+        main.ssl, "create_default_context",
+        lambda **kwargs: contexts.append(kwargs) or object(),
+    )
+    monkeypatch.setattr(main.urllib.request, "urlopen", lambda request, timeout, context: Response())
+    assert main.NodeTransport(main.NodeAgent()).call("sv2", "inspect", {}) == {"status": "ok"}
+    assert contexts == [{"cafile": None}]
 
 
 def test_reaper_ignores_standbys(tmp_path, monkeypatch):
@@ -434,6 +604,84 @@ def test_replica_lag_surfaces_through_api(client, monkeypatch):
     assert response.status_code == 200
     assert response.json()["replicas"][0]["lag_bytes"] == 42
     assert response.json()["lag_unit"] == "bytes behind primary WAL replay position"
+
+
+def test_local_primary_down_lag_sample_is_reported(client, monkeypatch):
+    created = tenant(client)
+    database = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "local-lag-down"},
+    ).json()
+    c = main.db()
+    primary = c.execute(
+        "SELECT * FROM branches WHERE database_id=?", (database["id"],)
+    ).fetchone()
+    c.execute(
+        "INSERT INTO replication_credentials VALUES(?,?,?,?)",
+        (database["id"], "mosaic_repl_down", main.cipher().encrypt(b"repl").decode(), main.now()),
+    )
+    c.execute(
+        "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("rep_down", database["id"], primary["id"], "local", "/standby", 55433, "ready", 0, main.now(), main.now(), "slot_down"),
+    )
+    c.commit()
+    c.close()
+
+    operational_error = type("OperationalError", (Exception,), {})
+
+    class FailedPsycopg:
+        OperationalError = operational_error
+
+        def connect(self, **kwargs):
+            raise self.OperationalError("server is down")
+
+    monkeypatch.setattr(main, "psycopg", FailedPsycopg())
+    response = client.get(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/replicas",
+        headers={"X-API-Key": created["api_key"]},
+    )
+    assert response.status_code == 200
+    assert response.json()["lag_sample_error"] == "replication lag sampling failed"
+
+
+def test_removed_replica_host_lag_sample_is_reported(client, monkeypatch):
+    created = tenant(client)
+    database = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "removed-replica-host"},
+    ).json()
+    c = main.db()
+    primary = c.execute(
+        "SELECT * FROM branches WHERE database_id=?", (database["id"],)
+    ).fetchone()
+    c.execute(
+        "INSERT INTO replication_credentials VALUES(?,?,?,?)",
+        (database["id"], "mosaic_repl_removed", main.cipher().encrypt(b"repl").decode(), main.now()),
+    )
+    c.execute(
+        "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("rep_removed", database["id"], primary["id"], "sv2", "/standby", 55433, "ready", 0, main.now(), main.now(), "slot_removed"),
+    )
+    c.commit()
+    c.close()
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local")
+    monkeypatch.setattr(
+        main, "node_transport",
+        type("Transport", (), {
+            "call": lambda self, *args, **kwargs: {
+                "sampled_at": "2025-01-01T00:00:00+00:00",
+                "replicas": [],
+            }
+        })(),
+    )
+    response = client.get(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/replicas",
+        headers={"X-API-Key": created["api_key"]},
+    )
+    assert response.status_code == 200
+    assert response.json()["lag_sample_error"] == "replication lag sampling failed"
 
 
 def test_plaintext_remote_transport_requires_opt_out(monkeypatch):
@@ -692,17 +940,23 @@ def test_standby_build_clears_partial_target_before_backup(tmp_path, monkeypatch
             seen.append(target.exists())
             raise RuntimeError("backup failed")
 
-    with pytest.raises(RuntimeError, match="backup failed"):
-        main.NodeAgent(run).handle("build_standby", {
-            "target_path": str(target),
-            "target_port": 55433,
-            "target_host_id": "local",
-            "primary_address": "127.0.0.1",
-            "primary_port": 55432,
-            "replication_user": "mosaic_repl_db",
-            "replication_password": "secret",
-        })
+    agent = main.NodeAgent(run)
+    assert agent.handle("build_standby", {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "local",
+        "primary_address": "127.0.0.1",
+        "primary_port": 55432,
+        "replication_user": "mosaic_repl_db",
+        "replication_password": "secret",
+    }) == {"status": "building"}
+    for _ in range(100):
+        result = agent.handle("inspect_standby", {"target_path": str(target)})
+        if result["status"] == "failed":
+            break
+        time.sleep(0.01)
     assert seen == [False]
+    assert result["status"] == "failed"
 
 
 def test_prepare_primary_refreshes_pid_after_restart(tmp_path, monkeypatch):

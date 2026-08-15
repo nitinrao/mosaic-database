@@ -118,8 +118,14 @@ import and mount during boot.
 Each database `main` branch has one dark standby on each other configured
 node. Standbys use `hot_standby=off` and are not readable; no query routing
 targets them. The tenant replica API reports observed bytes behind the
-primary's WAL replay position and the timestamp of the last sample. A replica
-is not a branch and is never selected by the idle branch reaper.
+primary's WAL replay position and the timestamp of the last sample. Standby
+base backups run asynchronously on the node agent; replica rows report
+`pending`, `building`, `ready`, or retryable failure states while the control
+plane polls job status. Replica data directories live under the reserved
+`.replicas` directory beside the primary branch, outside the tenant branch
+namespace. A replica is not a branch and is never selected by the idle branch
+reaper. HTTPS node-agent connections always use certificate verification via
+the system trust store or the configured `MOSAIC_NODE_AGENT_CA_BUNDLE`.
 
 V0 remains single-primary per host with no HA, PITR, or DR promise.
 Only `main` branches are replicated; ephemeral ZFS branches are not, so losing
