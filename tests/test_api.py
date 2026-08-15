@@ -480,6 +480,84 @@ def test_peer_down_replica_is_retryable_without_blocking_database(client, monkey
     c.close()
 
 
+def test_replica_reconciliation_isolated_per_database(client, monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2,sv3")
+    monkeypatch.setenv(
+        "MOSAIC_NODE_PRIVATE_ADDRESSES",
+        "local=10.0.0.1,sv2=10.0.0.2,sv3=10.0.0.3",
+    )
+    created = tenant(client)
+    calls = []
+
+    class FakeTransport:
+        def call(self, host_id, operation, payload):
+            if operation == "provision":
+                return {"status": "provisioned"}
+            if operation == "prepare_primary":
+                calls.append(("prepare", payload["path"], payload["replication_user"], payload["replication_password"]))
+                return {"status": "running", "pid": 123}
+            if operation == "build_standby":
+                calls.append(("build", payload["target_path"], payload["replication_user"], payload["replication_password"]))
+                return {"status": "ready"}
+            raise AssertionError(operation)
+
+    monkeypatch.setattr(main, "node_transport", FakeTransport())
+    databases = []
+    for name in ("first", "second"):
+        response = client.post(
+            f"/v1/tenants/{created['tenant_id']}/databases",
+            headers={"X-API-Key": created["api_key"]},
+            json={"name": name},
+        )
+        assert response.status_code == 200
+        databases.append(response.json()["id"])
+    c = main.db()
+    main.reconcile_replicas(c)
+    prepared = {
+        path: (username, password)
+        for kind, path, username, password in calls
+        if kind == "prepare"
+    }
+    builds = [
+        (path, username, password)
+        for kind, path, username, password in calls
+        if kind == "build"
+    ]
+    assert len(prepared) == 2
+    assert len(builds) == 4
+    for path, username, password in builds:
+        primary_path = str(Path(path).parents[1] / "main")
+        assert (username, password) == prepared[primary_path]
+    assert all(
+        row["status"] == "ready"
+        for row in c.execute("SELECT status FROM replicas").fetchall()
+    )
+    c.close()
+
+
+def test_replication_loop_survives_reconciliation_error(tmp_path, monkeypatch):
+    main.DB_PATH = tmp_path / "replication-loop.db"
+    c = main.db()
+    main.initialize_schema(c)
+    c.close()
+    calls = {"sleep": 0, "reconcile": 0}
+
+    async def fake_sleep(_):
+        calls["sleep"] += 1
+        if calls["sleep"] > 1:
+            raise asyncio.CancelledError
+
+    def fake_reconcile(connection):
+        calls["reconcile"] += 1
+        raise RuntimeError("peer unavailable")
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(main, "reconcile_replicas", fake_reconcile)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(main._replication_loop())
+    assert calls["reconcile"] == 1
+
+
 def test_repeated_primary_preparation_is_idempotent(tmp_path, monkeypatch):
     root = tmp_path / "branches"
     root.mkdir()

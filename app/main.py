@@ -757,23 +757,7 @@ def _retry_replica(c: Conn, replica, exc: Exception):
     )
 
 
-def reconcile_replicas(c: Conn):
-    rows = c.execute(
-        "SELECT r.*, b.id AS branch_id, b.path AS primary_path, b.port AS primary_port, "
-        "b.pid AS primary_pid, b.status AS primary_status, b.host_id AS primary_host_id, "
-        "b.credential_encrypted, rc.username, rc.credential_encrypted AS replication_credential "
-        "FROM replicas r JOIN branches b ON b.id=r.primary_branch_id "
-        "JOIN replication_credentials rc ON rc.database_id=r.database_id "
-        "WHERE r.status IN ('pending','retryable')"
-    ).fetchall()
-    due = []
-    for row in rows:
-        if row["next_attempt_at"]:
-            if datetime.fromisoformat(row["next_attempt_at"]) > datetime.now(timezone.utc):
-                continue
-        due.append(row)
-    if not due:
-        return
+def _reconcile_database_replicas(c: Conn, due: list):
     primary = due[0]
     all_replicas = c.execute(
         "SELECT host_id,slot_name FROM replicas WHERE database_id=?",
@@ -802,7 +786,6 @@ def reconcile_replicas(c: Conn):
     except (InvalidToken, RuntimeError) as exc:
         for row in due:
             _retry_replica(c, row, exc)
-        c.commit()
         return
     for replica in due:
         try:
@@ -822,6 +805,32 @@ def reconcile_replicas(c: Conn):
             )
         except (RuntimeError, OSError) as exc:
             _retry_replica(c, replica, exc)
+
+
+def reconcile_replicas(c: Conn):
+    rows = c.execute(
+        "SELECT r.*, b.id AS branch_id, b.path AS primary_path, b.port AS primary_port, "
+        "b.pid AS primary_pid, b.status AS primary_status, b.host_id AS primary_host_id, "
+        "b.credential_encrypted, rc.username, rc.credential_encrypted AS replication_credential "
+        "FROM replicas r JOIN branches b ON b.id=r.primary_branch_id "
+        "JOIN replication_credentials rc ON rc.database_id=r.database_id "
+        "WHERE r.status IN ('pending','retryable')"
+    ).fetchall()
+    due = []
+    for row in rows:
+        if row["next_attempt_at"]:
+            if datetime.fromisoformat(row["next_attempt_at"]) > datetime.now(timezone.utc):
+                continue
+        due.append(row)
+    grouped = {}
+    for row in due:
+        grouped.setdefault(row["database_id"], []).append(row)
+    for database_rows in grouped.values():
+        try:
+            _reconcile_database_replicas(c, database_rows)
+        except Exception as exc:
+            for row in database_rows:
+                _retry_replica(c, row, exc)
     c.commit()
 
 
@@ -897,7 +906,10 @@ async def _replication_loop():
         await asyncio.sleep(max(1, int(os.getenv("MOSAIC_REPLICATION_RETRY_INTERVAL", "10"))))
         c = db()
         try:
-            reconcile_replicas(c)
+            try:
+                reconcile_replicas(c)
+            except Exception:
+                pass
         finally:
             c.close()
 
