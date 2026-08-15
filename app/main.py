@@ -537,6 +537,27 @@ class NodeAgent:
             return {"status": "failed", "error": str(exc)}
         return {"status": "ready"}
 
+    def _standby_status_is_not_running(self, target: Path) -> bool:
+        try:
+            self.run([pg_bin("pg_ctl"), "-D", str(target), "status"])
+        except Exception as exc:
+            detail = str(exc).lower()
+            if isinstance(exc, subprocess.CalledProcessError):
+                detail = " ".join(
+                    part for part in (
+                        exc.stdout or "",
+                        exc.stderr or "",
+                        detail,
+                    ) if part
+                ).lower()
+            if "no server running" in detail or "not running" in detail:
+                return True
+            raise RuntimeError(
+                f"cannot remove standby target {target}: "
+                f"postmaster status could not be verified: {exc}"
+            ) from exc
+        return False
+
     def _run_standby_build(self, target: Path, payload: dict):
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -547,10 +568,12 @@ class NodeAgent:
                     try:
                         postmaster_pid = int(pid_file.read_text().splitlines()[0])
                     except (OSError, ValueError, IndexError):
-                        raise RuntimeError(
-                            f"cannot remove standby target {target}: "
-                            "postmaster pid cannot be verified"
-                        )
+                        if not self._standby_status_is_not_running(target):
+                            raise RuntimeError(
+                                f"cannot remove standby target {target}: "
+                                "postmaster is still running"
+                            )
+                        postmaster_pid = None
                     try:
                         self.run([
                             pg_bin("pg_ctl"), "-D", str(target),

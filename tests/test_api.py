@@ -479,6 +479,46 @@ def test_standby_build_does_not_remove_live_target_after_failed_stop(tmp_path, m
     assert not any(call[0] == main.pg_bin("pg_basebackup") for call in calls)
 
 
+def test_standby_build_cleans_unparseable_stopped_target(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
+    target.mkdir()
+    (target / "postmaster.pid").write_text("")
+    status_calls = 0
+
+    def run(argv, env=None):
+        nonlocal status_calls
+        if argv[-1] == "status":
+            status_calls += 1
+            if status_calls < 3:
+                raise RuntimeError("pg_ctl: no server running")
+            return None
+        if argv[0] == main.pg_bin("pg_basebackup"):
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "postgresql.conf").write_text("")
+            (target / "pg_hba.conf").write_text("")
+
+    agent = main.NodeAgent(run)
+    assert agent.handle("build_standby", {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "local",
+        "primary_address": "127.0.0.1",
+        "primary_port": 55432,
+        "replication_user": "mosaic_repl_db",
+        "replication_password": "secret",
+    }) == {"status": "building"}
+    for _ in range(100):
+        result = agent.handle("inspect_standby", {"target_path": str(target)})
+        if result["status"] == "ready":
+            break
+        time.sleep(0.01)
+    assert result == {"status": "ready"}
+    assert status_calls >= 2
+
+
 def test_copy_clone_passes_password_per_command_without_mutating_environment(tmp_path, monkeypatch):
     parent = tmp_path / "parent"
     target = tmp_path / "target"
@@ -655,7 +695,11 @@ def test_replica_lag_surfaces_through_api(client, monkeypatch):
     class FakeTransport:
         def call(self, host_id, operation, payload):
             assert operation == "inspect_replication"
-            return {"sampled_at": "2025-01-01T00:00:00+00:00", "replicas": [{"client_addr": "10.0.0.2", "lag_bytes": 42}]}
+            return {
+                "sampled_at": "2025-01-01T00:00:00+00:00",
+                "replicas": [{"client_addr": "10.0.0.2", "lag_bytes": 42}],
+                "invalid_slots": ["slot_lag"],
+            }
 
     monkeypatch.setattr(main, "node_transport", FakeTransport())
     response = client.get(
@@ -665,6 +709,17 @@ def test_replica_lag_surfaces_through_api(client, monkeypatch):
     assert response.status_code == 200
     assert response.json()["replicas"][0]["lag_bytes"] == 42
     assert response.json()["lag_unit"] == "bytes behind primary WAL replay position"
+    fresh = main.db()
+    try:
+        row = fresh.execute(
+            "SELECT lag_bytes,lag_sampled_at,status FROM replicas WHERE id=?",
+            ("rep_lag",),
+        ).fetchone()
+        assert row["lag_bytes"] == 42
+        assert row["lag_sampled_at"] == "2025-01-01T00:00:00+00:00"
+        assert row["status"] == "rebuild_required"
+    finally:
+        fresh.close()
 
 
 def test_local_primary_down_lag_sample_is_reported(client, monkeypatch):
