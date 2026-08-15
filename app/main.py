@@ -912,7 +912,7 @@ class NodeAgent:
                 row_factory=dict_row,
             ) as connection:
                 rows = connection.execute(
-                    "SELECT client_addr::text AS client_addr, application_name, "
+                    "SELECT host(client_addr) AS client_addr, application_name, "
                     "COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0)::bigint AS lag_bytes "
                     "FROM pg_stat_replication"
                 ).fetchall()
@@ -1205,7 +1205,8 @@ def refresh_replica_lag(c: Conn, database_id: str):
                 (f"replica host unavailable: {exc}"[:500], row["id"]),
             )
     for replica in sampled.get("replicas", []):
-        row = by_address.get(replica.get("client_addr"))
+        client_addr = str(replica.get("client_addr") or "").split("/", 1)[0]
+        row = by_address.get(client_addr)
         if row:
             c.execute(
                 "UPDATE replicas SET lag_bytes=?,lag_sampled_at=?,last_error=NULL "

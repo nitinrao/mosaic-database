@@ -1423,7 +1423,7 @@ def test_replica_lag_surfaces_through_api(client, monkeypatch):
             assert operation == "inspect_replication"
             return {
                 "sampled_at": "2025-01-01T00:00:00+00:00",
-                "replicas": [{"client_addr": "10.0.0.2", "lag_bytes": 42}],
+                "replicas": [{"client_addr": "10.0.0.2/32", "lag_bytes": 42}],
                 "invalid_slots": ["slot_lag"],
             }
 
