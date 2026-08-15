@@ -84,6 +84,11 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def replication_identifier(database_id: str, node_id: str | None = None) -> str:
+    value = database_id if node_id is None else f"{database_id}\0{node_id}"
+    return "mosaic_" + hashlib.sha256(value.encode()).hexdigest()[:56]
+
+
 def pg_bin(name: str) -> str:
     configured = os.getenv("MOSAIC_PG_BIN_DIR")
     candidates = [str(Path(configured) / name)] if configured else []
@@ -347,7 +352,7 @@ def _rewrite_postgres_config(
         f"hot_standby = {'off' if standby else 'on'}",
     ])
     if replication_user:
-        retained.append(f"max_slot_wal_keep_size = {REPLICATION_WAL_RETENTION_BYTES}")
+        retained.append(f"max_slot_wal_keep_size = {REPLICATION_WAL_RETENTION_BYTES}B")
     config.write_text("\n".join(retained) + "\n")
     if listen_address not in {"127.0.0.1", "::1"}:
         addresses = node_private_addresses()
@@ -540,6 +545,8 @@ class NodeAgent:
         if operation == "build_standby":
             target = confined(payload["target_path"], "target_path")
             target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                shutil.rmtree(target)
             argv = [
                 pg_bin("pg_basebackup"), "-D", str(target),
                 "-h", payload["primary_address"], "-p", str(payload["primary_port"]),
@@ -564,8 +571,9 @@ class NodeAgent:
             )
             self.run([
                 pg_bin("pg_ctl"), "-D", str(target),
-                "-l", str(target / "postgres.log"), "-w", "start",
+                "-l", str(target / "postgres.log"), "start",
             ])
+            self.run([pg_bin("pg_ctl"), "-D", str(target), "status"])
             return {"status": "ready"}
         if operation == "prepare_primary":
             if psycopg is None:
@@ -641,6 +649,7 @@ class NodeAgent:
                     pg_bin("pg_ctl"), "-D", str(primary_path),
                     "-m", "fast", "-w", "restart",
                 ])
+                result = {**result, "pid": int((primary_path / "postmaster.pid").read_text().splitlines()[0])}
             else:
                 self.run([pg_bin("pg_ctl"), "-D", str(primary_path), "reload"])
             return result
@@ -708,7 +717,7 @@ class NodeTransport:
             method="POST",
         )
         try:
-            if base_url.startswith("http://") and len(node_ids()) > 1 and not ALLOW_PLAINTEXT_NODE_AGENT:
+            if base_url.startswith("http://") and not ALLOW_PLAINTEXT_NODE_AGENT:
                 raise RuntimeError("plaintext node-agent transport requires MOSAIC_ALLOW_PLAINTEXT_NODE_AGENT=true")
             context = None
             if base_url.startswith("https://") and NODE_AGENT_CA_BUNDLE:
@@ -727,10 +736,10 @@ def create_replicas(c: Conn, database_id: str, main_row, postgres_password: str)
     peers = replica_nodes(main_row["host_id"])
     if not peers:
         return
-    replication_user = REPLICATION_USER_PREFIX + database_id.removeprefix("db_")[:24]
+    replication_user = REPLICATION_USER_PREFIX + replication_identifier(database_id)[7:31]
     replication_password = secrets.token_urlsafe(24)
     slots = {
-        node_id: f"mosaic_{database_id.removeprefix('db_')[:16]}_{node_id}".replace("-", "_")
+        node_id: replication_identifier(database_id, node_id)
         for node_id in peers
     }
     c.execute(
@@ -747,18 +756,24 @@ def create_replicas(c: Conn, database_id: str, main_row, postgres_password: str)
         )
 
 
-def _retry_replica(c: Conn, replica, exc: Exception):
+def _retry_replica(c: Conn, replica, exc: Exception, sensitive: tuple[str, ...] = ()):
     attempts = int(replica["attempts"]) + 1
     delay = min(300, 5 * (2 ** min(attempts - 1, 6)))
     next_attempt = datetime.now(timezone.utc) + timedelta(seconds=delay)
+    error = str(exc)
+    for secret in sensitive:
+        if secret:
+            error = error.replace(secret, "[REDACTED]")
     c.execute(
         "UPDATE replicas SET status='retryable',attempts=?,next_attempt_at=?,last_error=? WHERE id=?",
-        (attempts, next_attempt.isoformat(), str(exc)[:500], replica["id"]),
+        (attempts, next_attempt.isoformat(), error[:500], replica["id"]),
     )
 
 
 def _reconcile_database_replicas(c: Conn, due: list):
     primary = due[0]
+    postgres_password = ""
+    replication_password = ""
     all_replicas = c.execute(
         "SELECT host_id,slot_name FROM replicas WHERE database_id=?",
         (primary["database_id"],),
@@ -785,7 +800,7 @@ def _reconcile_database_replicas(c: Conn, due: list):
         )
     except (InvalidToken, RuntimeError) as exc:
         for row in due:
-            _retry_replica(c, row, exc)
+            _retry_replica(c, row, exc, (postgres_password, replication_password))
         return
     for replica in due:
         try:
@@ -804,7 +819,7 @@ def _reconcile_database_replicas(c: Conn, due: list):
                 (replica["id"],),
             )
         except (RuntimeError, OSError) as exc:
-            _retry_replica(c, replica, exc)
+            _retry_replica(c, replica, exc, (postgres_password, replication_password))
 
 
 def reconcile_replicas(c: Conn):
