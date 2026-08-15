@@ -45,6 +45,9 @@ BRANCH_ENGINE_NAME = os.getenv("MOSAIC_BRANCH_ENGINE", "copy")
 IDLE_REAPER_SECONDS = int(os.getenv("MOSAIC_BRANCH_IDLE_SECONDS", "900"))
 PORT_MIN = int(os.getenv("MOSAIC_POSTGRES_PORT_MIN", "55432"))
 RATE_LIMIT_REQUESTS = int(os.getenv("MOSAIC_RATE_LIMIT_REQUESTS", "120"))
+PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS = int(os.getenv("MOSAIC_PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS", "5"))
+MAX_DATABASES_TOTAL = int(os.getenv("MOSAIC_MAX_DATABASES_TOTAL", "50"))
+MOSAIC_PUBLIC_ENDPOINT = os.getenv("MOSAIC_PUBLIC_ENDPOINT", "https://database-api.mosaicos.com")
 NODE_ID = os.getenv("MOSAIC_NODE_ID", "local")
 PROMOTION_MAX_LAG_BYTES = int(os.getenv("MOSAIC_PROMOTION_MAX_LAG_BYTES", str(10 * 1024 * 1024 * 1024)))
 PROMOTION_MAX_LAG_AGE_SECONDS = int(os.getenv("MOSAIC_PROMOTION_MAX_LAG_AGE_SECONDS", "300"))
@@ -85,6 +88,18 @@ def token(prefix: str) -> str:
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def normalize_email(value: str) -> str:
+    return value.strip().lower()
+
+
+def derive_tenant_name(email: str, requested_name: str) -> str:
+    clean_name = requested_name.strip().replace("\n", " ")
+    if clean_name:
+        return clean_name[:100]
+    local_part = re.split(r"[@._-]+", email.split("@", 1)[0])[0] or "Workspace"
+    return f"{local_part} workspace"[:100]
 
 
 def replication_identifier(database_id: str, node_id: str | None = None) -> str:
@@ -199,6 +214,7 @@ def initialize_schema(c: Conn):
     integer = "BIGSERIAL PRIMARY KEY" if c.postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
     c.script(f"""
     CREATE TABLE IF NOT EXISTS tenants (id TEXT PRIMARY KEY, name TEXT NOT NULL, plan TEXT NOT NULL, api_key_hash TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS public_signups (email TEXT PRIMARY KEY, tenant_id TEXT NOT NULL UNIQUE REFERENCES tenants(id), tenant_name TEXT NOT NULL, last_key_created_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS databases (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id), name TEXT NOT NULL, root_path TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(tenant_id,name));
     CREATE TABLE IF NOT EXISTS branches (id TEXT PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id), name TEXT NOT NULL, parent_id TEXT, path TEXT NOT NULL, port INTEGER NOT NULL, pid INTEGER, status TEXT NOT NULL, credential_encrypted TEXT NOT NULL, last_query_at TEXT NOT NULL, created_at TEXT NOT NULL, host_id TEXT NOT NULL DEFAULT 'local', UNIQUE(database_id,name));
     CREATE TABLE IF NOT EXISTS replication_credentials (database_id TEXT PRIMARY KEY REFERENCES databases(id), username TEXT NOT NULL, credential_encrypted TEXT NOT NULL, created_at TEXT NOT NULL);
@@ -1627,15 +1643,23 @@ def tenant_auth(tid: str, x_api_key: str | None = Header(default=None, alias="X-
         c.close()
 
 
-def check_rate_limit(tid: str):
+def check_rate_limit(tid: str, limit: int | None = None):
+    limit = RATE_LIMIT_REQUESTS if limit is None else limit
     values = [x for x in _rate.get(tid, []) if x > time.time() - 60]
-    if len(values) >= RATE_LIMIT_REQUESTS:
+    if len(values) >= limit:
         raise HTTPException(429, "rate limit exceeded")
     _rate[tid] = values + [time.time()]
 
 
 class TenantCreate(BaseModel):
     name: str = Field(min_length=2, max_length=100)
+    plan: str = "shared"
+
+
+class PublicSignupCreate(BaseModel):
+    email: str = Field(pattern=r"^[^@\s]{1,80}@[^@\s]{1,120}\.[^@\s]{2,24}$", max_length=220)
+    tenant_name: str = Field(default="", max_length=100)
+    key_name: str = Field(default="", max_length=100)
     plan: str = "shared"
 
 
@@ -1769,6 +1793,92 @@ def create_tenant(payload: TenantCreate):
         return {"tenant_id": tid, "api_key": key, "plan": payload.plan}
     finally:
         c.close()
+
+
+@app.post("/v1/public/signup")
+def public_signup(payload: PublicSignupCreate, request: Request):
+    email = normalize_email(payload.email)
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit(f"public-signup-ip:{client_ip}", PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS)
+    check_rate_limit(f"public-signup-email:{email}", PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS)
+    if payload.plan != "shared":
+        raise HTTPException(400, "dedicated plans require you to get in touch with Mosaic")
+    tenant_name = derive_tenant_name(email, payload.tenant_name)
+    key_name = payload.key_name.strip() or "Self-serve key"
+    api_key = token("mdb_live_")
+    created = now()
+    c = db()
+    try:
+        signup = c.execute(
+            "SELECT * FROM public_signups WHERE email=?",
+            (email,),
+        ).fetchone()
+        if signup:
+            tenant_id = signup["tenant_id"]
+            tenant = c.execute(
+                "SELECT * FROM tenants WHERE id=?",
+                (tenant_id,),
+            ).fetchone()
+            if not tenant:
+                raise HTTPException(500, "signup record is missing its tenant")
+            effective_name = tenant_name if payload.tenant_name.strip() else tenant["name"]
+            c.execute(
+                "UPDATE tenants SET name=?,api_key_hash=?,status='active' WHERE id=?",
+                (effective_name, digest(api_key), tenant_id),
+            )
+            c.execute(
+                "UPDATE public_signups SET tenant_name=?,last_key_created_at=?,updated_at=? WHERE email=?",
+                (effective_name, created, created, email),
+            )
+            status_text = "rotated"
+        else:
+            tenant_id = token("ten_")
+            effective_name = tenant_name
+            c.execute(
+                "INSERT INTO tenants VALUES(?,?,?,?,?,?)",
+                (tenant_id, effective_name, "shared", digest(api_key), "active", created),
+            )
+            c.execute(
+                "INSERT INTO public_signups VALUES(?,?,?,?,?,?)",
+                (email, tenant_id, effective_name, created, created, created),
+            )
+            status_text = "created"
+        audit(c, tenant_id, f"public_signup.{status_text}", {
+            "plan": "shared",
+            "key_name": key_name,
+        }, actor=email)
+        c.commit()
+    finally:
+        c.close()
+    return {
+        "status": status_text,
+        "tenant_id": tenant_id,
+        "tenant_name": effective_name,
+        "plan": "shared",
+        "key_name": key_name,
+        "api_key": api_key,
+        "token_prefix": api_key[:12],
+        "quickstart": {
+            "endpoint": MOSAIC_PUBLIC_ENDPOINT,
+            "command": (
+                f"export MOSAIC_ENDPOINT={MOSAIC_PUBLIC_ENDPOINT}\n"
+                f"export MOSAIC_TENANT_ID={tenant_id}\n"
+                f"export MOSAIC_API_KEY={api_key}\n\n"
+                "DB_ID=$(curl -fsS -X POST "
+                "\"$MOSAIC_ENDPOINT/v1/tenants/$MOSAIC_TENANT_ID/databases\" "
+                "-H \"X-API-Key: $MOSAIC_API_KEY\" "
+                "-H \"Content-Type: application/json\" "
+                "-d '{\"name\":\"events\"}' | jq -r .id)\n"
+                "curl -fsS -X POST "
+                "\"$MOSAIC_ENDPOINT/v1/tenants/$MOSAIC_TENANT_ID/databases/$DB_ID/query\" "
+                "-H \"X-API-Key: $MOSAIC_API_KEY\" "
+                "-H \"Content-Type: application/json\" "
+                "-d '{\"sql\":\"SELECT 1 AS ok\"}'"
+            ),
+            "docs_path": "/docs/",
+            "signup_path": "/start/",
+        },
+    }
 
 
 def promotion_lag_is_acceptable(replica) -> bool:
@@ -2091,6 +2201,13 @@ def create_database(tid: str, payload: DatabaseCreate, tenant=Depends(tenant_aut
         did, root = token("db_"), BRANCH_ROOT / token("cluster_")
         password, bid = secrets.token_urlsafe(24), token("br_")
         with _branch_mutation_lock:
+            total = c.execute("SELECT COUNT(*) AS n FROM databases").fetchone()
+            if total["n"] >= MAX_DATABASES_TOTAL:
+                audit(c, tid, "database.creation_refused_capacity", {
+                    "limit": MAX_DATABASES_TOTAL,
+                })
+                c.commit()
+                raise HTTPException(503, "Mosaic Database is at capacity; please try again later")
             main_port = supervisor.allocate_port(c)
             host_id = placement_node(did)
             node_transport.call(host_id, "provision", {

@@ -14,6 +14,15 @@ Mosaic ClickHouse cluster and its control-plane PostgreSQL container. That
 workload remains on the approximately 94 GB root LV; Mosaic Database uses the
 dedicated ZFS pool below.
 
+For public database signup, expose the control plane at
+`MOSAIC_PUBLIC_ENDPOINT` (default `https://database-api.mosaicos.com`). The
+unauthenticated `POST /v1/public/signup` route provisions shared tenants and
+rotates keys for repeat email signups; dedicated plans remain an operator
+conversation. Set `MOSAIC_PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS` for its
+per-minute IP and email limit (default `5`). Set
+`MOSAIC_MAX_DATABASES_TOTAL` for the global database ceiling (default `50`);
+the service returns `503` and audits the refusal when that ceiling is reached.
+
 ## Storage
 
 Each host has a `mosaic` pool built as a mirror of `nvme2n1` and `nvme3n1`,

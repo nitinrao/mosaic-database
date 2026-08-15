@@ -38,6 +38,101 @@ def tenant(client, plan="shared"):
     return response.json()
 
 
+def test_public_signup_authenticates_and_rotates_one_tenant(client, monkeypatch):
+    monkeypatch.setattr(main, "MOSAIC_PUBLIC_ENDPOINT", "https://database-api.test")
+    first = client.post(
+        "/v1/public/signup",
+        json={"email": "Ops@Example.com", "tenant_name": "Ops Database", "key_name": "primary"},
+    )
+    assert first.status_code == 200
+    body = first.json()
+    assert body["status"] == "created"
+    assert body["plan"] == "shared"
+    assert body["token_prefix"] == body["api_key"][:12]
+    assert body["quickstart"]["endpoint"] == "https://database-api.test"
+    assert "/databases/$DB_ID/query" in body["quickstart"]["command"]
+    tenant_id, old_key = body["tenant_id"], body["api_key"]
+    assert client.get(
+        f"/v1/tenants/{tenant_id}/usage",
+        headers={"X-API-Key": old_key},
+    ).status_code == 200
+
+    second = client.post(
+        "/v1/public/signup",
+        json={"email": "ops@example.com", "tenant_name": "Ops Database"},
+    )
+    assert second.status_code == 200
+    rotated = second.json()
+    assert rotated["status"] == "rotated"
+    assert rotated["tenant_id"] == tenant_id
+    assert client.get(
+        f"/v1/tenants/{tenant_id}/usage",
+        headers={"X-API-Key": old_key},
+    ).status_code == 401
+    assert client.get(
+        f"/v1/tenants/{tenant_id}/usage",
+        headers={"X-API-Key": rotated["api_key"]},
+    ).status_code == 200
+    c = main.db()
+    try:
+        assert c.execute("SELECT COUNT(*) AS n FROM tenants").fetchone()["n"] == 1
+        actions = [
+            row["action"]
+            for row in c.execute(
+                "SELECT action FROM audit_log WHERE tenant_id=? ORDER BY created_at",
+                (tenant_id,),
+            ).fetchall()
+        ]
+        assert actions == ["public_signup.created", "public_signup.rotated"]
+    finally:
+        c.close()
+
+
+def test_public_signup_rejects_dedicated_plan(client):
+    response = client.post(
+        "/v1/public/signup",
+        json={"email": "dedicated@example.com", "plan": "dedicated"},
+    )
+    assert response.status_code == 400
+    assert "get in touch" in response.json()["detail"]
+
+
+def test_public_signup_has_tighter_rate_limit(client, monkeypatch):
+    monkeypatch.setattr(main, "PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS", 1)
+    first = client.post("/v1/public/signup", json={"email": "first@example.com"})
+    second = client.post("/v1/public/signup", json={"email": "second@example.com"})
+    assert first.status_code == 200
+    assert second.status_code == 429
+
+
+def test_database_capacity_ceiling_applies_to_all_callers(client, monkeypatch):
+    first = tenant(client)
+    created = client.post(
+        f"/v1/tenants/{first['tenant_id']}/databases",
+        headers={"X-API-Key": first["api_key"]},
+        json={"name": "first"},
+    )
+    assert created.status_code == 200
+    monkeypatch.setattr(main, "MAX_DATABASES_TOTAL", 1)
+    second = tenant(client)
+    refused = client.post(
+        f"/v1/tenants/{second['tenant_id']}/databases",
+        headers={"X-API-Key": second["api_key"]},
+        json={"name": "second"},
+    )
+    assert refused.status_code == 503
+    assert "at capacity" in refused.json()["detail"]
+    c = main.db()
+    try:
+        row = c.execute(
+            "SELECT action FROM audit_log WHERE tenant_id=? ORDER BY created_at DESC LIMIT 1",
+            (second["tenant_id"],),
+        ).fetchone()
+        assert row["action"] == "database.creation_refused_capacity"
+    finally:
+        c.close()
+
+
 def promotion_database(client, monkeypatch, replica_status="ready", lag_bytes=42):
     monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local")
     monkeypatch.delenv("MOSAIC_NODE_PRIVATE_ADDRESSES", raising=False)
