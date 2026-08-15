@@ -23,12 +23,13 @@ def client(tmp_path, monkeypatch):
     main.DATABASE_URL = ""
     main.DATABASE_URLS = []
     main._rate.clear()
+    main._rate_last_sweep = 0.0
     class FakeEngine:
         def create_database(self, path, password, port, host_id="local"): Path(path).mkdir(parents=True, exist_ok=True)
         def clone(self, parent, target, parent_port=None, parent_password=None, target_port=None, parent_host_id="local", target_host_id="local"): Path(target).mkdir(parents=True, exist_ok=True)
         def destroy(self, path): return None
     monkeypatch.setattr(main, "engine", lambda: FakeEngine())
-    with TestClient(main.app) as test_client:
+    with TestClient(main.app, client=("127.0.0.1", 12345)) as test_client:
         yield test_client
 
 
@@ -36,6 +37,268 @@ def tenant(client, plan="shared"):
     response = client.post("/v1/tenants", headers={"X-Admin-Key": "test-admin"}, json={"name": "Acme", "plan": plan})
     assert response.status_code == 200
     return response.json()
+
+
+def test_public_signup_authenticates_and_refuses_existing_email(client, monkeypatch):
+    monkeypatch.setattr(main, "MOSAIC_PUBLIC_ENDPOINT", "https://database-api.test")
+    first = client.post(
+        "/v1/public/signup",
+        json={"email": "Ops@Example.com", "tenant_name": "Ops Database", "key_name": "primary"},
+    )
+    assert first.status_code == 200
+    body = first.json()
+    assert body["status"] == "created"
+    assert body["plan"] == "shared"
+    assert body["token_prefix"] == body["api_key"][:12]
+    assert body["quickstart"]["endpoint"] == "https://database-api.test"
+    assert "/databases/$DB_ID/query" in body["quickstart"]["command"]
+    tenant_id, old_key = body["tenant_id"], body["api_key"]
+    assert client.get(
+        f"/v1/tenants/{tenant_id}/usage",
+        headers={"X-API-Key": old_key},
+    ).status_code == 200
+
+    c = main.db()
+    try:
+        before = c.execute(
+            "SELECT api_key_hash,name,status FROM tenants WHERE id=?",
+            (tenant_id,),
+        ).fetchone()
+        before_signup = c.execute(
+            "SELECT tenant_name,last_key_created_at,updated_at FROM public_signups WHERE email=?",
+            ("ops@example.com",),
+        ).fetchone()
+    finally:
+        c.close()
+
+    second = client.post(
+        "/v1/public/signup",
+        json={"email": "ops@example.com", "tenant_name": "Ops Database"},
+    )
+    assert second.status_code == 409
+    assert "already exists" in second.json()["detail"]
+    assert client.get(
+        f"/v1/tenants/{tenant_id}/usage",
+        headers={"X-API-Key": old_key},
+    ).status_code == 200
+    c = main.db()
+    try:
+        assert c.execute("SELECT COUNT(*) AS n FROM tenants").fetchone()["n"] == 1
+        after = c.execute(
+            "SELECT api_key_hash,name,status FROM tenants WHERE id=?",
+            (tenant_id,),
+        ).fetchone()
+        after_signup = c.execute(
+            "SELECT tenant_name,last_key_created_at,updated_at FROM public_signups WHERE email=?",
+            ("ops@example.com",),
+        ).fetchone()
+        assert tuple(after) == tuple(before)
+        assert tuple(after_signup) == tuple(before_signup)
+        actions = [
+            row["action"]
+            for row in c.execute(
+                "SELECT action FROM audit_log WHERE tenant_id=? ORDER BY created_at",
+                (tenant_id,),
+            ).fetchall()
+        ]
+        assert actions == ["public_signup.created", "public_signup.refused_existing"]
+    finally:
+        c.close()
+
+
+def test_public_signup_insert_collision_refuses_existing_email(client, monkeypatch):
+    competing_key = "mdb_live_competing"
+    injected = False
+    original_execute = main.Conn.execute
+
+    def inject_competing_signup(conn, sql, params=()):
+        nonlocal injected
+        result = original_execute(conn, sql, params)
+        if not injected and "SELECT * FROM public_signups WHERE email=?" in sql:
+            injected = True
+            competing = main.db()
+            try:
+                competing_tenant_id = "ten_competing"
+                created = main.now()
+                competing.execute(
+                    "INSERT INTO tenants VALUES(?,?,?,?,?,?)",
+                    (
+                        competing_tenant_id,
+                        "Competing workspace",
+                        "shared",
+                        main.digest(competing_key),
+                        "active",
+                        created,
+                    ),
+                )
+                competing.execute(
+                    "INSERT INTO public_signups VALUES(?,?,?,?,?,?)",
+                    (
+                        "collision@example.com",
+                        competing_tenant_id,
+                        "Competing workspace",
+                        created,
+                        created,
+                        created,
+                    ),
+                )
+                competing.commit()
+            finally:
+                competing.close()
+        return result
+
+    monkeypatch.setattr(main.Conn, "execute", inject_competing_signup)
+    response = client.post(
+        "/v1/public/signup",
+        json={"email": "collision@example.com"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "an account already exists for that email; use your existing key or contact Mosaic"
+    )
+    c = main.db()
+    try:
+        assert c.execute("SELECT COUNT(*) AS n FROM tenants").fetchone()["n"] == 1
+        assert c.execute("SELECT COUNT(*) AS n FROM public_signups").fetchone()["n"] == 1
+        assert c.execute(
+            "SELECT action FROM audit_log WHERE tenant_id=?",
+            ("ten_competing",),
+        ).fetchone()["action"] == "public_signup.refused_existing"
+    finally:
+        c.close()
+
+
+def test_public_signup_rejects_dedicated_plan(client):
+    response = client.post(
+        "/v1/public/signup",
+        json={"email": "dedicated@example.com", "plan": "dedicated"},
+    )
+    assert response.status_code == 400
+    assert "get in touch" in response.json()["detail"]
+
+
+def test_public_signup_has_tighter_rate_limit(client, monkeypatch):
+    monkeypatch.setattr(main, "PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS", 1)
+    first = client.post("/v1/public/signup", json={"email": "first@example.com"})
+    second = client.post("/v1/public/signup", json={"email": "second@example.com"})
+    assert first.status_code == 200
+    assert second.status_code == 429
+
+
+def test_public_signup_ignores_forwarded_ip_by_default(client, monkeypatch):
+    monkeypatch.setattr(main, "PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS", 1)
+    first = client.post(
+        "/v1/public/signup",
+        headers={"CF-Connecting-IP": "198.51.100.10"},
+        json={"email": "socket-first@example.com"},
+    )
+    second = client.post(
+        "/v1/public/signup",
+        headers={"CF-Connecting-IP": "198.51.100.11"},
+        json={"email": "socket-second@example.com"},
+    )
+    assert first.status_code == 200
+    assert second.status_code == 429
+
+
+def test_public_signup_honors_forwarded_ip_when_trusted(client, monkeypatch):
+    monkeypatch.setattr(main, "PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS", 1)
+    monkeypatch.setattr(main, "TRUST_CLOUDFLARE_IP", True)
+    first = client.post(
+        "/v1/public/signup",
+        headers={"CF-Connecting-IP": "198.51.100.20"},
+        json={"email": "forwarded-first@example.com"},
+    )
+    second = client.post(
+        "/v1/public/signup",
+        headers={"CF-Connecting-IP": "198.51.100.21"},
+        json={"email": "forwarded-second@example.com"},
+    )
+    limited = client.post(
+        "/v1/public/signup",
+        headers={"CF-Connecting-IP": "198.51.100.20"},
+        json={"email": "forwarded-third@example.com"},
+    )
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert limited.status_code == 429
+
+
+def test_public_signup_rejects_forwarded_ip_from_untrusted_peer():
+    request = main.Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/public/signup",
+        "headers": [(b"cf-connecting-ip", b"198.51.100.20")],
+        "client": ("8.8.8.8", 443),
+        "scheme": "http",
+        "server": ("control-plane", 80),
+    })
+    old = main.TRUST_CLOUDFLARE_IP
+    main.TRUST_CLOUDFLARE_IP = True
+    try:
+        assert main.public_signup_client_ip(request) == "8.8.8.8"
+    finally:
+        main.TRUST_CLOUDFLARE_IP = old
+
+
+def test_rate_limit_sweeps_unrelated_expired_buckets(client, monkeypatch):
+    monkeypatch.setattr(main, "RATE_LIMIT_SWEEP_THRESHOLD", 2)
+    now = time.time()
+    main._rate["expired-unrelated"] = [now - 61]
+    main._rate["live-unrelated"] = [now]
+    main._rate_last_sweep = 0.0
+    main.check_rate_limit("current", 2)
+    assert "expired-unrelated" not in main._rate
+    assert "live-unrelated" in main._rate
+
+
+def test_database_capacity_ceiling_applies_to_all_callers(client, monkeypatch):
+    first = tenant(client)
+    created = client.post(
+        f"/v1/tenants/{first['tenant_id']}/databases",
+        headers={"X-API-Key": first["api_key"]},
+        json={"name": "first"},
+    )
+    assert created.status_code == 200
+    monkeypatch.setattr(main, "MAX_DATABASES_TOTAL", 1)
+    second = tenant(client)
+    refused = client.post(
+        f"/v1/tenants/{second['tenant_id']}/databases",
+        headers={"X-API-Key": second["api_key"]},
+        json={"name": "second"},
+    )
+    assert refused.status_code == 503
+    assert "at capacity" in refused.json()["detail"]
+    c = main.db()
+    try:
+        row = c.execute(
+            "SELECT action FROM audit_log WHERE tenant_id=? ORDER BY created_at DESC LIMIT 1",
+            (second["tenant_id"],),
+        ).fetchone()
+        assert row["action"] == "database.creation_refused_capacity"
+    finally:
+        c.close()
+
+
+def test_database_provisioning_failure_does_not_commit_database(client, monkeypatch):
+    created = tenant(client)
+
+    def fail_provision(*args, **kwargs):
+        raise RuntimeError("provision failed")
+
+    monkeypatch.setattr(main.node_transport, "call", fail_provision)
+    with pytest.raises(RuntimeError, match="provision failed"):
+        client.post(
+            f"/v1/tenants/{created['tenant_id']}/databases",
+            headers={"X-API-Key": created["api_key"]},
+            json={"name": "failed"},
+        )
+    c = main.db()
+    try:
+        assert c.execute("SELECT COUNT(*) AS n FROM databases").fetchone()["n"] == 0
+    finally:
+        c.close()
 
 
 def promotion_database(client, monkeypatch, replica_status="ready", lag_bytes=42):

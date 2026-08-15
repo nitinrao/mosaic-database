@@ -1,6 +1,17 @@
 # Mosaic Database architecture
 
 Each database has an independent PostgreSQL data directory and a `main` branch.
+The unauthenticated `POST /v1/public/signup` endpoint supports self-serve
+`shared` tenants and returns an API key exactly once. An email that already has
+a tenant is refused with `409`; no tenant or key state is changed. Its public base URL is configured with
+`MOSAIC_PUBLIC_ENDPOINT` (default `https://database-api.mosaicos.com`).
+Self-serve signup is rate-limited independently by IP and email.
+
+The control plane enforces a global database ceiling with
+`MOSAIC_MAX_DATABASES_TOTAL` (default `50`). This applies to every database
+creation caller and returns `503` at capacity; refusals are written to the
+audit log because each database's replicated `main` pins postmasters across
+the co-tenancy slice.
 Branches have their own postmaster and port. ZFS snapshots and clones make
 creation O(1) in data size. Before a ZFS snapshot or `pg_basebackup`, the
 supervisor issues `CHECKPOINT` when the parent is running. This makes the
