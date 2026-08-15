@@ -26,7 +26,7 @@ interface ExecutionContext {
 // const imageConfig: ImageConfig = { dangerouslyAllowSVG: true };
 
 const IMAGE_PATH = "/_vinext/image";
-const SITE_CSP = "default-src 'self'; connect-src 'self' https://database-api.mosaicos.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+const SITE_CSP = "default-src 'self'; connect-src 'self' https://database-api.mosaicos.com https://sandbox.mosaicos.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
 // Image payloads never need to execute anything: match the Next.js/vinext image policy rather than
 // the site one, so an image (an SVG, once dangerouslyAllowSVG is on) can't run script.
 const IMAGE_CSP = "default-src 'none'; script-src 'none'; frame-src 'none'; base-uri 'none'; frame-ancestors 'none'; sandbox;";
