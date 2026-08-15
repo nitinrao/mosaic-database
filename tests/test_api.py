@@ -18,8 +18,8 @@ def client(tmp_path, monkeypatch):
     main.DATABASE_URLS = []
     main._rate.clear()
     class FakeEngine:
-        def create_database(self, path): Path(path).mkdir(parents=True, exist_ok=True)
-        def clone(self, parent, target, parent_port=None): Path(target).mkdir(parents=True, exist_ok=True)
+        def create_database(self, path, password, port): Path(path).mkdir(parents=True, exist_ok=True)
+        def clone(self, parent, target, parent_port=None, parent_password=None): Path(target).mkdir(parents=True, exist_ok=True)
         def destroy(self, path): return None
     monkeypatch.setattr(main, "engine", lambda: FakeEngine())
     with TestClient(main.app) as test_client:
@@ -42,6 +42,19 @@ def test_auth_limits_and_key_rotation(client):
     assert client.get(f"/v1/tenants/{tid}/usage", headers={"X-API-Key": rotated}).status_code == 200
 
 
+def test_revoke_key_does_not_revoke_tenant(client):
+    created = tenant(client)
+    tid, key = created["tenant_id"], created["api_key"]
+    response = client.delete(f"/v1/tenants/{tid}/api-key", headers={"X-API-Key": key})
+    assert response.json()["status"] == "key_revoked"
+    c = main.db()
+    try:
+        row = c.execute("SELECT status,api_key_hash FROM tenants WHERE id=?", (tid,)).fetchone()
+        assert (row["status"], row["api_key_hash"]) == ("active", "")
+    finally:
+        c.close()
+
+
 def test_database_branch_lifecycle_and_main_protection(client):
     created = tenant(client)
     tid, key = created["tenant_id"], created["api_key"]
@@ -54,9 +67,57 @@ def test_database_branch_lifecycle_and_main_protection(client):
     assert client.delete(f"/v1/tenants/{tid}/databases/{did}/branches/{branch['id']}", headers={"X-API-Key": key}).status_code == 200
 
 
+def test_cross_tenant_branch_delete_is_rejected(client):
+    first, second = tenant(client), tenant(client)
+    first_db = client.post(
+        f"/v1/tenants/{first['tenant_id']}/databases",
+        headers={"X-API-Key": first["api_key"]},
+        json={"name": "firstdb"},
+    ).json()
+    branch = client.post(
+        f"/v1/tenants/{first['tenant_id']}/databases/{first_db['id']}/branches",
+        headers={"X-API-Key": first["api_key"]},
+        json={"name": "feature"},
+    ).json()
+    response = client.delete(
+        f"/v1/tenants/{second['tenant_id']}/databases/{first_db['id']}/branches/{branch['id']}",
+        headers={"X-API-Key": second["api_key"]},
+    )
+    assert response.status_code == 404
+
+
+def test_mcp_rate_limit_matches_rest(client, monkeypatch):
+    created = tenant(client)
+    monkeypatch.setattr(main, "RATE_LIMIT_REQUESTS", 1)
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    headers = {"X-API-Key": created["api_key"]}
+    assert client.post("/mcp", headers=headers, json=payload).status_code == 200
+    assert client.post("/mcp", headers=headers, json=payload).status_code == 429
+
+
+def test_branch_ports_are_unique(client):
+    created = tenant(client)
+    database = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "ports"},
+    ).json()
+    c = main.db()
+    try:
+        main_port = c.execute("SELECT port FROM branches WHERE database_id=?", (database["id"],)).fetchone()["port"]
+        with pytest.raises(Exception):
+            c.execute(
+                "INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("br_duplicate", database["id"], "other", None, "/tmp/other", main_port, None, "stopped", "x", main.now(), main.now()),
+            )
+    finally:
+        c.close()
+
+
 @pytest.mark.parametrize("sql", [
     "CREATE TABLE x (id int)",
     "select pg_read_file('/etc/passwd')",
+    "select pg_read_file/**/('/etc/passwd')",
     "select dblink_connect('host=evil')",
     "COPY x TO PROGRAM 'id'",
     "select 1; select 2",
@@ -65,17 +126,26 @@ def test_sql_guardrails(sql):
     assert main.forbidden_sql(sql)
 
 
-def test_zfs_engine_exact_argv():
+def test_sql_comments_and_literals_do_not_trigger_false_positive():
+    assert main.forbidden_sql("select 1 -- pg_read_file('/etc/passwd')\n") is None
+    assert main.forbidden_sql("select '-- pg_read_file(/etc/passwd)'") is None
+
+
+def test_zfs_engine_exact_argv(tmp_path):
     calls = []
     engine = main.ZfsBranchEngine("tank/mosaic", calls.append)
-    engine.create_database(Path("/srv/db"))
-    engine.clone(Path("/srv/db"), Path("/srv/feature"))
-    engine.destroy(Path("/srv/feature"))
-    assert calls == [
-        ["zfs", "create", "-p", "tank/mosaic/db"],
-        ["zfs", "snapshot", "tank/mosaic/db@branch-feature"],
-        ["zfs", "clone", "tank/mosaic/db@branch-feature", "tank/mosaic/feature"],
-        ["zfs", "destroy", "-r", "tank/mosaic/feature"],
+    parent, child = tmp_path / "db", tmp_path / "feature"
+    engine.create_database(parent, "secret", 55432)
+    engine.clone(parent, child)
+    engine.destroy(child)
+    assert calls[0] == ["zfs", "create", "-p", f"tank/mosaic/{tmp_path.name}/db"]
+    assert calls[1][0].endswith("/initdb")
+    assert calls[1][1:6] == ["-D", str(parent), "-U", "postgres", "--auth=scram-sha-256"]
+    assert calls[1][6] == "--pwfile"
+    assert calls[2:] == [
+        [ "zfs", "snapshot", f"tank/mosaic/{tmp_path.name}/db@branch-{child.name}"],
+        [ "zfs", "clone", f"tank/mosaic/{tmp_path.name}/db@branch-{child.name}", f"tank/mosaic/{tmp_path.name}/{child.name}"],
+        ["zfs", "destroy", "-r", f"tank/mosaic/{tmp_path.name}/{child.name}"],
     ]
 
 
@@ -90,5 +160,5 @@ def test_reaper_stop_cycle(tmp_path, monkeypatch):
     c.commit()
     stopped = main.Supervisor().reap(c, idle_seconds=1)
     assert stopped == 1
-    assert c.execute("SELECT status,pid FROM branches").fetchone()[0] == "stopped"
+    assert c.execute("SELECT status,pid FROM branches").fetchone()["status"] == "stopped"
     c.close()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import os
 import re
@@ -8,20 +9,25 @@ import secrets
 import shutil
 import sqlite3
 import subprocess
+import tempfile
+import threading
+from glob import glob
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 try:
     import psycopg
+    from psycopg import sql as psycopg_sql
     from psycopg.rows import dict_row
 except ImportError:
     psycopg = None
+    psycopg_sql = None
     dict_row = None
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,6 +62,17 @@ def token(prefix: str) -> str:
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def pg_bin(name: str) -> str:
+    configured = os.getenv("MOSAIC_PG_BIN_DIR")
+    candidates = [str(Path(configured) / name)] if configured else []
+    candidates += [shutil.which(name) or ""]
+    candidates += sorted(glob(f"/usr/lib/postgresql/*/bin/{name}"), reverse=True)
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return name
 
 
 class Conn:
@@ -108,13 +125,13 @@ def initialize_schema(c: Conn):
     CREATE TABLE IF NOT EXISTS audit_log (id {integer}, tenant_id TEXT, action TEXT NOT NULL, actor TEXT NOT NULL, details TEXT NOT NULL DEFAULT '{{}}', created_at TEXT NOT NULL);
     """)
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS usage_idempotency ON usage_events(tenant_id,idempotency_key) WHERE idempotency_key <> ''")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS branches_port_unique ON branches(port)")
     c.commit()
 
 
 def cipher() -> Fernet:
-    global CREDENTIAL_ENCRYPTION_KEY
     if not CREDENTIAL_ENCRYPTION_KEY:
-        CREDENTIAL_ENCRYPTION_KEY = Fernet.generate_key().decode()
+        raise RuntimeError("MOSAIC_CREDENTIAL_ENCRYPTION_KEY is required")
     return Fernet(CREDENTIAL_ENCRYPTION_KEY.encode())
 
 
@@ -122,8 +139,8 @@ CommandRunner = Callable[[list[str]], Any]
 
 
 class BranchEngine(Protocol):
-    def create_database(self, path: Path) -> None: ...
-    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None) -> None: ...
+    def create_database(self, path: Path, password: str, port: int) -> None: ...
+    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None) -> None: ...
     def destroy(self, path: Path) -> None: ...
 
 
@@ -133,13 +150,20 @@ class ZfsBranchEngine:
         self.run = runner or (lambda argv: subprocess.run(argv, check=True, capture_output=True, text=True))
 
     def _dataset(self, path: Path) -> str:
-        return f"{self.pool}/{path.name}"
+        try:
+            relative = path.resolve().relative_to(BRANCH_ROOT.resolve())
+        except ValueError:
+            relative = Path(path.parent.name) / path.name
+        return "/".join((self.pool, *relative.parts))
 
-    def create_database(self, path: Path):
+    def create_database(self, path: Path, password: str, port: int):
         self.run(["zfs", "create", "-p", self._dataset(path)])
+        _initdb(path, password, port, self.run)
 
-    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None):
+    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None):
         snap = f"{self._dataset(parent)}@branch-{target.name}"
+        if parent_port:
+            _checkpoint(parent_port, parent_password)
         self.run(["zfs", "snapshot", snap])
         self.run(["zfs", "clone", snap, self._dataset(target)])
 
@@ -152,13 +176,24 @@ class CopyBranchEngine:
     def __init__(self, runner: CommandRunner | None = None):
         self.run = runner or (lambda argv: subprocess.run(argv, check=True))
 
-    def create_database(self, path: Path):
-        path.mkdir(parents=True, exist_ok=True)
+    def create_database(self, path: Path, password: str, port: int):
+        _initdb(path, password, port, self.run)
 
-    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None):
+    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None):
         target.parent.mkdir(parents=True, exist_ok=True)
         if parent_port:
-            self.run(["pg_basebackup", "-D", str(target), "-h", "127.0.0.1", "-p", str(parent_port), "-U", "postgres", "-Fp", "-X", "stream", "-R"])
+            _checkpoint(parent_port, parent_password)
+            argv = [pg_bin("pg_basebackup"), "-D", str(target), "-h", "127.0.0.1", "-p", str(parent_port), "-U", "postgres", "-Fp", "-X", "stream", "-R"]
+            old_password = os.environ.get("PGPASSWORD")
+            if parent_password:
+                os.environ["PGPASSWORD"] = parent_password
+            try:
+                self.run(argv)
+            finally:
+                if old_password is None:
+                    os.environ.pop("PGPASSWORD", None)
+                else:
+                    os.environ["PGPASSWORD"] = old_password
         else:
             shutil.copytree(parent, target)
 
@@ -168,6 +203,29 @@ class CopyBranchEngine:
 
 def engine() -> BranchEngine:
     return ZfsBranchEngine() if BRANCH_ENGINE_NAME == "zfs" else CopyBranchEngine()
+
+
+def _initdb(path: Path, password: str, port: int, run: CommandRunner):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", prefix="mosaic-pw-", delete=False) as pwfile:
+        pwfile.write(password)
+        pwfile_path = Path(pwfile.name)
+    try:
+        pwfile_path.chmod(0o600)
+        run([pg_bin("initdb"), "-D", str(path), "-U", "postgres", "--auth=scram-sha-256", "--pwfile", str(pwfile_path)])
+    finally:
+        pwfile_path.unlink(missing_ok=True)
+    config = path / "postgresql.conf"
+    with config.open("a") as handle:
+        handle.write(f"\nport = {port}\nlisten_addresses = '127.0.0.1'\nunix_socket_directories = '{path}'\n")
+
+
+def _checkpoint(port: int, password: str | None):
+    if psycopg is None or not password:
+        return
+    with psycopg.connect(host="127.0.0.1", port=port, user="postgres", password=password, dbname="postgres", connect_timeout=5) as connection:
+        connection.execute("CHECKPOINT")
 
 
 def alive(pid: int | None) -> bool:
@@ -182,7 +240,7 @@ def alive(pid: int | None) -> bool:
 
 class Supervisor:
     def allocate_port(self, c: Conn) -> int:
-        used = {int(row[0]) for row in c.execute("SELECT port FROM branches").fetchall()}
+        used = {int(row["port"]) for row in c.execute("SELECT port FROM branches").fetchall()}
         port = PORT_MIN
         while port in used:
             port += 1
@@ -193,21 +251,47 @@ class Supervisor:
             return
         path = Path(row["path"])
         if not (path / "PG_VERSION").exists():
-            return
-        subprocess.run(["pg_ctl", "-D", str(path), "-o", f"-p {row['port']}", "-w", "start"], check=True, capture_output=True)
+            raise RuntimeError(f"branch {row['id']} has no PostgreSQL cluster at {path}")
+        if psycopg is None:
+            raise RuntimeError("psycopg is required to supervise PostgreSQL branches")
+        subprocess.run([pg_bin("pg_ctl"), "-D", str(path), "-o", f"-p {row['port']}", "-l", str(path / "postgres.log"), "-w", "start"], check=True, capture_output=True)
         if (path / "standby.signal").exists():
-            subprocess.run(["pg_ctl", "-D", str(path), "promote", "-w"], check=True, capture_output=True)
+            subprocess.run([pg_bin("pg_ctl"), "-D", str(path), "promote", "-w"], check=True, capture_output=True)
+        try:
+            branch_password = cipher().decrypt(row["credential_encrypted"].encode()).decode()
+        except InvalidToken as exc:
+            raise RuntimeError(f"branch {row['id']} credentials cannot be decrypted") from exc
+        passwords = [branch_password]
+        if row["parent_id"]:
+            parent = c.execute("SELECT credential_encrypted FROM branches WHERE id=?", (row["parent_id"],)).fetchone()
+            if parent:
+                try:
+                    passwords.append(cipher().decrypt(parent["credential_encrypted"].encode()).decode())
+                except InvalidToken as exc:
+                    raise RuntimeError(f"parent credentials for branch {row['id']} cannot be decrypted") from exc
+        for candidate in passwords:
+            try:
+                with psycopg.connect(host="127.0.0.1", port=row["port"], user="postgres", password=candidate, dbname="postgres", connect_timeout=5) as connection:
+                    connection.execute(psycopg_sql.SQL("ALTER ROLE postgres PASSWORD {}").format(psycopg_sql.Literal(branch_password)))
+                    connection.commit()
+                break
+            except Exception:
+                continue
+        else:
+            raise RuntimeError(f"unable to set password for branch {row['id']}")
         pid = int((path / "postmaster.pid").read_text().splitlines()[0])
         c.execute("UPDATE branches SET status='running',pid=? WHERE id=?", (pid, row["id"]))
         c.commit()
 
     def stop(self, row, c: Conn):
         if alive(row["pid"]):
-            subprocess.run(["pg_ctl", "-D", row["path"], "-m", "fast", "-w", "stop"], check=False, capture_output=True)
+            subprocess.run([pg_bin("pg_ctl"), "-D", row["path"], "-m", "fast", "-w", "stop"], check=False, capture_output=True)
         c.execute("UPDATE branches SET status='stopped',pid=NULL WHERE id=?", (row["id"],))
         c.commit()
 
-    def reap(self, c: Conn, idle_seconds: int = IDLE_REAPER_SECONDS) -> int:
+    def reap(self, c: Conn, idle_seconds: int | None = None) -> int:
+        if idle_seconds is None:
+            idle_seconds = int(os.getenv("MOSAIC_BRANCH_IDLE_SECONDS", str(IDLE_REAPER_SECONDS)))
         cutoff = time.time() - idle_seconds
         count = 0
         for row in c.execute("SELECT * FROM branches WHERE status='running'").fetchall():
@@ -219,16 +303,54 @@ class Supervisor:
 
 supervisor = Supervisor()
 app = FastAPI(title="Mosaic Database", version="0.1.0")
+_reaper_task: asyncio.Task | None = None
+_branch_mutation_lock = threading.Lock()
+
+
+async def _reaper_loop():
+    while True:
+        await asyncio.sleep(max(1, int(os.getenv("MOSAIC_BRANCH_REAPER_INTERVAL", "60"))))
+        c = db()
+        try:
+            supervisor.reap(c)
+        finally:
+            c.close()
 
 
 @app.on_event("startup")
-def startup():
+async def startup():
+    global _reaper_task
+    if not CREDENTIAL_ENCRYPTION_KEY:
+        if os.getenv("MOSAIC_ALLOW_EPHEMERAL_CREDENTIAL_KEY", "").lower() == "true":
+            key_path = BRANCH_ROOT / ".credential.key"
+            key_path.parent.mkdir(parents=True, exist_ok=True)
+            if key_path.exists():
+                globals()["CREDENTIAL_ENCRYPTION_KEY"] = key_path.read_text().strip()
+            else:
+                globals()["CREDENTIAL_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+                key_path.write_text(CREDENTIAL_ENCRYPTION_KEY)
+                key_path.chmod(0o600)
+        else:
+            raise RuntimeError("MOSAIC_CREDENTIAL_ENCRYPTION_KEY is required; set MOSAIC_ALLOW_EPHEMERAL_CREDENTIAL_KEY=true only for development")
     c = db()
     try:
         initialize_schema(c)
         BRANCH_ROOT.mkdir(parents=True, exist_ok=True)
     finally:
         c.close()
+    _reaper_task = asyncio.create_task(_reaper_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global _reaper_task
+    if _reaper_task:
+        _reaper_task.cancel()
+        try:
+            await _reaper_task
+        except asyncio.CancelledError:
+            pass
+        _reaper_task = None
 
 
 @app.middleware("http")
@@ -251,13 +373,17 @@ def tenant_auth(tid: str, x_api_key: str | None = Header(default=None, alias="X-
         row = c.execute("SELECT * FROM tenants WHERE id=? AND status='active'", (tid,)).fetchone()
         if not row or not key or not secrets.compare_digest(row["api_key_hash"], digest(key)):
             raise HTTPException(401, "invalid tenant API key")
-        values = [x for x in _rate.get(tid, []) if x > time.time() - 60]
-        if len(values) >= RATE_LIMIT_REQUESTS:
-            raise HTTPException(429, "rate limit exceeded")
-        _rate[tid] = values + [time.time()]
+        check_rate_limit(tid)
         return row
     finally:
         c.close()
+
+
+def check_rate_limit(tid: str):
+    values = [x for x in _rate.get(tid, []) if x > time.time() - 60]
+    if len(values) >= RATE_LIMIT_REQUESTS:
+        raise HTTPException(429, "rate limit exceeded")
+    _rate[tid] = values + [time.time()]
 
 
 class TenantCreate(BaseModel):
@@ -298,13 +424,16 @@ def healthz():
 
 @app.get("/readyz")
 def readyz():
+    c = None
     try:
         c = db()
         c.execute("SELECT 1")
-        c.close()
         return {"status": "ready"}
     except Exception as exc:
         raise HTTPException(503, f"control plane unavailable: {exc}")
+    finally:
+        if c:
+            c.close()
 
 
 @app.get("/v1/plans")
@@ -335,6 +464,7 @@ def mcp(payload: dict, response: Response, x_api_key: str | None = Header(defaul
         tenant = c.execute("SELECT * FROM tenants WHERE api_key_hash=? AND status='active'", (digest(key),)).fetchone()
         if not tenant:
             raise HTTPException(401, "valid tenant API key required")
+        check_rate_limit(tenant["id"])
         if payload.get("method") == "tools/list":
             return {"jsonrpc": "2.0", "id": payload.get("id"), "result": {"tools": MCP_TOOLS}}
         args, name = payload.get("params", {}).get("arguments", {}), payload.get("params", {}).get("name")
@@ -385,10 +515,10 @@ def rotate_key(tid: str, tenant=Depends(tenant_auth)):
 def revoke_key(tid: str, tenant=Depends(tenant_auth)):
     c = db()
     try:
-        c.execute("UPDATE tenants SET status='revoked' WHERE id=?", (tid,))
+        c.execute("UPDATE tenants SET api_key_hash='' WHERE id=?", (tid,))
         audit(c, tid, "api_key.revoked", {})
         c.commit()
-        return {"status": "revoked"}
+        return {"status": "key_revoked"}
     finally:
         c.close()
 
@@ -414,15 +544,16 @@ def create_database(tid: str, payload: DatabaseCreate, tenant=Depends(tenant_aut
         existing = c.execute("SELECT * FROM databases WHERE tenant_id=? AND name=?", (tid, payload.name)).fetchone()
         if existing:
             return {"id": existing["id"], "name": existing["name"], "status": existing["status"], "reused": True}
-        if c.execute("SELECT COUNT(*) FROM databases WHERE tenant_id=?", (tid,)).fetchone()[0] >= PLANS[tenant["plan"]]["max_databases"]:
+        count = c.execute("SELECT COUNT(*) AS n FROM databases WHERE tenant_id=?", (tid,)).fetchone()
+        if count["n"] >= PLANS[tenant["plan"]]["max_databases"]:
             raise HTTPException(403, "database limit exceeded")
         did, root = token("db_"), BRANCH_ROOT / token("cluster_")
-        engine().create_database(root)
-        main_path = root / "main"
-        engine().create_database(main_path)
         password, bid = secrets.token_urlsafe(24), token("br_")
-        c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", (did, tid, payload.name, str(root), "ready", now()))
-        c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?)", (bid, did, "main", None, str(main_path), supervisor.allocate_port(c), None, "stopped", cipher().encrypt(password.encode()).decode(), now(), now()))
+        with _branch_mutation_lock:
+            main_port = supervisor.allocate_port(c)
+            engine().create_database(root / "main", password, main_port)
+            c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", (did, tid, payload.name, str(root), "ready", now()))
+            c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?)", (bid, did, "main", None, str(root / "main"), main_port, None, "stopped", cipher().encrypt(password.encode()).decode(), now(), now()))
         audit(c, tid, "database.created", {"database_id": did})
         c.commit()
         return {"id": did, "name": payload.name, "status": "ready", "main_branch": {"id": bid, "name": "main", "password": password}}
@@ -451,14 +582,18 @@ def get_database(tid: str, did: str, tenant=Depends(tenant_auth)):
 
 def _create_branch(c: Conn, tid: str, did: str, payload: BranchCreate, tenant):
     parent_db, parent = database(c, tid, did), branch(c, did, payload.parent)
-    if c.execute("SELECT COUNT(*) FROM branches WHERE database_id=?", (did,)).fetchone()[0] >= PLANS[tenant["plan"]]["max_branches"]:
+    count = c.execute("SELECT COUNT(*) AS n FROM branches WHERE database_id=?", (did,)).fetchone()
+    if count["n"] >= PLANS[tenant["plan"]]["max_branches"]:
         raise HTTPException(403, "branch limit exceeded")
     if c.execute("SELECT 1 FROM branches WHERE database_id=? AND name=?", (did, payload.name)).fetchone():
         raise HTTPException(409, "branch already exists")
     bid, path = token("br_"), Path(parent_db["root_path"]) / payload.name
-    engine().clone(Path(parent["path"]), path, parent_port=parent["port"] if parent["status"] == "running" else None)
+    parent_password = cipher().decrypt(parent["credential_encrypted"].encode()).decode()
+    engine().clone(Path(parent["path"]), path, parent_port=parent["port"] if parent["status"] == "running" else None, parent_password=parent_password)
     password = secrets.token_urlsafe(24)
-    c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?)", (bid, did, payload.name, parent["id"], str(path), supervisor.allocate_port(c), None, "stopped", cipher().encrypt(password.encode()).decode(), now(), now()))
+    with _branch_mutation_lock:
+        port = supervisor.allocate_port(c)
+        c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?)", (bid, did, payload.name, parent["id"], str(path), port, None, "stopped", cipher().encrypt(password.encode()).decode(), now(), now()))
     audit(c, tid, "branch.created", {"branch_id": bid, "parent": parent["id"]})
     c.commit()
     return {"id": bid, "name": payload.name, "parent": parent["name"], "status": "stopped", "password": password}
@@ -491,6 +626,7 @@ def branches_get(tid: str, did: str, tenant=Depends(tenant_auth)):
 def delete_branch(tid: str, did: str, bid: str, tenant=Depends(tenant_auth)):
     c = db()
     try:
+        database(c, tid, did)
         row = branch(c, did, bid)
         if row["name"] == "main":
             raise HTTPException(400, "main branch is protected")
@@ -504,8 +640,40 @@ def delete_branch(tid: str, did: str, bid: str, tenant=Depends(tenant_auth)):
         c.close()
 
 
+def _sql_without_comments_or_literals(sql: str) -> str:
+    output, index, quote = [], 0, None
+    while index < len(sql):
+        if quote:
+            if sql[index] == quote:
+                if index + 1 < len(sql) and sql[index + 1] == quote:
+                    output.extend("  ")
+                    index += 2
+                    continue
+                quote = None
+            output.append(" ")
+            index += 1
+            continue
+        if sql.startswith("--", index):
+            newline = sql.find("\n", index)
+            index = len(sql) if newline == -1 else newline
+            output.append(" ")
+            continue
+        if sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            index = len(sql) if end == -1 else end + 2
+            output.append(" ")
+            continue
+        if sql[index] in ("'", '"'):
+            quote = sql[index]
+            output.append(" ")
+        else:
+            output.append(sql[index])
+        index += 1
+    return "".join(output)
+
+
 def forbidden_sql(sql: str) -> str | None:
-    normalized = re.sub(r"\s+", " ", sql.strip().lower())
+    normalized = re.sub(r"\s+", " ", _sql_without_comments_or_literals(sql).strip().lower())
     if ";" in normalized.rstrip(";"):
         return "exactly one SQL statement is required"
     if re.match(r"^(create|alter|drop|truncate|grant|revoke|comment|vacuum|reindex|analyze|copy|do|call|prepare|execute|listen|notify|unlisten)\b", normalized):
@@ -525,22 +693,30 @@ def execute_query(tid: str, did: str, payload: Query, tenant):
     try:
         database(c, tid, did)
         row = branch(c, did, payload.branch)
-        supervisor.start(row, c)
+        try:
+            supervisor.start(row, c)
+        except RuntimeError as exc:
+            raise HTTPException(503, f"branch unavailable: {exc}") from exc
         if psycopg is None:
             raise HTTPException(503, "PostgreSQL driver unavailable")
-        password = cipher().decrypt(row["credential_encrypted"].encode()).decode()
-        conn = psycopg.connect(host="127.0.0.1", port=row["port"], user="postgres", password=password, dbname="postgres", connect_timeout=3)
+        try:
+            password = cipher().decrypt(row["credential_encrypted"].encode()).decode()
+        except InvalidToken as exc:
+            raise HTTPException(503, "branch credentials cannot be decrypted") from exc
+        conn = psycopg.connect(host="127.0.0.1", port=row["port"], user="postgres", password=password, dbname="postgres", connect_timeout=5)
         try:
             conn.execute(f"SET statement_timeout = {PLANS[tenant['plan']]['statement_timeout_ms']}")
             cur = conn.execute(payload.sql, payload.params)
-            rows = cur.fetchall() if cur.description else []
-            if len(rows) > PLANS[tenant["plan"]]["max_rows"]:
+            max_rows = PLANS[tenant["plan"]]["max_rows"]
+            rows = cur.fetchmany(max_rows + 1) if cur.description else []
+            if len(rows) > max_rows:
                 raise HTTPException(413, "row limit exceeded")
             result = {"rows": [list(x) for x in rows], "columns": [x.name for x in (cur.description or [])], "row_count": len(rows)}
             conn.commit()
         finally:
             conn.close()
         c.execute("UPDATE branches SET last_query_at=? WHERE id=?", (now(), row["id"]))
+        c.execute("INSERT INTO usage_events(tenant_id,kind,quantity,unit,occurred_at,metadata,idempotency_key) VALUES(?,?,?,?,?,?,?)", (tid, "query_rows", result["row_count"], "rows", now(), json.dumps({"branch_id": row["id"]}), ""))
         audit(c, tid, "query.executed", {"branch_id": row["id"], "rows": result["row_count"]})
         c.commit()
         return result
