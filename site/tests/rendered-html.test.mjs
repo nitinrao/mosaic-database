@@ -19,6 +19,9 @@ test("renders the Mosaic Database landing page", async () => {
   const html = await response.text();
   assert.match(html, /Branchable Postgres for agents/);
   assert.match(html, /Replication is not a backup/);
+  assert.match(html, /ALPHA/);
+  assert.match(html, /no point-in-time recovery or WAL archiving yet/);
+  assert.match(html, /only copy is this service/);
   assert.match(html, /database-api\.mosaicos\.com/);
   assert.doesNotMatch(html, /ClickHouse workloads|Your site is taking shape/);
 });
@@ -45,6 +48,9 @@ test("keeps the API contract and operational boundaries visible", async () => {
 
 test("renders signup reuse refusal and capacity guidance", async () => {
   const html = await (await render("/start")).text();
+  assert.match(html, /ALPHA/);
+  assert.match(html, /no point-in-time recovery or WAL archiving yet/);
+  assert.match(html, /only copy is this service/);
   assert.match(html, /database-api\.mosaicos\.com\/v1\/public\/signup/);
   assert.match(html, /returned exactly once/);
   assert.match(html, /signup is refused/);

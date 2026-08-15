@@ -85,7 +85,7 @@ export default function DocsPage() {
           ))}
         </aside>
         <article className="prose">
-          <span className="badge"><span className="live" /> Production API</span>
+          <span className="badge"><span className="live" /> ALPHA API</span>
           <h1>DevDocs</h1>
           <p className="lead">
             Mosaic Database is managed PostgreSQL with instant branches and a governed HTTP surface.{" "}

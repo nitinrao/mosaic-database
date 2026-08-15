@@ -17,6 +17,7 @@ export function SiteNav({ current }: { current?: string }) {
         <span className="mark" aria-hidden="true">M</span>
         <span>Mosaic Database</span>
       </ServiceSwitcher>
+      <span className="badge alpha-badge">ALPHA</span>
       <nav aria-label="Primary">
         {links.map(([label, href]) => (
           <Link key={href} href={href} aria-current={current === href ? "page" : undefined}>
