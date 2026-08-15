@@ -56,6 +56,10 @@ in a private mount namespace: copied mounts pin datasets for the lifetime of
 the service and make later ZFS destroys fail with unmount errors. The
 `PrivateTmp` and `ProtectHome` unit options are therefore intentionally
 omitted; the service already runs unprivileged as `postgres`.
+If a stopped standby mount remains pinned by another host namespace, teardown
+uses the narrow `mosaic-umount` helper for one last lazy detach of a path under
+`MOSAIC_BRANCH_ROOT`, then retries the destroy once. Its warning indicates
+that an external namespace is holding the mount.
 
 ## Nodes
 

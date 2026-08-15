@@ -294,6 +294,16 @@ class ZfsBranchEngine:
         except subprocess.CalledProcessError as exc:
             raise ZfsCommandError(argv, exc) from exc
 
+    def _lazy_unmount(self, path: Path) -> None:
+        root = BRANCH_ROOT.resolve()
+        target = path.resolve()
+        if target == root or root not in target.parents:
+            raise RuntimeError(
+                f"refusing lazy unmount outside MOSAIC_BRANCH_ROOT: {target}"
+            )
+        logger.warning("lazy-detaching ZFS standby mountpoint %s", target)
+        self.run(["mosaic-umount", "-l", str(target)])
+
     def create_database(self, path: Path, password: str, port: int, host_id: str = "local"):
         self._run_zfs(["zfs", "create", "-p", "-o", f"mountpoint={path.resolve()}", self._dataset(path)])
         _initdb(path, password, port, self.run, host_id)
@@ -335,8 +345,18 @@ class ZfsBranchEngine:
                         f"cannot safely remove busy standby target {path}: "
                         "postmaster could not be proven stopped"
                     ) from exc
-                self._run_zfs(["zfs", "unmount", "-f", dataset])
-                self._run_zfs(["zfs", "destroy", "-r", dataset])
+                try:
+                    self._run_zfs(["zfs", "unmount", "-f", dataset])
+                    self._run_zfs(["zfs", "destroy", "-r", dataset])
+                except ZfsCommandError as unmount_error:
+                    detail = str(unmount_error).lower()
+                    if not any(
+                        marker in detail
+                        for marker in ("busy", "unmount failed", "umount failed")
+                    ):
+                        raise
+                    self._lazy_unmount(path)
+                    self._run_zfs(["zfs", "destroy", "-r", dataset])
         self._run_zfs(["zfs", "create", "-p", "-o", f"mountpoint={path.resolve()}", dataset])
 
 

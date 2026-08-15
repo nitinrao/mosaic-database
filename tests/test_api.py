@@ -269,6 +269,75 @@ def test_zfs_unmount_failed_standby_destroy_retries_after_verified_stop(tmp_path
     assert calls.count(["zfs", "destroy", "-r", dataset]) == 2
 
 
+def test_zfs_lazy_unmount_retries_after_forced_unmount_fails(tmp_path, monkeypatch):
+    calls = []
+    destroy_attempts = 0
+    root = tmp_path / "branches"
+    standby = root / "cluster" / ".replicas" / "sv2"
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+
+    def run(argv, env=None):
+        nonlocal destroy_attempts
+        calls.append(argv)
+        if argv[:3] == ["zfs", "destroy", "-r"]:
+            destroy_attempts += 1
+            if destroy_attempts == 1:
+                raise subprocess.CalledProcessError(
+                    1, argv, stderr="cannot unmount: unmount failed"
+                )
+        elif argv[:3] == ["zfs", "unmount", "-f"]:
+            raise subprocess.CalledProcessError(
+                1, argv, stderr="cannot unmount: unmount failed"
+            )
+
+    engine = main.ZfsBranchEngine("mosaic/db", run)
+    engine.prepare_standby(standby, is_stopped=lambda path: True)
+    dataset = engine._dataset(standby)
+    assert ["zfs", "unmount", "-f", dataset] in calls
+    assert ["mosaic-umount", "-l", str(standby.resolve())] in calls
+    assert calls.count(["zfs", "destroy", "-r", dataset]) == 2
+
+
+def test_zfs_lazy_unmount_does_not_run_when_target_is_unverified(tmp_path, monkeypatch):
+    calls = []
+    root = tmp_path / "branches"
+    standby = root / "cluster" / ".replicas" / "sv2"
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[:3] == ["zfs", "destroy", "-r"]:
+            raise subprocess.CalledProcessError(
+                1, argv, stderr="cannot unmount: unmount failed"
+            )
+
+    engine = main.ZfsBranchEngine("mosaic/db", run)
+    with pytest.raises(RuntimeError, match="could not be proven stopped"):
+        engine.prepare_standby(standby, is_stopped=lambda path: False)
+    assert not any(call[0] == "mosaic-umount" for call in calls)
+
+
+def test_zfs_lazy_unmount_refuses_path_outside_branch_root(tmp_path, monkeypatch):
+    calls = []
+    root = tmp_path / "branches"
+    standby = tmp_path / "outside" / "cluster" / ".replicas" / "sv2"
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[:3] == ["zfs", "destroy", "-r"]:
+            raise subprocess.CalledProcessError(
+                1, argv, stderr="cannot unmount: unmount failed"
+            )
+        if argv[:3] == ["zfs", "unmount", "-f"]:
+            raise subprocess.CalledProcessError(
+                1, argv, stderr="cannot unmount: unmount failed"
+            )
+
+    engine = main.ZfsBranchEngine("mosaic/db", run)
+    with pytest.raises(RuntimeError, match="outside MOSAIC_BRANCH_ROOT"):
+        engine.prepare_standby(standby, is_stopped=lambda path: True)
+    assert not any(call[0] == "mosaic-umount" for call in calls)
 def test_zfs_busy_standby_destroy_does_not_unmount_unverified_target(tmp_path):
     calls = []
     standby = tmp_path / "cluster" / ".replicas" / "sv2"
