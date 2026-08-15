@@ -523,11 +523,13 @@ class Supervisor:
         pid = int((path / "postmaster.pid").read_text().splitlines()[0])
         return {"status": "running", "pid": pid}
 
-    def stop_local(self, payload: dict):
-        status_argv = [pg_bin("pg_ctl"), "-D", payload["path"], "status"]
+    def _cluster_is_running(self, path: str) -> bool:
+        if not Path(path).exists():
+            return False
+        status_argv = [pg_bin("pg_ctl"), "-D", path, "status"]
         try:
             subprocess.run(status_argv, check=True, capture_output=True, text=True)
-            running = True
+            return True
         except subprocess.CalledProcessError as exc:
             detail = " ".join(
                 part for part in (exc.stdout or "", exc.stderr or "", str(exc))
@@ -537,35 +539,23 @@ class Supervisor:
                 "no server running" in detail
                 or "not running" in detail
                 or "not a database cluster directory" in detail
+                or "does not exist" in detail
             ):
-                running = False
+                return False
             else:
                 raise RuntimeError(
-                    f"cannot verify PostgreSQL cluster at {payload['path']} is stopped"
+                    f"cannot verify PostgreSQL cluster at {path} is stopped"
                 ) from exc
+
+    def stop_local(self, payload: dict):
+        running = self._cluster_is_running(payload["path"])
         if running:
             subprocess.run(
                 [pg_bin("pg_ctl"), "-D", payload["path"], "-m", "fast", "-w", "stop"],
                 check=False,
                 capture_output=True,
             )
-            try:
-                subprocess.run(status_argv, check=True, capture_output=True, text=True)
-            except subprocess.CalledProcessError as exc:
-                detail = " ".join(
-                    part for part in (exc.stdout or "", exc.stderr or "", str(exc))
-                    if part
-                ).lower()
-                if (
-                    "no server running" in detail
-                    or "not running" in detail
-                    or "not a database cluster directory" in detail
-                ):
-                    running = False
-                else:
-                    raise RuntimeError(
-                        f"cannot verify PostgreSQL cluster at {payload['path']} is stopped"
-                    ) from exc
+            running = self._cluster_is_running(payload["path"])
             if running:
                 raise RuntimeError(
                     f"PostgreSQL cluster at {payload['path']} is still running after stop"

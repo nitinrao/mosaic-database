@@ -50,8 +50,9 @@ replicated. Replication slots use the bounded
 `MOSAIC_REPLICATION_WAL_RETENTION_BYTES` budget (10 GiB by default), and a
 standby whose slot is invalidated must be rebuilt from a fresh base backup.
 Standby base backups run as asynchronous node-agent jobs. Replica rows move
-through `pending`, `building`, `ready`, and retryable failure states; the
-control plane polls job status rather than holding an HTTP request open.
+through `pending`, `building`, `ready`, `rebuild_required`, and retryable
+failure states; the control plane polls job status rather than holding an HTTP
+request open.
 Observed lag is exposed as bytes behind the primary WAL replay position with a
 sample timestamp. Standbys use `hot_standby=off` and are never query targets.
 Replica data directories live under the reserved `.replicas` directory beside
@@ -62,8 +63,16 @@ PITR in this scope. Promotion is an operator-only action through the admin
 API. It first fences the old primary when reachable; if that host is
 unreachable, `force=true` records the operator's assertion that it is dead.
 The API reports the last observed standby lag as the promotion event's RPO.
-After promotion, surviving standbys and the old primary are rebuilt from fresh
-base backups rather than reattached to the divergent timeline. When the old
-primary host is reachable, its stopped data directory is destroyed before the
-transition completes. A forced promotion records an unreachable old-primary
-path as abandoned and reserves its port until an operator cleans it up.
+After promotion, surviving standbys and the old primary are marked
+`rebuild_required` and forced through a full teardown and fresh `pg_basebackup`
+rather than reusing anything found at the target path or reattaching to the
+divergent timeline. This prevents a stale standby on a diverged timeline from
+being reported healthy. A forced rebuild that fails remains `rebuild_required`
+and retries with backoff. Slot-invalidated replicas are reconciled
+automatically through the same rebuild path. When the old primary host is
+reachable, its stopped data directory is destroyed before the transition
+completes. A forced promotion records an unreachable old-primary path as
+abandoned and reserves its port until an operator cleans it up. Fencing
+verifies the old primary's actual cluster state from its data directory rather
+than trusting the recorded ledger PID; promotion refuses while that cluster is
+still running unless `force=true`.
