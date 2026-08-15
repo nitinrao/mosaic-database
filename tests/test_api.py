@@ -336,7 +336,10 @@ def test_reaper_loop_invalid_interval_still_yields(monkeypatch):
 def test_standby_build_argv(tmp_path, monkeypatch):
     monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2")
     monkeypatch.setenv("MOSAIC_NODE_PRIVATE_ADDRESSES", "local=10.0.0.1,sv2=10.0.0.2")
-    target = tmp_path / "standby"
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
     target.mkdir()
     (target / "postgresql.conf").write_text("")
     (target / "pg_hba.conf").write_text("")
@@ -478,7 +481,12 @@ def test_peer_down_replica_is_retryable_without_blocking_database(client, monkey
 
 
 def test_repeated_primary_preparation_is_idempotent(tmp_path, monkeypatch):
-    config = tmp_path / "postgresql.conf"
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    primary = root / "primary"
+    primary.mkdir()
+    config = primary / "postgresql.conf"
     config.write_text("listen_addresses = '127.0.0.1'\n")
     calls = []
 
@@ -510,7 +518,7 @@ def test_repeated_primary_preparation_is_idempotent(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "alive", lambda pid: False)
     agent = main.NodeAgent(lambda argv: calls.append(" ".join(argv)))
     payload = {
-        "path": str(tmp_path),
+        "path": str(primary),
         "port": 55432,
         "host_id": "local",
         "branch_id": "br",

@@ -505,7 +505,10 @@ class NodeAgent:
         self.run = runner or (lambda argv: subprocess.run(argv, check=True, capture_output=True, text=True))
 
     def handle(self, operation: str, payload: dict):
-        if operation not in {"provision", "clone", "start", "stop", "inspect", "destroy"}:
+        if operation not in {
+            "provision", "clone", "build_standby", "prepare_primary",
+            "inspect_replication", "start", "stop", "inspect", "destroy",
+        }:
             raise RuntimeError(f"unknown node operation {operation}")
         root = BRANCH_ROOT.resolve()
 
@@ -535,7 +538,7 @@ class NodeAgent:
             )
             return {"status": "cloned"}
         if operation == "build_standby":
-            target = Path(payload["target_path"])
+            target = confined(payload["target_path"], "target_path")
             target.parent.mkdir(parents=True, exist_ok=True)
             argv = [
                 pg_bin("pg_basebackup"), "-D", str(target),
@@ -567,7 +570,8 @@ class NodeAgent:
         if operation == "prepare_primary":
             if psycopg is None:
                 raise RuntimeError("psycopg is required for replication setup")
-            config_text = (Path(payload["path"]) / "postgresql.conf").read_text()
+            primary_path = confined(payload["path"], "path")
+            config_text = (primary_path / "postgresql.conf").read_text()
             listen_setting = re.search(
                 r"^\s*listen_addresses\s*=\s*'([^']*)'",
                 config_text,
@@ -579,7 +583,7 @@ class NodeAgent:
             )
             was_running = alive(payload.get("pid"))
             _rewrite_postgres_config(
-                Path(payload["path"]),
+                primary_path,
                 int(payload["port"]),
                 payload["host_id"],
                 replication_user=payload["replication_user"],
@@ -587,7 +591,7 @@ class NodeAgent:
             )
             result = supervisor.start_local({
                 "branch_id": payload["branch_id"],
-                "path": payload["path"],
+                "path": str(primary_path),
                 "port": payload["port"],
                 "pid": payload.get("pid"),
                 "status": payload.get("status", "stopped"),
@@ -634,11 +638,11 @@ class NodeAgent:
                 connection.commit()
             if requires_restart and was_running:
                 self.run([
-                    pg_bin("pg_ctl"), "-D", payload["path"],
+                    pg_bin("pg_ctl"), "-D", str(primary_path),
                     "-m", "fast", "-w", "restart",
                 ])
             else:
-                self.run([pg_bin("pg_ctl"), "-D", payload["path"], "reload"])
+                self.run([pg_bin("pg_ctl"), "-D", str(primary_path), "reload"])
             return result
         if operation == "inspect_replication":
             if psycopg is None:
