@@ -1132,6 +1132,8 @@ def test_standby_build_replaces_existing_slot_before_backup(tmp_path, monkeypatc
             target.mkdir(parents=True, exist_ok=True)
             (target / "postgresql.conf").write_text("")
             (target / "pg_hba.conf").write_text("")
+        elif argv[0] == main.pg_bin("pg_ctl") and argv[-1] == "start":
+            (target / "postmaster.pid").write_text("123\n")
 
     agent = main.NodeAgent(run)
     payload = {
@@ -1191,6 +1193,8 @@ def test_standby_build_missing_slot_is_not_an_error(tmp_path, monkeypatch):
             target.mkdir(parents=True, exist_ok=True)
             (target / "postgresql.conf").write_text("")
             (target / "pg_hba.conf").write_text("")
+        elif argv[0] == main.pg_bin("pg_ctl") and argv[-1] == "start":
+            (target / "postmaster.pid").write_text("123\n")
 
     agent = main.NodeAgent(run)
     payload = {
@@ -1626,6 +1630,7 @@ def test_start_local_does_not_adopt_foreign_postmaster_pidfile(tmp_path, monkeyp
     def run(argv, **kwargs):
         calls.append(argv)
         assert argv[-1] == "start"
+        assert not (path / "postmaster.pid").exists()
         (path / "postmaster.pid").write_text(f"456\n{path.resolve()}\n")
 
     monkeypatch.setattr(main, "psycopg", FakePsycopg())
@@ -1660,6 +1665,20 @@ def test_stop_local_does_not_follow_foreign_postmaster_pidfile(tmp_path, monkeyp
         "path": str(path),
         "require_path": True,
     }) == {"status": "stopped", "pid": None}
+
+
+def test_foreign_pidfile_cleanup_preserves_matching_and_unparseable_files(tmp_path):
+    path = tmp_path / "branch"
+    path.mkdir()
+    pidfile = path / "postmaster.pid"
+
+    pidfile.write_text("123\n")
+    main._remove_foreign_postmaster_pidfile(path)
+    assert pidfile.exists()
+
+    pidfile.write_text(f"123\n{path.resolve()}\n")
+    main._remove_foreign_postmaster_pidfile(path)
+    assert pidfile.exists()
 
 
 def test_start_local_fast_path_skips_status_and_password_reconciliation(tmp_path, monkeypatch):

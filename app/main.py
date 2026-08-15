@@ -535,6 +535,14 @@ def _postmaster_pidfile_matches_path(path: Path) -> bool | None:
         return None
 
 
+def _remove_foreign_postmaster_pidfile(path: Path):
+    pidfile = path / "postmaster.pid"
+    if not pidfile.exists():
+        return
+    if _postmaster_pidfile_matches_path(path) is False:
+        pidfile.unlink()
+
+
 def _checkpoint(host_id: str, port: int, password: str | None):
     if psycopg is None or not password:
         return
@@ -606,6 +614,7 @@ class Supervisor:
             raise RuntimeError("psycopg is required to supervise PostgreSQL branches")
         branch_password = payload["password"]
         if not self._cluster_is_running(str(path)):
+            _remove_foreign_postmaster_pidfile(path)
             subprocess.run([pg_bin("pg_ctl"), "-D", str(path), "-o", f"-p {port}", "-l", str(path / "postgres.log"), "-w", "start"], check=True, capture_output=True)
         self._reconcile_password(
             path,
