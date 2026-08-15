@@ -57,5 +57,10 @@ sample timestamp. Standbys use `hot_standby=off` and are never query targets.
 Replica data directories live under the reserved `.replicas` directory beside
 the primary branch, outside the tenant branch namespace.
 Standbys remain dark until a later manual or scripted promotion. There is no
-automatic failover, leader election, or fencing in this scope; losing a host
-loses its ephemeral branches.
+automatic failover, leader election, watchdog, synchronous replication, or
+PITR in this scope. Promotion is an operator-only action through the admin
+API. It first fences the old primary when reachable; if that host is
+unreachable, `force=true` records the operator's assertion that it is dead.
+The API reports the last observed standby lag as the promotion event's RPO.
+After promotion, surviving standbys and the old primary are rebuilt from fresh
+base backups rather than reattached to the divergent timeline.

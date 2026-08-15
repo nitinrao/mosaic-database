@@ -37,6 +37,70 @@ def tenant(client, plan="shared"):
     return response.json()
 
 
+def promotion_database(client, monkeypatch, replica_status="ready", lag_bytes=42):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local")
+    monkeypatch.delenv("MOSAIC_NODE_PRIVATE_ADDRESSES", raising=False)
+    created = tenant(client)
+    database = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "promotion-db"},
+    ).json()
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2,sv3")
+    monkeypatch.setenv(
+        "MOSAIC_NODE_PRIVATE_ADDRESSES",
+        "local=10.0.0.1,sv2=10.0.0.2,sv3=10.0.0.3",
+    )
+    c = main.db()
+    main_row = c.execute(
+        "SELECT * FROM branches WHERE database_id=?", (database["id"],)
+    ).fetchone()
+    c.execute(
+        "UPDATE branches SET status='running',pid=111 WHERE id=?",
+        (main_row["id"],),
+    )
+    c.execute(
+        "INSERT INTO replication_credentials VALUES(?,?,?,?)",
+        (
+            database["id"],
+            "mosaic_repl_promotion",
+            main.cipher().encrypt(b"repl-secret").decode(),
+            main.now(),
+        ),
+    )
+    sampled = main.now()
+    ports = [main.Supervisor().allocate_port(c)]
+    used = {int(row["port"]) for row in c.execute(
+        "SELECT port FROM branches UNION ALL SELECT port FROM replicas"
+    ).fetchall()}
+    ports.append(ports[0] + 1)
+    while ports[1] in used:
+        ports[1] += 1
+    for host_id, status, port in (
+        ("sv2", replica_status, ports[0]),
+        ("sv3", "ready", ports[1]),
+    ):
+        c.execute(
+            "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                f"rep_{host_id}_{database['id']}",
+                database["id"],
+                main_row["id"],
+                host_id,
+                str(Path(main_row["path"]).parent / ".replicas" / host_id),
+                port,
+                status,
+                lag_bytes,
+                sampled,
+                sampled,
+                f"slot_{host_id}",
+            ),
+        )
+    c.commit()
+    c.close()
+    return created, database
+
+
 def test_auth_limits_and_key_rotation(client):
     created = tenant(client)
     tid, key = created["tenant_id"], created["api_key"]
@@ -439,6 +503,265 @@ def test_standby_build_argv(tmp_path, monkeypatch):
         str(target / "postgres.log"), "start",
     ]
     assert calls[2] == [main.pg_bin("pg_ctl"), "-D", str(target), "status"]
+
+
+def test_promote_standby_clears_standby_configuration_and_is_idempotent(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
+    target.mkdir()
+    (target / "PG_VERSION").write_text("14\n")
+    (target / "postmaster.pid").write_text("321\n")
+    (target / "postgresql.conf").write_text("port = 55433\nhot_standby = off\n")
+    (target / "postgresql.auto.conf").write_text(
+        "primary_conninfo = 'host=10.0.0.1'\nprimary_slot_name = 'slot_x'\n"
+    )
+    (target / "standby.signal").write_text("")
+    calls = []
+    recovery = iter([True, False, False])
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, query):
+            assert query == "SELECT pg_is_in_recovery()"
+            return type(
+                "Result",
+                (),
+                {"fetchone": lambda self: (next(recovery),)},
+            )()
+
+    class FakePsycopg:
+        def connect(self, **kwargs):
+            return Connection()
+
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+
+    def run(argv, env=None):
+        calls.append(argv)
+
+    agent = main.NodeAgent(run)
+    payload = {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "local",
+        "postgres_password": "secret",
+        "promotion_timeout": 1,
+    }
+    first = agent.handle("promote_standby", payload)
+    second = agent.handle("promote_standby", payload)
+    assert first == {"status": "promoted", "pid": 321, "port": 55433}
+    assert second == first
+    assert sum(call[-1] == "promote" for call in calls) == 1
+    assert not (target / "standby.signal").exists()
+    auto = (target / "postgresql.auto.conf").read_text()
+    assert "primary_conninfo" not in auto
+    assert "primary_slot_name" not in auto
+    assert "hot_standby = on" in (target / "postgresql.conf").read_text()
+
+
+def test_starting_standby_signal_does_not_promote(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    path = root / "branch"
+    path.mkdir()
+    (path / "PG_VERSION").write_text("14\n")
+    (path / "standby.signal").write_text("")
+    (path / "postgresql.conf").write_text("")
+    calls = []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, query):
+            return self
+
+        def commit(self):
+            return None
+
+    class FakePsycopg:
+        def connect(self, **kwargs):
+            return Connection()
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        (path / "postmaster.pid").write_text("456\n")
+
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    monkeypatch.setattr(main, "subprocess", type("Subprocess", (), {"run": staticmethod(run)}))
+    monkeypatch.setattr(main, "alive", lambda pid: False)
+    result = main.Supervisor().start_local({
+        "path": str(path),
+        "branch_id": "br",
+        "port": 55432,
+        "host_id": "local",
+        "pid": None,
+        "status": "stopped",
+        "password": "secret",
+        "parent_passwords": [],
+    })
+    assert result == {"status": "running", "pid": 456}
+    assert not any(call[-1] == "promote" for call in calls)
+
+
+def test_promotion_requires_ready_replica_and_fresh_lag(client, monkeypatch):
+    created, database = promotion_database(
+        client, monkeypatch, replica_status="building", lag_bytes=42
+    )
+    response = client.post(
+        f"/v1/admin/databases/{database['id']}/promote",
+        headers={"X-Admin-Key": "test-admin"},
+        json={"host_id": "sv2"},
+    )
+    assert response.status_code == 409
+
+    created, database = promotion_database(
+        client, monkeypatch, replica_status="ready", lag_bytes=None
+    )
+    response = client.post(
+        f"/v1/admin/databases/{database['id']}/promote",
+        headers={"X-Admin-Key": "test-admin"},
+        json={"host_id": "sv2"},
+    )
+    assert response.status_code == 409
+
+
+def test_promotion_requires_admin(client, monkeypatch):
+    created, database = promotion_database(client, monkeypatch)
+    response = client.post(
+        f"/v1/admin/databases/{database['id']}/promote",
+        headers={"X-API-Key": created["api_key"]},
+        json={"host_id": "sv2"},
+    )
+    assert response.status_code == 401
+
+
+def test_promotion_fences_before_promoting_and_rebuilds_replicas(client, monkeypatch):
+    _, database = promotion_database(client, monkeypatch)
+    calls = []
+
+    class Transport:
+        def call(self, host_id, operation, payload):
+            calls.append((host_id, operation))
+            if operation == "promote_standby":
+                return {"status": "promoted", "pid": 222, "port": payload["target_port"]}
+            if operation == "stop":
+                return {"status": "stopped", "pid": None}
+            raise AssertionError(operation)
+
+    monkeypatch.setattr(main, "node_transport", Transport())
+    response = client.post(
+        f"/v1/admin/databases/{database['id']}/promote",
+        headers={"X-Admin-Key": "test-admin"},
+        json={"host_id": "sv2"},
+    )
+    assert response.status_code == 200
+    assert calls == [("local", "stop"), ("sv2", "promote_standby")]
+    c = main.db()
+    try:
+        main_row = c.execute(
+            "SELECT host_id,path,port,status,pid FROM branches WHERE database_id=? AND name='main'",
+            (database["id"],),
+        ).fetchone()
+        assert main_row["host_id"] == "sv2"
+        assert main_row["path"].endswith("/.replicas/sv2")
+        assert (main_row["port"], main_row["status"], main_row["pid"]) == (
+            response.json()["port"],
+            "running",
+            222,
+        )
+        replicas = c.execute(
+            "SELECT host_id,status FROM replicas WHERE database_id=? ORDER BY host_id",
+            (database["id"],),
+        ).fetchall()
+        assert [(row["host_id"], row["status"]) for row in replicas] == [
+            ("local", "pending"),
+            ("sv3", "pending"),
+        ]
+        audit_row = c.execute(
+            "SELECT action,actor,details FROM audit_log WHERE action='database.promoted' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert audit_row["actor"] == "admin"
+        details = main.json.loads(audit_row["details"])
+        assert details["promoted_host"] == "sv2"
+        assert details["lag_bytes"] == 42
+        assert details["fence"] == "reachable and stopped"
+    finally:
+        c.close()
+
+
+def test_promotion_requires_force_when_old_primary_unreachable(client, monkeypatch):
+    _, database = promotion_database(client, monkeypatch)
+    calls = []
+
+    class Transport:
+        def call(self, host_id, operation, payload):
+            calls.append((host_id, operation))
+            if operation == "stop":
+                raise RuntimeError("old host unavailable")
+            return {"status": "promoted", "pid": 222, "port": payload["target_port"]}
+
+    monkeypatch.setattr(main, "node_transport", Transport())
+    endpoint = f"/v1/admin/databases/{database['id']}/promote"
+    response = client.post(
+        endpoint,
+        headers={"X-Admin-Key": "test-admin"},
+        json={"host_id": "sv2"},
+    )
+    assert response.status_code == 409
+    assert calls == [("local", "stop")]
+    response = client.post(
+        endpoint,
+        headers={"X-Admin-Key": "test-admin"},
+        json={"host_id": "sv2", "force": True},
+    )
+    assert response.status_code == 200
+    assert calls == [
+        ("local", "stop"),
+        ("local", "stop"),
+        ("sv2", "promote_standby"),
+    ]
+
+
+def test_promotion_is_idempotent_when_main_already_on_target(client, monkeypatch):
+    _, database = promotion_database(client, monkeypatch)
+    c = main.db()
+    main_row = c.execute(
+        "SELECT * FROM branches WHERE database_id=? AND name='main'",
+        (database["id"],),
+    ).fetchone()
+    target_path = Path(main_row["path"]).parent / ".replicas" / "sv2"
+    c.execute(
+        "UPDATE branches SET host_id='sv2',path=?,port=55433,status='running',pid=222 WHERE id=?",
+        (str(target_path), main_row["id"]),
+    )
+    c.execute("DELETE FROM replicas WHERE database_id=?", (database["id"],))
+    c.commit()
+    c.close()
+    calls = []
+
+    class Transport:
+        def call(self, host_id, operation, payload):
+            calls.append((host_id, operation))
+            return {"status": "promoted", "pid": 222, "port": 55433}
+
+    monkeypatch.setattr(main, "node_transport", Transport())
+    response = client.post(
+        f"/v1/admin/databases/{database['id']}/promote",
+        headers={"X-Admin-Key": "test-admin"},
+        json={"host_id": "sv2"},
+    )
+    assert response.status_code == 200
+    assert calls == [("sv2", "promote_standby")]
 
 
 def test_standby_build_stops_before_removing_target(tmp_path, monkeypatch):

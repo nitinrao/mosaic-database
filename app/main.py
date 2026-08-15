@@ -46,6 +46,8 @@ IDLE_REAPER_SECONDS = int(os.getenv("MOSAIC_BRANCH_IDLE_SECONDS", "900"))
 PORT_MIN = int(os.getenv("MOSAIC_POSTGRES_PORT_MIN", "55432"))
 RATE_LIMIT_REQUESTS = int(os.getenv("MOSAIC_RATE_LIMIT_REQUESTS", "120"))
 NODE_ID = os.getenv("MOSAIC_NODE_ID", "local")
+PROMOTION_MAX_LAG_BYTES = int(os.getenv("MOSAIC_PROMOTION_MAX_LAG_BYTES", str(10 * 1024 * 1024 * 1024)))
+PROMOTION_MAX_LAG_AGE_SECONDS = int(os.getenv("MOSAIC_PROMOTION_MAX_LAG_AGE_SECONDS", "300"))
 NODE_AGENT_TOKEN = os.getenv("MOSAIC_NODE_AGENT_TOKEN", "")
 NODE_AGENT_CA_BUNDLE = os.getenv("MOSAIC_NODE_AGENT_CA_BUNDLE", "")
 ALLOW_PLAINTEXT_NODE_AGENT = os.getenv("MOSAIC_ALLOW_PLAINTEXT_NODE_AGENT", "").lower() == "true"
@@ -312,7 +314,7 @@ class CopyBranchEngine:
         else:
             shutil.copytree(parent, target)
         if target_port is not None:
-            _rewrite_postgres_config(target, target_port, target_host_id)
+            _clear_standby_configuration(target, target_port, target_host_id)
 
     def destroy(self, path: Path):
         shutil.rmtree(path, ignore_errors=True)
@@ -401,6 +403,20 @@ def _rewrite_postgres_config(
         hba.write_text("\n".join(hba_lines) + "\n")
 
 
+def _clear_standby_configuration(path: Path, port: int, host_id: str):
+    auto_conf = path / "postgresql.auto.conf"
+    if auto_conf.exists():
+        lines = auto_conf.read_text().splitlines()
+        auto_conf.write_text(
+            "\n".join(
+                line for line in lines
+                if not re.match(r"^\s*(?:primary_conninfo|primary_slot_name)\s*=", line)
+            ) + ("\n" if lines else "")
+        )
+    (path / "standby.signal").unlink(missing_ok=True)
+    _rewrite_postgres_config(path, port, host_id, standby=False)
+
+
 def _checkpoint(host_id: str, port: int, password: str | None):
     if psycopg is None or not password:
         return
@@ -468,8 +484,6 @@ class Supervisor:
         if psycopg is None:
             raise RuntimeError("psycopg is required to supervise PostgreSQL branches")
         subprocess.run([pg_bin("pg_ctl"), "-D", str(path), "-o", f"-p {port}", "-l", str(path / "postgres.log"), "-w", "start"], check=True, capture_output=True)
-        if (path / "standby.signal").exists():
-            subprocess.run([pg_bin("pg_ctl"), "-D", str(path), "promote", "-w"], check=True, capture_output=True)
         branch_password = payload["password"]
         for candidate in [branch_password, *payload.get("parent_passwords", [])]:
             try:
@@ -558,6 +572,46 @@ class NodeAgent:
             ) from exc
         return False
 
+    def _is_in_recovery(self, target: Path, payload: dict) -> bool:
+        if psycopg is None:
+            raise RuntimeError("psycopg is required to promote a standby")
+        with psycopg.connect(
+            host=node_address(payload["target_host_id"]),
+            port=int(payload["target_port"]),
+            user="postgres",
+            password=payload["postgres_password"],
+            dbname="postgres",
+            connect_timeout=5,
+        ) as connection:
+            row = connection.execute("SELECT pg_is_in_recovery()").fetchone()
+        value = row[0] if not isinstance(row, dict) else next(iter(row.values()))
+        return bool(value)
+
+    def promote_standby(self, target: Path, payload: dict) -> dict:
+        recovery = self._is_in_recovery(target, payload)
+        if recovery:
+            self.run([
+                pg_bin("pg_ctl"), "-D", str(target), "promote",
+            ])
+            deadline = time.monotonic() + float(payload.get("promotion_timeout", 30))
+            while time.monotonic() < deadline:
+                if not self._is_in_recovery(target, payload):
+                    break
+                time.sleep(0.2)
+            else:
+                raise RuntimeError("standby promotion did not leave recovery")
+        _clear_standby_configuration(
+            target,
+            int(payload["target_port"]),
+            payload["target_host_id"],
+        )
+        pid = int((target / "postmaster.pid").read_text().splitlines()[0])
+        return {
+            "status": "promoted",
+            "pid": pid,
+            "port": int(payload["target_port"]),
+        }
+
     def _run_standby_build(self, target: Path, payload: dict):
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -641,7 +695,8 @@ class NodeAgent:
     def handle(self, operation: str, payload: dict):
         if operation not in {
             "provision", "clone", "build_standby", "prepare_primary",
-            "inspect_replication", "inspect_standby", "start", "stop", "inspect", "destroy",
+            "inspect_replication", "inspect_standby", "promote_standby",
+            "start", "stop", "inspect", "destroy",
         }:
             raise RuntimeError(f"unknown node operation {operation}")
         root = BRANCH_ROOT.resolve()
@@ -676,6 +731,11 @@ class NodeAgent:
             return self._start_standby_build(target, payload)
         if operation == "inspect_standby":
             return self._standby_status(confined(payload["target_path"], "target_path"))
+        if operation == "promote_standby":
+            return self.promote_standby(
+                confined(payload["target_path"], "target_path"),
+                payload,
+            )
         if operation == "prepare_primary":
             if psycopg is None:
                 raise RuntimeError("psycopg is required for replication setup")
@@ -850,6 +910,11 @@ def replica_nodes(primary_host_id: str) -> list[str]:
     return [node_id for node_id in node_ids() if node_id != primary_host_id]
 
 
+def replica_root(main_path: str | Path) -> Path:
+    path = Path(main_path)
+    return path.parent.parent if path.parent.name == ".replicas" else path.parent
+
+
 def create_replicas(c: Conn, database_id: str, main_row, postgres_password: str):
     peers = replica_nodes(main_row["host_id"])
     if not peers:
@@ -867,7 +932,7 @@ def create_replicas(c: Conn, database_id: str, main_row, postgres_password: str)
     for node_id in peers:
         replica_id = token("rep_")
         replica_port = supervisor.allocate_port(c)
-        replica_path = Path(main_row["path"]).parent / ".replicas" / node_id
+        replica_path = replica_root(main_row["path"]) / ".replicas" / node_id
         c.execute(
             "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (replica_id, database_id, main_row["id"], node_id, str(replica_path), replica_port, "pending", None, None, now(), slots[node_id]),
@@ -1210,6 +1275,11 @@ class BranchCreate(BaseModel):
     parent: str = "main"
 
 
+class PromotionRequest(BaseModel):
+    host_id: str = Field(min_length=1, max_length=100)
+    force: bool = False
+
+
 class Query(BaseModel):
     sql: str = Field(min_length=1, max_length=100000)
     params: list[Any] = []
@@ -1223,8 +1293,8 @@ class Usage(BaseModel):
     idempotency_key: str = ""
 
 
-def audit(c: Conn, tenant_id: str | None, action: str, details: dict):
-    c.execute("INSERT INTO audit_log(tenant_id,action,actor,details,created_at) VALUES(?,?,?,?,?)", (tenant_id, action, "api", json.dumps(details), now()))
+def audit(c: Conn, tenant_id: str | None, action: str, details: dict, actor: str = "api"):
+    c.execute("INSERT INTO audit_log(tenant_id,action,actor,details,created_at) VALUES(?,?,?,?,?)", (tenant_id, action, actor, json.dumps(details), now()))
 
 
 @app.get("/healthz")
@@ -1324,6 +1394,166 @@ def create_tenant(payload: TenantCreate):
         audit(c, tid, "tenant.created", {"plan": payload.plan})
         c.commit()
         return {"tenant_id": tid, "api_key": key, "plan": payload.plan}
+    finally:
+        c.close()
+
+
+def promotion_lag_is_acceptable(replica) -> bool:
+    if replica["lag_bytes"] is None or not replica["lag_sampled_at"]:
+        return False
+    try:
+        sampled_at = datetime.fromisoformat(replica["lag_sampled_at"])
+    except ValueError:
+        return False
+    age = (datetime.now(timezone.utc) - sampled_at).total_seconds()
+    return (
+        age <= int(os.getenv(
+            "MOSAIC_PROMOTION_MAX_LAG_AGE_SECONDS",
+            str(PROMOTION_MAX_LAG_AGE_SECONDS),
+        ))
+        and int(replica["lag_bytes"]) <= int(os.getenv(
+            "MOSAIC_PROMOTION_MAX_LAG_BYTES",
+            str(PROMOTION_MAX_LAG_BYTES),
+        ))
+    )
+
+
+@app.post("/v1/admin/databases/{database_id}/promote")
+def promote_database(
+    database_id: str,
+    payload: PromotionRequest,
+    _: None = Depends(require_admin),
+):
+    c = db()
+    try:
+        main_row = c.execute(
+            "SELECT * FROM branches WHERE database_id=? AND name='main'",
+            (database_id,),
+        ).fetchone()
+        if not main_row:
+            raise HTTPException(404, "database not found")
+        if main_row["host_id"] == payload.host_id:
+            try:
+                postgres_password = cipher().decrypt(
+                    main_row["credential_encrypted"].encode()
+                ).decode()
+                result = node_transport.call(payload.host_id, "promote_standby", {
+                    "target_path": main_row["path"],
+                    "target_port": main_row["port"],
+                    "target_host_id": payload.host_id,
+                    "postgres_password": postgres_password,
+                })
+            except Exception as exc:
+                raise HTTPException(503, f"promotion failed: {exc}") from exc
+            audit(
+                c,
+                None,
+                "database.promoted",
+                {
+                    "database_id": database_id,
+                    "promoted_host": payload.host_id,
+                    "fence": "already primary",
+                    "lag_bytes": None,
+                    "force": payload.force,
+                },
+                actor="admin",
+            )
+            c.commit()
+            return {
+                "status": result["status"],
+                "host_id": payload.host_id,
+                "pid": result["pid"],
+                "port": result["port"],
+                "lag_bytes": None,
+            }
+        replica = c.execute(
+            "SELECT * FROM replicas WHERE database_id=? AND host_id=?",
+            (database_id, payload.host_id),
+        ).fetchone()
+        if not replica:
+            raise HTTPException(404, "promotion target is not a replica")
+        if replica["status"] != "ready":
+            raise HTTPException(409, "promotion target replica is not ready")
+        if not promotion_lag_is_acceptable(replica) and not payload.force:
+            raise HTTPException(
+                409,
+                "promotion target lag sample is missing, stale, or beyond the configured threshold",
+            )
+        try:
+            postgres_password = cipher().decrypt(
+                main_row["credential_encrypted"].encode()
+            ).decode()
+        except InvalidToken as exc:
+            raise HTTPException(503, "primary credentials cannot be decrypted") from exc
+
+        fence_outcome = "reachable and stopped"
+        try:
+            node_transport.call(main_row["host_id"], "stop", {
+                "path": main_row["path"],
+                "pid": main_row["pid"],
+            })
+        except Exception as exc:
+            if not payload.force:
+                raise HTTPException(
+                    409,
+                    "old primary is unreachable; set force=true only after asserting it is dead",
+                ) from exc
+            fence_outcome = f"unreachable; force asserted: {type(exc).__name__}"
+        c.execute(
+            "UPDATE branches SET status='stopped',pid=NULL WHERE id=?",
+            (main_row["id"],),
+        )
+        try:
+            promoted = node_transport.call(payload.host_id, "promote_standby", {
+                "target_path": replica["path"],
+                "target_port": replica["port"],
+                "target_host_id": payload.host_id,
+                "postgres_password": postgres_password,
+            })
+        except Exception as exc:
+            raise HTTPException(503, f"promotion failed: {exc}") from exc
+
+        c.execute(
+            "UPDATE branches SET host_id=?,path=?,port=?,status='running',pid=? WHERE id=?",
+            (
+                replica["host_id"],
+                replica["path"],
+                promoted["port"],
+                promoted["pid"],
+                main_row["id"],
+            ),
+        )
+        c.execute("DELETE FROM replicas WHERE database_id=?", (database_id,))
+        c.execute(
+            "DELETE FROM replication_credentials WHERE database_id=?",
+            (database_id,),
+        )
+        new_main = c.execute(
+            "SELECT * FROM branches WHERE id=?", (main_row["id"],)
+        ).fetchone()
+        create_replicas(c, database_id, new_main, postgres_password)
+        audit(
+            c,
+            None,
+            "database.promoted",
+            {
+                "database_id": database_id,
+                "fence": fence_outcome,
+                "promoted_host": payload.host_id,
+                "lag_bytes": replica["lag_bytes"],
+                "lag_sampled_at": replica["lag_sampled_at"],
+                "force": payload.force,
+            },
+            actor="admin",
+        )
+        c.commit()
+        return {
+            "status": promoted["status"],
+            "host_id": payload.host_id,
+            "pid": promoted["pid"],
+            "port": promoted["port"],
+            "lag_bytes": replica["lag_bytes"],
+        }
     finally:
         c.close()
 

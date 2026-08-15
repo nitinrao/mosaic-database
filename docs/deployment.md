@@ -136,5 +136,15 @@ the system trust store or the configured `MOSAIC_NODE_AGENT_CA_BUNDLE`.
 V0 remains single-primary per host with no HA, PITR, or DR promise.
 Only `main` branches are replicated; ephemeral ZFS branches are not, so losing
 a host loses its ephemeral branches. Standbys remain dark until a later manual
-or scripted promotion. Automatic failover, leader election, and fencing are
-not implemented.
+or scripted promotion. Automatic failover, leader election, watchdogs,
+synchronous replication, and PITR are not implemented. Promotion is
+operator-triggered through `POST /v1/admin/databases/{database_id}/promote`
+with the `X-Admin-Key` header. The control plane stops the old primary before
+promoting a reachable standby; an unreachable old-primary host requires
+`force=true`, which is the operator's explicit assertion that it is dead. The
+response's observed lag is the RPO for that promotion event. Every surviving
+standby, including the old primary when it returns, is rebuilt from a fresh
+base backup instead of being reattached to the new timeline.
+Promotion rejects missing or stale lag samples and lag above
+`MOSAIC_PROMOTION_MAX_LAG_BYTES` (10 GiB by default); configure the freshness
+window with `MOSAIC_PROMOTION_MAX_LAG_AGE_SECONDS` (five minutes by default).
