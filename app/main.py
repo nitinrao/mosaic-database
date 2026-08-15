@@ -58,6 +58,15 @@ _rate: dict[str, list[float]] = {}
 logger = logging.getLogger(__name__)
 
 
+def background_interval(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning("invalid %s=%r; using %ss", name, raw, default)
+        return default
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -522,7 +531,7 @@ _branch_mutation_lock = threading.Lock()
 async def _reaper_loop():
     while True:
         try:
-            await asyncio.sleep(max(1, int(os.getenv("MOSAIC_BRANCH_REAPER_INTERVAL", "60"))))
+            await asyncio.sleep(background_interval("MOSAIC_BRANCH_REAPER_INTERVAL", 60))
             c = db()
             try:
                 reap_branches(c)

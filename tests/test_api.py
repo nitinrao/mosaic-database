@@ -314,6 +314,25 @@ def test_reaper_loop_survives_ledger_connection_error(monkeypatch):
     assert calls["reap"] == 1
 
 
+def test_reaper_loop_invalid_interval_still_yields(monkeypatch):
+    monkeypatch.setenv("MOSAIC_BRANCH_REAPER_INTERVAL", "60s")
+    calls = {"sleep": 0}
+
+    async def fake_sleep(_):
+        calls["sleep"] += 1
+        if calls["sleep"] > 1:
+            raise asyncio.CancelledError
+
+    def unavailable_db():
+        raise RuntimeError("ledger unavailable")
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(main, "db", unavailable_db)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(main._reaper_loop())
+    assert calls["sleep"] == 2
+
+
 def test_existing_ledger_migrates_branch_host(tmp_path):
     path = tmp_path / "legacy.db"
     raw = main.sqlite3.connect(path)
