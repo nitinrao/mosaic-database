@@ -247,6 +247,28 @@ def test_zfs_busy_standby_destroy_unmounts_after_verified_stop_and_retries(tmp_p
     ) == 2
 
 
+def test_zfs_unmount_failed_standby_destroy_retries_after_verified_stop(tmp_path):
+    calls = []
+    destroy_attempts = 0
+    standby = tmp_path / "cluster" / ".replicas" / "sv2"
+
+    def run(argv, env=None):
+        nonlocal destroy_attempts
+        calls.append(argv)
+        if argv[:3] == ["zfs", "destroy", "-r"]:
+            destroy_attempts += 1
+            if destroy_attempts == 1:
+                raise subprocess.CalledProcessError(
+                    1, argv, stderr="cannot unmount: unmount failed"
+                )
+
+    engine = main.ZfsBranchEngine("mosaic/db", run)
+    engine.prepare_standby(standby, is_stopped=lambda path: True)
+    dataset = engine._dataset(standby)
+    assert ["zfs", "unmount", "-f", dataset] in calls
+    assert calls.count(["zfs", "destroy", "-r", dataset]) == 2
+
+
 def test_zfs_busy_standby_destroy_does_not_unmount_unverified_target(tmp_path):
     calls = []
     standby = tmp_path / "cluster" / ".replicas" / "sv2"
@@ -254,7 +276,9 @@ def test_zfs_busy_standby_destroy_does_not_unmount_unverified_target(tmp_path):
     def run(argv, env=None):
         calls.append(argv)
         if argv[:3] == ["zfs", "destroy", "-r"]:
-            raise subprocess.CalledProcessError(1, argv, stderr="mount is busy")
+            raise subprocess.CalledProcessError(
+                1, argv, stderr="cannot unmount: unmount failed"
+            )
 
     engine = main.ZfsBranchEngine("mosaic/db", run)
     with pytest.raises(RuntimeError, match="could not be proven stopped"):

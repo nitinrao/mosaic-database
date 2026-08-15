@@ -50,11 +50,12 @@ This matches the ZFS mountpoint contract implemented by the service. The
 remaining 447 GB of NVMe capacity on each host is unpartitioned and
 unclaimed.
 
-The node-agent ZFS wrapper must execute ZFS in the host mount namespace. The
-service unit uses `PrivateTmp` and `ProtectHome`, which otherwise isolate ZFS
-mounts in a private namespace and silently strand branch and replica data
-directories when the service restarts. The wrapper enters PID 1's mount
-namespace and retains the post-create/clone ownership fix-up for `postgres`.
+The node-agent ZFS wrapper executes ZFS in the host mount namespace and retains
+the post-create/clone ownership fix-up for `postgres`. The unit must not run
+in a private mount namespace: copied mounts pin datasets for the lifetime of
+the service and make later ZFS destroys fail with unmount errors. The
+`PrivateTmp` and `ProtectHome` unit options are therefore intentionally
+omitted; the service already runs unprivileged as `postgres`.
 
 ## Nodes
 

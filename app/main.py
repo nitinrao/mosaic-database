@@ -328,7 +328,7 @@ class ZfsBranchEngine:
                 self._run_zfs(["zfs", "destroy", "-r", dataset])
             except ZfsCommandError as exc:
                 detail = str(exc).lower()
-                if "busy" not in detail:
+                if not any(marker in detail for marker in ("busy", "unmount failed", "umount failed")):
                     raise
                 if is_stopped is None or not is_stopped(path):
                     raise RuntimeError(
