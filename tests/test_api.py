@@ -546,6 +546,41 @@ def test_zfs_engine_exact_argv(tmp_path):
     ]
 
 
+def test_clone_removes_postmaster_runtime_files(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    parent = root / "parent"
+    parent.mkdir(parents=True)
+    (parent / "postmaster.pid").write_text("123\n")
+    (parent / "postmaster.opts").write_text("postgres\n")
+    zfs_target = root / "zfs-target"
+    calls = []
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[:2] == ["zfs", "clone"]:
+            zfs_target.mkdir()
+            (zfs_target / "postmaster.pid").write_text("123\n")
+            (zfs_target / "postmaster.opts").write_text("postgres\n")
+
+    main.ZfsBranchEngine("mosaic/db", run).clone(
+        parent,
+        zfs_target,
+        target_port=55433,
+    )
+    assert not (zfs_target / "postmaster.pid").exists()
+    assert not (zfs_target / "postmaster.opts").exists()
+
+    copy_target = root / "copy-target"
+    main.CopyBranchEngine(lambda argv, env=None: None).clone(
+        parent,
+        copy_target,
+        target_port=55434,
+    )
+    assert not (copy_target / "postmaster.pid").exists()
+    assert not (copy_target / "postmaster.opts").exists()
+
+
 def test_zfs_busy_standby_destroy_unmounts_after_verified_stop_and_retries(tmp_path):
     calls = []
     destroy_attempts = 0
@@ -1097,6 +1132,8 @@ def test_standby_build_replaces_existing_slot_before_backup(tmp_path, monkeypatc
             target.mkdir(parents=True, exist_ok=True)
             (target / "postgresql.conf").write_text("")
             (target / "pg_hba.conf").write_text("")
+        elif argv[0] == main.pg_bin("pg_ctl") and argv[-1] == "start":
+            (target / "postmaster.pid").write_text("123\n")
 
     agent = main.NodeAgent(run)
     payload = {
@@ -1156,6 +1193,8 @@ def test_standby_build_missing_slot_is_not_an_error(tmp_path, monkeypatch):
             target.mkdir(parents=True, exist_ok=True)
             (target / "postgresql.conf").write_text("")
             (target / "pg_hba.conf").write_text("")
+        elif argv[0] == main.pg_bin("pg_ctl") and argv[-1] == "start":
+            (target / "postmaster.pid").write_text("123\n")
 
     agent = main.NodeAgent(run)
     payload = {
@@ -1566,6 +1605,80 @@ def test_start_local_adopts_running_cluster_with_stale_ledger_pid(tmp_path, monk
     assert result == {"status": "running", "pid": 456}
     assert calls == []
     assert connections == []
+
+
+def test_start_local_does_not_adopt_foreign_postmaster_pidfile(tmp_path, monkeypatch):
+    path = tmp_path / "branch"
+    path.mkdir()
+    (path / "PG_VERSION").write_text("14\n")
+    foreign = tmp_path / "parent"
+    (path / "postmaster.pid").write_text(f"123\n{foreign}\n")
+    calls = []
+    monkeypatch.setattr(main, "alive", lambda pid: True)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    class FakePsycopg:
+        def connect(self, **kwargs):
+            return Connection()
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        assert argv[-1] == "start"
+        assert not (path / "postmaster.pid").exists()
+        (path / "postmaster.pid").write_text(f"456\n{path.resolve()}\n")
+
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    monkeypatch.setattr(main.subprocess, "run", run)
+    result = main.Supervisor().start_local({
+        "path": str(path),
+        "branch_id": "br",
+        "port": 55432,
+        "host_id": "local",
+        "pid": None,
+        "status": "stopped",
+        "password": "secret",
+        "parent_passwords": [],
+    })
+    assert result == {"status": "running", "pid": 456}
+    assert len(calls) == 1
+
+
+def test_stop_local_does_not_follow_foreign_postmaster_pidfile(tmp_path, monkeypatch):
+    path = tmp_path / "branch"
+    path.mkdir()
+    (path / "PG_VERSION").write_text("14\n")
+    foreign = tmp_path / "parent"
+    (path / "postmaster.pid").write_text(f"123\n{foreign}\n")
+    monkeypatch.setattr(main, "alive", lambda pid: True)
+
+    def run(*args, **kwargs):
+        pytest.fail("pg_ctl must not be called for a foreign postmaster pidfile")
+
+    monkeypatch.setattr(main.subprocess, "run", run)
+    assert main.Supervisor().stop_local({
+        "path": str(path),
+        "require_path": True,
+    }) == {"status": "stopped", "pid": None}
+
+
+def test_foreign_pidfile_cleanup_preserves_matching_and_unparseable_files(tmp_path):
+    path = tmp_path / "branch"
+    path.mkdir()
+    pidfile = path / "postmaster.pid"
+
+    pidfile.write_text("123\n")
+    main._remove_foreign_postmaster_pidfile(path)
+    assert pidfile.exists()
+
+    pidfile.write_text(f"123\n{path.resolve()}\n")
+    main._remove_foreign_postmaster_pidfile(path)
+    assert pidfile.exists()
 
 
 def test_start_local_fast_path_skips_status_and_password_reconciliation(tmp_path, monkeypatch):
