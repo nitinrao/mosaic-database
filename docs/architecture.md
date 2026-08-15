@@ -23,8 +23,21 @@ and inconsistent WAL state.
 
 The supervisor records port, PID, status, and last-query time in the ledger.
 It starts stopped branches on demand and stops idle postmasters while retaining
-data. V0 is single-primary, with no HA, PITR, or DR promise. DDL is deferred to
-deploy requests.
+data. V0 is single-primary, with no HA, PITR, or DR promise. Schema changes use
+declarative deploy requests: the control plane compiles an allowlisted operation
+vocabulary into transactional PostgreSQL DDL. Raw DDL remains forbidden on the
+query endpoint.
+
+Deploy requests move through `pending`, `applying`, `applied`, and `failed`.
+They execute all operations in one transaction with bounded statement and lock
+timeouts, and a branch is marked busy while an apply is in flight so the idle
+reaper cannot stop its postmaster. A deploy to `main` must reference an earlier
+matching deploy that succeeded on a branch of the same database. Destructive
+operations require explicit confirmation and are refused on `main` until WAL
+archiving exists. Each deploy records a monotonically increasing database
+branch-local `schema_version` for future query pinning. Deploy leases are
+reconciled on startup and during reaper sweeps; an expired apply is marked
+failed and its branch lock is released.
 
 Production ZFS datasets are created and cloned with an explicit mountpoint equal
 to the branch's absolute path under `MOSAIC_BRANCH_ROOT`; relying on ZFS's

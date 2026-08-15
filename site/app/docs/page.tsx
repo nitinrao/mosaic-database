@@ -66,6 +66,19 @@ X-API-Key: mdb_live_…
 {"columns":[{"table_schema":"public","table_name":"events",
  "column_name":"id","data_type":"integer"}]}`;
 
+const deploy = `POST /v1/tenants/ten_…/databases/db_…/deploys
+X-API-Key: mdb_live_…
+
+{"branch":"feature-search","operations":[
+  {"op":"create_table","name":"events","columns":[
+    {"name":"id","type":"bigint","pk":true,"identity":true},
+    {"name":"payload","type":"jsonb","nullable":false}
+  ]}
+]}
+
+{"id":"dep_…","status":"pending","schema_version":0,
+ "sql_preview":["CREATE TABLE …"]}`;
+
 const mcp = `POST https://database-api.mosaicos.com/mcp
 Authorization: Bearer mdb_live_…
 Content-Type: application/json
@@ -135,6 +148,14 @@ export default function DocsPage() {
             <p>Child branches are created from a parent and start on demand. Schema inspection runs through the same governed query path.</p>
             <CodeBlock value={branch} />
             <CodeBlock value={schema} />
+            <Heading level={3} id="deploys">Deploy requests</Heading>
+            <p>
+              Schema changes use declarative deploy requests rather than SQL text. Create a deploy to inspect its
+              server-compiled preview, then apply it with <code>POST …/deploys/&#123;id&#125;/apply</code>. Deploys run
+              transactionally and return a branch-local <code>schema_version</code>. Apply schema changes
+              on a branch first; a deploy to <code>main</code> must reference the matching successful branch deploy.
+            </p>
+            <CodeBlock value={deploy} />
             <Heading level={3} id="usage">Usage</Heading>
             <p><code>GET /v1/tenants/&#123;tenant_id&#125;/usage</code> reports the tenant plan and recorded usage events. The API also exposes database and branch listings.</p>
           </section>
@@ -145,7 +166,8 @@ export default function DocsPage() {
               The query endpoint accepts one statement beginning with <code>SELECT</code>, <code>INSERT</code>,
               <code>UPDATE</code>, <code>DELETE</code>, <code>WITH</code>, <code>VALUES</code>, or <code>SHOW</code>.
               DDL, server-side commands, filesystem functions, foreign-server access, process control, and multiple
-              statements are rejected before execution. Results are capped by the plan&apos;s row limit and statement timeout.
+              statements are rejected before execution. Use deploy requests for schema changes; results are capped by the
+              plan&apos;s row limit and statement timeout.
             </p>
           </section>
 
@@ -187,6 +209,7 @@ export default function DocsPage() {
                 <tr><th>Branches per tenant</th><td>20</td><td>100</td></tr>
                 <tr><th>Rows per query</th><td>10,000</td><td>100,000</td></tr>
                 <tr><th>Statement timeout</th><td>5 seconds</td><td>30 seconds</td></tr>
+                <tr><th>Deploy operations/request</th><td>20</td><td>100</td></tr>
                 <tr><th>Global databases</th><td colSpan={2}>50 by default, across all tenants</td></tr>
               </tbody>
             </table>
@@ -195,7 +218,7 @@ export default function DocsPage() {
 
           <section id="mcp">
             <Heading level={2} id="mcp-heading">MCP</Heading>
-            <p>The stateless <code>POST /mcp</code> endpoint exposes <code>inspect_schema</code>, <code>query</code>, <code>create_branch</code>, and <code>list_branches</code>. It uses the same tenant key and governance rules.</p>
+            <p>The stateless <code>POST /mcp</code> endpoint exposes <code>inspect_schema</code>, <code>query</code>, <code>deploy</code>, <code>get_deploy</code>, <code>create_branch</code>, and <code>list_branches</code>. It uses the same tenant key and governance rules.</p>
             <CodeBlock value={mcp} />
           </section>
         </article>
