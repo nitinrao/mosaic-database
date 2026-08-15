@@ -23,6 +23,7 @@ def client(tmp_path, monkeypatch):
     main.DATABASE_URL = ""
     main.DATABASE_URLS = []
     main._rate.clear()
+    main._rate_last_sweep = 0.0
     class FakeEngine:
         def create_database(self, path, password, port, host_id="local"): Path(path).mkdir(parents=True, exist_ok=True)
         def clone(self, parent, target, parent_port=None, parent_password=None, target_port=None, parent_host_id="local", target_host_id="local"): Path(target).mkdir(parents=True, exist_ok=True)
@@ -179,10 +180,15 @@ def test_public_signup_rejects_forwarded_ip_from_untrusted_peer():
         main.TRUST_CLOUDFLARE_IP = old
 
 
-def test_rate_limit_drops_expired_bucket(client, monkeypatch):
-    main._rate["expired"] = [time.time() - 61]
-    main.check_rate_limit("expired", 2)
-    assert len(main._rate["expired"]) == 1
+def test_rate_limit_sweeps_unrelated_expired_buckets(client, monkeypatch):
+    monkeypatch.setattr(main, "RATE_LIMIT_SWEEP_THRESHOLD", 2)
+    now = time.time()
+    main._rate["expired-unrelated"] = [now - 61]
+    main._rate["live-unrelated"] = [now]
+    main._rate_last_sweep = 0.0
+    main.check_rate_limit("current", 2)
+    assert "expired-unrelated" not in main._rate
+    assert "live-unrelated" in main._rate
 
 
 def test_database_capacity_ceiling_applies_to_all_callers(client, monkeypatch):

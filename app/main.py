@@ -47,6 +47,8 @@ IDLE_REAPER_SECONDS = int(os.getenv("MOSAIC_BRANCH_IDLE_SECONDS", "900"))
 PORT_MIN = int(os.getenv("MOSAIC_POSTGRES_PORT_MIN", "55432"))
 RATE_LIMIT_REQUESTS = int(os.getenv("MOSAIC_RATE_LIMIT_REQUESTS", "120"))
 PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS = int(os.getenv("MOSAIC_PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS", "5"))
+RATE_LIMIT_SWEEP_THRESHOLD = 256
+RATE_LIMIT_SWEEP_INTERVAL_SECONDS = 60.0
 MAX_DATABASES_TOTAL = int(os.getenv("MOSAIC_MAX_DATABASES_TOTAL", "50"))
 MOSAIC_PUBLIC_ENDPOINT = os.getenv("MOSAIC_PUBLIC_ENDPOINT", "https://database-api.mosaicos.com")
 TRUST_CLOUDFLARE_IP = os.getenv("MOSAIC_TRUST_CLOUDFLARE_IP", "").lower() == "true"
@@ -69,6 +71,7 @@ MCP_TOOLS = [{"name": n, "description": d, "inputSchema": {"type": "object"}} fo
     ("create_branch", "Create a branch"), ("list_branches", "List branches"))]
 _rate: dict[str, list[float]] = {}
 _rate_lock = threading.Lock()
+_rate_last_sweep = 0.0
 logger = logging.getLogger(__name__)
 
 
@@ -1647,9 +1650,19 @@ def tenant_auth(tid: str, x_api_key: str | None = Header(default=None, alias="X-
 
 
 def check_rate_limit(tid: str, limit: int | None = None):
+    global _rate_last_sweep
     limit = RATE_LIMIT_REQUESTS if limit is None else limit
     current = time.time()
     with _rate_lock:
+        if (
+            len(_rate) >= RATE_LIMIT_SWEEP_THRESHOLD
+            and current - _rate_last_sweep >= RATE_LIMIT_SWEEP_INTERVAL_SECONDS
+        ):
+            cutoff = current - 60
+            for key, timestamps in list(_rate.items()):
+                if not any(timestamp > cutoff for timestamp in timestamps):
+                    _rate.pop(key, None)
+            _rate_last_sweep = current
         values = [x for x in _rate.get(tid, []) if x > current - 60]
         if not values:
             _rate.pop(tid, None)
