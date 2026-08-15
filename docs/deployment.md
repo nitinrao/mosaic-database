@@ -50,6 +50,17 @@ This matches the ZFS mountpoint contract implemented by the service. The
 remaining 447 GB of NVMe capacity on each host is unpartitioned and
 unclaimed.
 
+The node-agent ZFS wrapper executes ZFS in the host mount namespace and retains
+the post-create/clone ownership fix-up for `postgres`. The unit must not run
+in a private mount namespace: copied mounts pin datasets for the lifetime of
+the service and make later ZFS destroys fail with unmount errors. The
+`PrivateTmp` and `ProtectHome` unit options are therefore intentionally
+omitted; the service already runs unprivileged as `postgres`.
+If a stopped standby mount remains pinned by another host namespace, teardown
+uses the narrow `mosaic-umount` helper for one last lazy detach of a path under
+`MOSAIC_BRANCH_ROOT`, then retries the destroy once. Its warning indicates
+that an external namespace is holding the mount.
+
 ## Nodes
 
 Replication uses asynchronous physical streaming. Configure the bounded WAL
@@ -131,7 +142,11 @@ states while the control plane polls job status. Replica data directories live
 under the reserved
 `.replicas` directory beside the primary branch, outside the tenant branch
 namespace. A replica is not a branch and is never selected by the idle branch
-reaper. HTTPS node-agent connections always use certificate verification via
+reaper; a branch with replica rows is also never idle-reaped, and the
+replication reconciler starts that primary before building standbys or
+sampling lag. A ready replica whose standby cluster is verifiably gone is
+marked `rebuild_required` and rebuilt instead of being reported healthy.
+HTTPS node-agent connections always use certificate verification via
 the system trust store or the configured `MOSAIC_NODE_AGENT_CA_BUNDLE`.
 
 V0 remains single-primary per host with no HA, PITR, or DR promise.
@@ -154,6 +169,9 @@ This prevents a stale standby on a diverged timeline from being reported
 healthy. If that forced rebuild fails, it remains `rebuild_required` and
 retries with backoff. Slot-invalidated replicas are automatically reconciled
 through the same rebuild path.
+Recovery detection is connection-free and reads `pg_controldata`, because dark
+standbys reject SQL connections. An unmounted or otherwise unusable old-primary
+data directory is unverifiable and refuses promotion without `force=true`.
 Promotion rejects missing or stale lag samples and lag above
 `MOSAIC_PROMOTION_MAX_LAG_BYTES` (10 GiB by default); configure the freshness
 window with `MOSAIC_PROMOTION_MAX_LAG_AGE_SECONDS` (five minutes by default).

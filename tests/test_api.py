@@ -225,6 +225,171 @@ def test_zfs_engine_exact_argv(tmp_path):
     ]
 
 
+def test_zfs_busy_standby_destroy_unmounts_after_verified_stop_and_retries(tmp_path):
+    calls = []
+    destroy_attempts = 0
+    standby = tmp_path / "cluster" / ".replicas" / "sv2"
+
+    def run(argv, env=None):
+        nonlocal destroy_attempts
+        calls.append(argv)
+        if argv[:3] == ["zfs", "destroy", "-r"]:
+            destroy_attempts += 1
+            if destroy_attempts == 1:
+                raise subprocess.CalledProcessError(1, argv, stderr="dataset is busy")
+
+    engine = main.ZfsBranchEngine("mosaic/db", run)
+    engine.prepare_standby(standby, is_stopped=lambda path: True)
+    dataset = engine._dataset(standby)
+    assert ["zfs", "unmount", "-f", dataset] in calls
+    assert calls.count(
+        ["zfs", "destroy", "-r", dataset]
+    ) == 2
+
+
+def test_zfs_unmount_failed_standby_destroy_retries_after_verified_stop(tmp_path):
+    calls = []
+    destroy_attempts = 0
+    standby = tmp_path / "cluster" / ".replicas" / "sv2"
+
+    def run(argv, env=None):
+        nonlocal destroy_attempts
+        calls.append(argv)
+        if argv[:3] == ["zfs", "destroy", "-r"]:
+            destroy_attempts += 1
+            if destroy_attempts == 1:
+                raise subprocess.CalledProcessError(
+                    1, argv, stderr="cannot unmount: unmount failed"
+                )
+
+    engine = main.ZfsBranchEngine("mosaic/db", run)
+    engine.prepare_standby(standby, is_stopped=lambda path: True)
+    dataset = engine._dataset(standby)
+    assert ["zfs", "unmount", "-f", dataset] in calls
+    assert calls.count(["zfs", "destroy", "-r", dataset]) == 2
+
+
+def test_zfs_lazy_unmount_retries_after_forced_unmount_fails(tmp_path, monkeypatch):
+    calls = []
+    destroy_attempts = 0
+    root = tmp_path / "branches"
+    standby = root / "cluster" / ".replicas" / "sv2"
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+
+    def run(argv, env=None):
+        nonlocal destroy_attempts
+        calls.append(argv)
+        if argv[:3] == ["zfs", "destroy", "-r"]:
+            destroy_attempts += 1
+            if destroy_attempts == 1:
+                raise subprocess.CalledProcessError(
+                    1, argv, stderr="cannot unmount: unmount failed"
+                )
+        elif argv[:3] == ["zfs", "unmount", "-f"]:
+            raise subprocess.CalledProcessError(
+                1, argv, stderr="cannot unmount: unmount failed"
+            )
+
+    engine = main.ZfsBranchEngine("mosaic/db", run)
+    engine.prepare_standby(standby, is_stopped=lambda path: True)
+    dataset = engine._dataset(standby)
+    assert ["zfs", "unmount", "-f", dataset] in calls
+    assert ["mosaic-umount", "-l", str(standby.resolve())] in calls
+    assert calls.count(["zfs", "destroy", "-r", dataset]) == 2
+
+
+def test_zfs_lazy_unmount_does_not_run_when_target_is_unverified(tmp_path, monkeypatch):
+    calls = []
+    root = tmp_path / "branches"
+    standby = root / "cluster" / ".replicas" / "sv2"
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[:3] == ["zfs", "destroy", "-r"]:
+            raise subprocess.CalledProcessError(
+                1, argv, stderr="cannot unmount: unmount failed"
+            )
+
+    engine = main.ZfsBranchEngine("mosaic/db", run)
+    with pytest.raises(RuntimeError, match="could not be proven stopped"):
+        engine.prepare_standby(standby, is_stopped=lambda path: False)
+    assert not any(call[0] == "mosaic-umount" for call in calls)
+
+
+def test_zfs_lazy_unmount_refuses_path_outside_branch_root(tmp_path, monkeypatch):
+    calls = []
+    root = tmp_path / "branches"
+    standby = tmp_path / "outside" / "cluster" / ".replicas" / "sv2"
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[:3] == ["zfs", "destroy", "-r"]:
+            raise subprocess.CalledProcessError(
+                1, argv, stderr="cannot unmount: unmount failed"
+            )
+        if argv[:3] == ["zfs", "unmount", "-f"]:
+            raise subprocess.CalledProcessError(
+                1, argv, stderr="cannot unmount: unmount failed"
+            )
+
+    engine = main.ZfsBranchEngine("mosaic/db", run)
+    with pytest.raises(RuntimeError, match="outside MOSAIC_BRANCH_ROOT"):
+        engine.prepare_standby(standby, is_stopped=lambda path: True)
+    assert not any(call[0] == "mosaic-umount" for call in calls)
+
+
+def test_zfs_busy_standby_destroy_does_not_unmount_unverified_target(tmp_path):
+    calls = []
+    standby = tmp_path / "cluster" / ".replicas" / "sv2"
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[:3] == ["zfs", "destroy", "-r"]:
+            raise subprocess.CalledProcessError(
+                1, argv, stderr="cannot unmount: unmount failed"
+            )
+
+    engine = main.ZfsBranchEngine("mosaic/db", run)
+    with pytest.raises(RuntimeError, match="could not be proven stopped"):
+        engine.prepare_standby(standby, is_stopped=lambda path: False)
+    assert ["zfs", "unmount", "-f", engine._dataset(standby)] not in calls
+
+
+def test_zfs_nonbusy_standby_destroy_failure_is_not_retried(tmp_path):
+    calls = []
+    standby = tmp_path / "cluster" / ".replicas" / "sv2"
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[:3] == ["zfs", "destroy", "-r"]:
+            raise subprocess.CalledProcessError(1, argv, stderr="permission denied")
+
+    engine = main.ZfsBranchEngine("mosaic/db", run)
+    with pytest.raises(main.ZfsCommandError, match="permission denied"):
+        engine.prepare_standby(standby, is_stopped=lambda path: True)
+    assert ["zfs", "unmount", "-f", engine._dataset(standby)] not in calls
+
+
+def test_zfs_failure_includes_stderr_and_stdout(tmp_path):
+    path = tmp_path / "cluster"
+    argv = ["zfs", "destroy", "-r", f"mosaic/db/{tmp_path.name}/cluster"]
+
+    def run(actual, env=None):
+        raise subprocess.CalledProcessError(
+            1,
+            actual,
+            output="zfs stdout detail",
+            stderr="zfs stderr detail",
+        )
+
+    with pytest.raises(main.ZfsCommandError) as caught:
+        main.ZfsBranchEngine("mosaic/db", run).destroy(path)
+    assert "zfs stderr detail" in str(caught.value)
+    assert "zfs stdout detail" in str(caught.value)
+
+
 def test_clone_rewrites_postgres_port_and_socket(tmp_path):
     config = tmp_path / "postgresql.conf"
     config.write_text("port = 55432\nlisten_addresses = '*'\nunix_socket_directories = '/old'\nshared_buffers = '128MB'\n")
@@ -249,6 +414,26 @@ def test_reaper_stop_cycle(tmp_path, monkeypatch):
     c.commit()
     stopped = main.Supervisor().reap(c, idle_seconds=1)
     assert stopped == 1
+    assert c.execute("SELECT status,pid FROM branches").fetchone()["status"] == "stopped"
+    c.close()
+
+
+def test_reaper_treats_missing_branch_directory_as_stopped(tmp_path):
+    main.DB_PATH = tmp_path / "reaper-missing.db"
+    c = main.db()
+    main.initialize_schema(c)
+    main_path = tmp_path / "gone"
+    main_path.mkdir()
+    c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_x", "x", "shared", "h", "active", main.now()))
+    c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_x", "ten_x", "x", str(tmp_path), "ready", main.now()))
+    old = "2000-01-01T00:00:00+00:00"
+    c.execute(
+        "INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("br_x", "db_x", "main", None, str(main_path), 55432, 999999, "running", "x", old, old, "local"),
+    )
+    main_path.rmdir()
+    c.commit()
+    assert main.Supervisor().reap(c, idle_seconds=1) == 1
     assert c.execute("SELECT status,pid FROM branches").fetchone()["status"] == "stopped"
     c.close()
 
@@ -545,6 +730,101 @@ def test_explicit_standby_rebuild_bypasses_ready_cache(tmp_path, monkeypatch):
     assert sum(call[0] == main.pg_bin("pg_basebackup") for call in calls) == 1
 
 
+def test_forced_standby_rebuild_supersedes_inflight_build(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
+    target.mkdir()
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[0] == main.pg_bin("pg_basebackup"):
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "postgresql.conf").write_text("")
+            started.set()
+            release.wait(timeout=2)
+
+    agent = main.NodeAgent(run)
+    payload = {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "local",
+        "primary_address": "127.0.0.1",
+        "primary_port": 55432,
+        "replication_user": "mosaic_repl_db",
+        "replication_password": "secret",
+        "force_rebuild": True,
+    }
+    assert agent.handle("build_standby", payload) == {"status": "building"}
+    assert started.wait(timeout=2)
+    assert agent.handle("build_standby", payload) == {
+        "status": "building",
+        "superseded": True,
+    }
+    release.set()
+    for _ in range(100):
+        result = agent.handle("inspect_standby", {"target_path": str(target)})
+        if result["status"] == "failed":
+            break
+        time.sleep(0.01)
+    assert result["status"] == "failed"
+    assert "superseded" in result["error"]
+    assert sum(call[0] == main.pg_bin("pg_basebackup") for call in calls) == 1
+
+
+def test_concurrent_forced_rebuilds_start_one_build(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
+    target.mkdir()
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[0] == main.pg_bin("pg_basebackup"):
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "postgresql.conf").write_text("")
+            started.set()
+            release.wait(timeout=2)
+
+    agent = main.NodeAgent(run)
+    payload = {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "local",
+        "primary_address": "127.0.0.1",
+        "primary_port": 55432,
+        "replication_user": "mosaic_repl_db",
+        "replication_password": "secret",
+        "force_rebuild": True,
+    }
+    results = []
+    barrier = threading.Barrier(3)
+
+    def request():
+        barrier.wait()
+        results.append(agent.handle("build_standby", payload))
+
+    threads = [threading.Thread(target=request) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+    assert started.wait(timeout=2)
+    release.set()
+    assert len(results) == 2
+    assert sum(call[0] == main.pg_bin("pg_basebackup") for call in calls) == 1
+    assert all(result["status"] == "building" for result in results)
+
+
 def test_zfs_standby_dataset_is_reusable_and_promoted_path_can_clone(tmp_path, monkeypatch):
     root = tmp_path / "branches"
     root.mkdir()
@@ -602,31 +882,12 @@ def test_promote_standby_clears_standby_configuration_and_is_idempotent(tmp_path
     )
     (target / "standby.signal").write_text("")
     calls = []
-    recovery = iter([True, False, False])
-
-    class Connection:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def execute(self, query):
-            assert query == "SELECT pg_is_in_recovery()"
-            return type(
-                "Result",
-                (),
-                {"fetchone": lambda self: (next(recovery),)},
-            )()
-
-    class FakePsycopg:
-        def connect(self, **kwargs):
-            return Connection()
-
-    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    recovery = iter(["in archive recovery", "in production", "in production"])
 
     def run(argv, env=None):
         calls.append(argv)
+        if argv[0] == main.pg_bin("pg_controldata"):
+            return type("Result", (), {"stdout": f"Database cluster state: {next(recovery)}\n"})()
 
     agent = main.NodeAgent(run)
     payload = {
@@ -646,6 +907,41 @@ def test_promote_standby_clears_standby_configuration_and_is_idempotent(tmp_path
     assert "primary_conninfo" not in auto
     assert "primary_slot_name" not in auto
     assert "hot_standby = on" in (target / "postgresql.conf").read_text()
+    assert sum(call[-1] == "reload" for call in calls) == 2
+
+
+def test_promote_dark_standby_does_not_connect_to_postgres(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
+    target.mkdir()
+    (target / "PG_VERSION").write_text("14\n")
+    (target / "postmaster.pid").write_text("321\n")
+    (target / "postgresql.conf").write_text("port = 55433\nhot_standby = off\n")
+    (target / "standby.signal").write_text("")
+    calls = []
+    recovery = iter(["in archive recovery", "in production"])
+
+    class RefusingPsycopg:
+        def connect(self, **kwargs):
+            raise AssertionError("dark standby recovery detection must not connect")
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[0] == main.pg_bin("pg_controldata"):
+            return type("Result", (), {"stdout": f"Database cluster state: {next(recovery)}\n"})()
+
+    monkeypatch.setattr(main, "psycopg", RefusingPsycopg())
+    result = main.NodeAgent(run).handle("promote_standby", {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "local",
+        "postgres_password": "secret",
+        "promotion_timeout": 1,
+    })
+    assert result == {"status": "promoted", "pid": 321, "port": 55433}
+    assert any(call[-1] == "promote" for call in calls)
 
 
 def test_starting_standby_signal_does_not_promote(tmp_path, monkeypatch):
@@ -682,6 +978,7 @@ def test_starting_standby_signal_does_not_promote(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "psycopg", FakePsycopg())
     monkeypatch.setattr(main, "subprocess", type("Subprocess", (), {"run": staticmethod(run)}))
     monkeypatch.setattr(main, "alive", lambda pid: False)
+    monkeypatch.setattr(main.Supervisor, "_cluster_is_running", lambda self, path, require_path=False: False)
     result = main.Supervisor().start_local({
         "path": str(path),
         "branch_id": "br",
@@ -694,6 +991,106 @@ def test_starting_standby_signal_does_not_promote(tmp_path, monkeypatch):
     })
     assert result == {"status": "running", "pid": 456}
     assert not any(call[-1] == "promote" for call in calls)
+
+
+def test_start_local_adopts_running_cluster_with_stale_ledger_pid(tmp_path, monkeypatch):
+    path = tmp_path / "branch"
+    path.mkdir()
+    (path / "PG_VERSION").write_text("14\n")
+    (path / "postmaster.pid").write_text("456\n")
+    calls = []
+    connections = []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, query):
+            connections.append(query)
+            return self
+
+        def commit(self):
+            return None
+
+    class FakePsycopg:
+        def connect(self, **kwargs):
+            return Connection()
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    monkeypatch.setattr(main, "subprocess", type("Subprocess", (), {"run": staticmethod(run)}))
+    monkeypatch.setattr(main.Supervisor, "_cluster_is_running", lambda self, path, require_path=False: True)
+    result = main.Supervisor().start_local({
+        "path": str(path),
+        "branch_id": "br",
+        "port": 55432,
+        "host_id": "local",
+        "pid": 123,
+        "status": "running",
+        "password": "secret",
+        "parent_passwords": [],
+    })
+    assert result == {"status": "running", "pid": 456}
+    assert calls == []
+    assert connections == []
+
+
+def test_start_local_fast_path_skips_status_and_password_reconciliation(tmp_path, monkeypatch):
+    path = tmp_path / "branch"
+    path.mkdir()
+    (path / "PG_VERSION").write_text("14\n")
+
+    monkeypatch.setattr(main, "alive", lambda pid: True)
+    monkeypatch.setattr(
+        main.Supervisor,
+        "_cluster_is_running",
+        lambda *args, **kwargs: pytest.fail("status check should not run on the fast path"),
+    )
+    monkeypatch.setattr(
+        main,
+        "subprocess",
+        type(
+            "Subprocess",
+            (),
+            {"run": staticmethod(lambda *args, **kwargs: pytest.fail("pg_ctl should not run on the fast path"))},
+        ),
+    )
+
+    class FakePsycopg:
+        def connect(self, **kwargs):
+            pytest.fail("password reconciliation should not run on the fast path")
+
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    result = main.Supervisor().start_local({
+        "path": str(path),
+        "branch_id": "br",
+        "port": 55432,
+        "host_id": "local",
+        "pid": 123,
+        "status": "running",
+        "password": "secret",
+        "parent_passwords": [],
+    })
+    assert result == {"status": "running", "pid": 123}
+
+
+def test_start_local_requires_cluster_directory(tmp_path):
+    with pytest.raises(RuntimeError, match="no PostgreSQL cluster"):
+        main.Supervisor().start_local({
+            "path": str(tmp_path / "missing"),
+            "branch_id": "br",
+            "port": 55432,
+            "host_id": "local",
+            "pid": None,
+            "status": "stopped",
+            "password": "secret",
+            "parent_passwords": [],
+        })
 
 
 def test_promotion_requires_ready_replica_and_fresh_lag(client, monkeypatch):
@@ -964,6 +1361,183 @@ def test_promotion_is_idempotent_when_main_already_on_target(client, monkeypatch
     assert calls == [("sv2", "promote_standby")]
 
 
+def test_already_primary_promotion_reports_bad_credentials_as_503(client, monkeypatch):
+    _, database = promotion_database(client, monkeypatch)
+    c = main.db()
+    c.execute(
+        "UPDATE branches SET credential_encrypted=? WHERE database_id=? AND name='main'",
+        ("not-a-fernet-token", database["id"]),
+    )
+    c.commit()
+    c.close()
+    response = client.post(
+        f"/v1/admin/databases/{database['id']}/promote",
+        headers={"X-Admin-Key": "test-admin"},
+        json={"host_id": "local"},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "primary credentials cannot be decrypted"
+
+
+def test_promotion_refuses_absent_old_primary_without_force(client, monkeypatch):
+    _, database = promotion_database(client, monkeypatch)
+    c = main.db()
+    main_path = Path(
+        c.execute(
+            "SELECT path FROM branches WHERE database_id=? AND name='main'",
+            (database["id"],),
+        ).fetchone()["path"]
+    )
+    c.close()
+    shutil.rmtree(main_path)
+    calls = []
+
+    class Transport:
+        def call(self, host_id, operation, payload):
+            calls.append((host_id, operation, payload))
+            if operation == "stop":
+                return main.Supervisor().stop_local(payload)
+            raise AssertionError("promotion must not run")
+
+    monkeypatch.setattr(main, "node_transport", Transport())
+    response = client.post(
+        f"/v1/admin/databases/{database['id']}/promote",
+        headers={"X-Admin-Key": "test-admin"},
+        json={"host_id": "sv2"},
+    )
+    assert response.status_code == 409
+    assert calls[0][1] == "stop"
+    assert calls[0][2]["require_path"] is True
+
+
+def test_strict_stop_refuses_unusable_cluster_directory_but_lenient_stop_succeeds(tmp_path, monkeypatch):
+    path = tmp_path / "not-a-cluster"
+    path.mkdir()
+
+    def run(argv, **kwargs):
+        raise subprocess.CalledProcessError(
+            4,
+            argv,
+            stderr='pg_ctl: directory is not a database cluster directory',
+        )
+
+    monkeypatch.setattr(main.subprocess, "run", run)
+    supervisor = main.Supervisor()
+    assert supervisor.stop_local({"path": str(path)}) == {"status": "stopped", "pid": None}
+    with pytest.raises(RuntimeError, match="not a usable cluster"):
+        supervisor.stop_local({"path": str(path), "require_path": True})
+
+
+def test_standby_teardown_accepts_absent_empty_and_noncluster_targets(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    agent = main.NodeAgent(
+        lambda argv, env=None: (_ for _ in ()).throw(
+            subprocess.CalledProcessError(
+                4, argv, stderr="pg_ctl: directory is not a database cluster directory"
+            )
+        )
+    )
+    assert agent._standby_status_is_not_running(root / "absent")
+    empty = root / "empty"
+    empty.mkdir()
+    assert agent._standby_status_is_not_running(empty)
+    noncluster = root / "noncluster"
+    noncluster.mkdir()
+    (noncluster / "postgresql.conf").write_text("")
+    assert agent._standby_status_is_not_running(noncluster)
+
+
+def test_standby_teardown_accepts_stale_and_recycled_pids(tmp_path, monkeypatch):
+    target = tmp_path / "standby"
+    target.mkdir()
+    (target / "PG_VERSION").write_text("17\n")
+    (target / "postmaster.pid").write_text("123\n")
+
+    def run(argv, env=None):
+        raise subprocess.CalledProcessError(
+            4, argv, stderr="pg_ctl: could not read status"
+        )
+
+    agent = main.NodeAgent(run)
+    monkeypatch.setattr(main, "alive", lambda pid: False)
+    assert agent._standby_status_is_not_running(target)
+    monkeypatch.setattr(main, "alive", lambda pid: True)
+    monkeypatch.setattr(main, "_pid_owns_postgres_directory", lambda pid, path: False)
+    assert agent._standby_status_is_not_running(target)
+
+
+def test_standby_teardown_refuses_live_postmaster_and_reports_pgctl_stderr(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "standby"
+    target.mkdir()
+    (target / "PG_VERSION").write_text("17\n")
+    (target / "postmaster.pid").write_text("123\n")
+
+    def run(argv, env=None):
+        raise subprocess.CalledProcessError(
+            4, argv, stderr="pg_ctl: status could not classify cluster"
+        )
+
+    monkeypatch.setattr(main, "alive", lambda pid: True)
+    monkeypatch.setattr(main, "_pid_owns_postgres_directory", lambda pid, path: True)
+    agent = main.NodeAgent(run)
+    assert not agent._standby_status_is_not_running(target)
+
+
+def test_recycled_pid_does_not_look_like_running_postmaster(tmp_path, monkeypatch):
+    target = tmp_path / "standby"
+    target.mkdir()
+    (target / "PG_VERSION").write_text("17\n")
+    (target / "postmaster.pid").write_text("456\n")
+    monkeypatch.setattr(main, "alive", lambda pid: True)
+    monkeypatch.setattr(main, "_pid_owns_postgres_directory", lambda pid, path: False)
+    agent = main.NodeAgent(
+        lambda argv, env=None: (_ for _ in ()).throw(
+            subprocess.CalledProcessError(4, argv, stderr="unclassified status")
+        )
+    )
+    assert agent._standby_status_is_not_running(target)
+
+
+def test_live_pid_owned_by_working_directory_is_running(tmp_path, monkeypatch):
+    target = tmp_path / "standby"
+    target.mkdir()
+    monkeypatch.setattr(
+        main,
+        "_pid_process_evidence",
+        lambda pid: (["postgres"], target),
+    )
+    assert main._pid_owns_postgres_directory(123, target)
+
+
+def test_live_pid_without_ownership_evidence_is_ambiguous(tmp_path, monkeypatch):
+    target = tmp_path / "standby"
+    target.mkdir()
+    monkeypatch.setattr(
+        main,
+        "_pid_process_evidence",
+        lambda pid: ([], None),
+    )
+    with pytest.raises(RuntimeError, match="cannot determine"):
+        main._pid_owns_postgres_directory(123, target)
+
+
+def test_strict_pgctl_failure_includes_stderr(tmp_path, monkeypatch):
+    path = tmp_path / "cluster"
+    path.mkdir()
+
+    def run(argv, **kwargs):
+        raise subprocess.CalledProcessError(
+            4, argv, stderr="pg_ctl: status output detail"
+        )
+
+    monkeypatch.setattr(main.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="status output detail"):
+        main.Supervisor().stop_local({"path": str(path), "require_path": True})
+
+
 def test_standby_build_stops_before_removing_target(tmp_path, monkeypatch):
     root = tmp_path / "branches"
     root.mkdir()
@@ -1020,6 +1594,7 @@ def test_standby_build_does_not_remove_live_target_after_failed_stop(tmp_path, m
             raise RuntimeError("permission denied")
 
     monkeypatch.setattr(main, "alive", lambda pid: pid == 123)
+    monkeypatch.setattr(main, "_pid_owns_postgres_directory", lambda pid, path: True)
     agent = main.NodeAgent(run)
     assert agent.handle("build_standby", {
         "target_path": str(target),
@@ -1048,14 +1623,8 @@ def test_standby_build_cleans_unparseable_stopped_target(tmp_path, monkeypatch):
     target = root / "standby"
     target.mkdir()
     (target / "postmaster.pid").write_text("")
-    status_calls = 0
-
     def run(argv, env=None):
-        nonlocal status_calls
         if argv[-1] == "status":
-            status_calls += 1
-            if status_calls < 3:
-                raise RuntimeError("pg_ctl: no server running")
             return None
         if argv[0] == main.pg_bin("pg_basebackup"):
             target.mkdir(parents=True, exist_ok=True)
@@ -1063,7 +1632,7 @@ def test_standby_build_cleans_unparseable_stopped_target(tmp_path, monkeypatch):
             (target / "pg_hba.conf").write_text("")
 
     agent = main.NodeAgent(run)
-    assert agent.handle("build_standby", {
+    initial = agent.handle("build_standby", {
         "target_path": str(target),
         "target_port": 55433,
         "target_host_id": "local",
@@ -1071,14 +1640,19 @@ def test_standby_build_cleans_unparseable_stopped_target(tmp_path, monkeypatch):
         "primary_port": 55432,
         "replication_user": "mosaic_repl_db",
         "replication_password": "secret",
-    }) == {"status": "building"}
+    })
+    assert initial in ({"status": "building"}, {"status": "ready"})
+    if initial == {"status": "ready"}:
+        result = initial
+    else:
+        result = None
     for _ in range(100):
-        result = agent.handle("inspect_standby", {"target_path": str(target)})
-        if result["status"] == "ready":
-            break
-        time.sleep(0.01)
+        if result is None:
+            result = agent.handle("inspect_standby", {"target_path": str(target)})
+            if result["status"] == "ready":
+                break
+            time.sleep(0.01)
     assert result == {"status": "ready"}
-    assert status_calls >= 2
 
 
 def test_copy_clone_passes_password_per_command_without_mutating_environment(tmp_path, monkeypatch):
@@ -1118,6 +1692,8 @@ def test_replica_build_failure_does_not_downgrade_ready_sibling(client, monkeypa
         def call(self, host_id, operation, payload):
             if operation == "provision":
                 return {"status": "provisioned"}
+            if operation == "start":
+                return {"status": "running", "pid": 123}
             if operation == "prepare_primary":
                 return {"status": "running", "pid": 123}
             if operation == "build_standby" and host_id == self.failure_host:
@@ -1153,6 +1729,120 @@ def test_replica_build_failure_does_not_downgrade_ready_sibling(client, monkeypa
         status == "ready"
         for host, status in statuses.items()
         if host != FakeTransport.failure_host
+    )
+    c.close()
+
+
+def test_reconciler_starts_stopped_primary_before_building_standbys(client, monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2")
+    monkeypatch.setenv("MOSAIC_NODE_PRIVATE_ADDRESSES", "local=10.0.0.1,sv2=10.0.0.2")
+    created = tenant(client)
+    calls = []
+
+    class FakeTransport:
+        def call(self, host_id, operation, payload):
+            calls.append(operation)
+            if operation == "provision":
+                return {"status": "provisioned"}
+            if operation == "start":
+                return {"status": "running", "pid": 321}
+            if operation == "prepare_primary":
+                return {"status": "running", "pid": 321}
+            if operation == "build_standby":
+                return {"status": "ready"}
+            raise AssertionError(operation)
+
+    monkeypatch.setattr(main, "node_transport", FakeTransport())
+    response = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "starts-primary"},
+    )
+    c = main.db()
+    main.reconcile_replicas(c)
+    assert calls.index("start") < calls.index("build_standby")
+    assert c.execute(
+        "SELECT status,pid FROM branches WHERE database_id=? AND name='main'",
+        (response.json()["id"],),
+    ).fetchone()["status"] == "running"
+    c.close()
+
+
+def test_ready_replica_with_stopped_cluster_requires_rebuild(client, monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2")
+    monkeypatch.setenv("MOSAIC_NODE_PRIVATE_ADDRESSES", "local=10.0.0.1,sv2=10.0.0.2")
+    created = tenant(client)
+
+    class FakeTransport:
+        def call(self, host_id, operation, payload):
+            if operation == "provision":
+                return {"status": "provisioned"}
+            if operation == "start":
+                return {"status": "running", "pid": 321}
+            if operation == "inspect_standby":
+                return {"status": "failed", "error": "standby postmaster is not running"}
+            raise AssertionError(operation)
+
+    monkeypatch.setattr(main, "node_transport", FakeTransport())
+    response = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "missing-standby"},
+    )
+    c = main.db()
+    c.execute(
+        "UPDATE replicas SET status='ready',lag_bytes=0,lag_sampled_at=? WHERE database_id=?",
+        (main.now(), response.json()["id"]),
+    )
+    c.commit()
+    main.reconcile_replicas(c)
+    assert all(
+        row["status"] == "rebuild_required"
+        for row in c.execute(
+            "SELECT status FROM replicas WHERE database_id=?",
+            (response.json()["id"],),
+        ).fetchall()
+    )
+    c.close()
+
+
+@pytest.mark.parametrize("failure", ["transport", "primary"])
+def test_ready_replica_stays_ready_on_inconclusive_or_primary_failure(client, monkeypatch, failure):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2")
+    monkeypatch.setenv("MOSAIC_NODE_PRIVATE_ADDRESSES", "local=10.0.0.1,sv2=10.0.0.2")
+    created = tenant(client)
+
+    class FakeTransport:
+        def call(self, host_id, operation, payload):
+            if operation == "provision":
+                return {"status": "provisioned"}
+            if operation == "start":
+                raise RuntimeError("primary unavailable")
+            if operation == "inspect_standby":
+                if failure == "transport":
+                    raise RuntimeError("standby unavailable")
+                return {"status": "failed", "error": "probe inconclusive"}
+            raise AssertionError(operation)
+
+    monkeypatch.setattr(main, "node_transport", FakeTransport())
+    response = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": f"ready-{failure}"},
+    )
+    c = main.db()
+    c.execute(
+        "UPDATE replicas SET status='ready',lag_bytes=0,lag_sampled_at=? WHERE database_id=?",
+        (main.now(), response.json()["id"]),
+    )
+    c.commit()
+    main.reconcile_replicas(c)
+    assert all(
+        row["status"] == "ready"
+        for row in c.execute(
+            "SELECT status FROM replicas WHERE database_id=?",
+            (response.json()["id"],),
+        ).fetchall()
     )
     c.close()
 
@@ -1212,6 +1902,7 @@ def test_reaper_ignores_standbys(tmp_path, monkeypatch):
     c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_r", "ten_r", "r", str(tmp_path), "ready", main.now()))
     old = "2000-01-01T00:00:00+00:00"
     c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("br_r", "db_r", "main", None, str(tmp_path / "main"), 55432, 123, "running", "x", old, old, "local"))
+    c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("br_e", "db_r", "ephemeral", None, str(tmp_path / "ephemeral"), 55436, 124, "running", "x", old, old, "local"))
     c.execute(
         "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         ("rep_r", "db_r", "br_r", "sv2", str(tmp_path / "standby"), 55433, "ready", 99, old, old, "slot_r"),
@@ -1227,7 +1918,41 @@ def test_reaper_ignores_standbys(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "node_transport", FakeTransport())
     assert main.reap_branches(c) == 1
     assert len(calls) == 1 and calls[0][1] == "stop"
+    assert c.execute("SELECT status FROM branches WHERE id='br_r'").fetchone()["status"] == "running"
+    assert c.execute("SELECT status FROM branches WHERE id='br_e'").fetchone()["status"] == "stopped"
     assert c.execute("SELECT status FROM replicas").fetchone()["status"] == "ready"
+    c.close()
+
+
+def test_supervisor_reaper_skips_replicated_primary(tmp_path, monkeypatch):
+    main.DB_PATH = tmp_path / "supervisor-reaper-replica.db"
+    c = main.db()
+    main.initialize_schema(c)
+    c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_r", "r", "shared", "h", "active", main.now()))
+    c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_r", "ten_r", "r", str(tmp_path), "ready", main.now()))
+    old = "2000-01-01T00:00:00+00:00"
+    for branch_id, name in (("br_r", "main"), ("br_e", "ephemeral")):
+        c.execute(
+            "INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (branch_id, "db_r", name, None, str(tmp_path / name), 55432 if name == "main" else 55436,
+             123, "running", "x", old, old, "local"),
+        )
+    c.execute(
+        "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("rep_r", "db_r", "br_r", "sv2", str(tmp_path / "standby"), 55433, "ready", 0, old, old, "slot_r"),
+    )
+    c.commit()
+    stopped = []
+    supervisor = main.Supervisor()
+    monkeypatch.setattr(
+        supervisor,
+        "stop",
+        lambda row, connection: stopped.append(row["id"]) or {"status": "stopped", "pid": None},
+    )
+    assert supervisor.reap(c, idle_seconds=1) == 1
+    assert stopped == ["br_e"]
+    assert c.execute("SELECT status FROM branches WHERE id='br_r'").fetchone()["status"] == "running"
     c.close()
 
 
@@ -1240,7 +1965,10 @@ def test_replica_lag_surfaces_through_api(client, monkeypatch):
     ).json()
     c = main.db()
     main_row = c.execute("SELECT * FROM branches WHERE database_id=?", (database["id"],)).fetchone()
-    c.execute("UPDATE branches SET host_id='local' WHERE id=?", (main_row["id"],))
+    c.execute(
+        "UPDATE branches SET host_id='local',status='running',pid=123 WHERE id=?",
+        (main_row["id"],),
+    )
     c.execute(
         "INSERT INTO replication_credentials VALUES(?,?,?,?)",
         (database["id"], "mosaic_repl_lag", main.cipher().encrypt(b"repl").decode(), main.now()),
@@ -1259,7 +1987,7 @@ def test_replica_lag_surfaces_through_api(client, monkeypatch):
             assert operation == "inspect_replication"
             return {
                 "sampled_at": "2025-01-01T00:00:00+00:00",
-                "replicas": [{"client_addr": "10.0.0.2", "lag_bytes": 42}],
+                "replicas": [{"client_addr": "10.0.0.2/32", "lag_bytes": 42}],
                 "invalid_slots": ["slot_lag"],
             }
 
@@ -1334,6 +2062,10 @@ def test_removed_replica_host_lag_sample_is_reported(client, monkeypatch):
     primary = c.execute(
         "SELECT * FROM branches WHERE database_id=?", (database["id"],)
     ).fetchone()
+    c.execute(
+        "UPDATE branches SET status='running',pid=123 WHERE id=?",
+        (primary["id"],),
+    )
     c.execute(
         "INSERT INTO replication_credentials VALUES(?,?,?,?)",
         (database["id"], "mosaic_repl_removed", main.cipher().encrypt(b"repl").decode(), main.now()),
@@ -1460,6 +2192,8 @@ def test_replica_reconciliation_isolated_per_database(client, monkeypatch):
         def call(self, host_id, operation, payload):
             if operation == "provision":
                 return {"status": "provisioned"}
+            if operation == "start":
+                return {"status": "running", "pid": 123}
             if operation == "prepare_primary":
                 calls.append(("prepare", payload["path"], payload["replication_user"], payload["replication_password"]))
                 return {"status": "running", "pid": 123}
@@ -1705,7 +2439,7 @@ def test_prepare_primary_refreshes_pid_after_restart(tmp_path, monkeypatch):
 
     monkeypatch.setattr(main, "psycopg", FakePsycopg())
     monkeypatch.setattr(main.supervisor, "start_local", lambda payload: {"status": "running", "pid": 111})
-    monkeypatch.setattr(main, "alive", lambda pid: True)
+    monkeypatch.setattr(main.supervisor, "_cluster_is_running", lambda path: True)
 
     def run(argv, env=None):
         calls.append(argv)

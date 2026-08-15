@@ -255,7 +255,20 @@ class BranchEngine(Protocol):
     def create_database(self, path: Path, password: str, port: int, host_id: str = "local") -> None: ...
     def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None, target_port: int | None = None, parent_host_id: str = "local", target_host_id: str = "local") -> None: ...
     def destroy(self, path: Path) -> None: ...
-    def prepare_standby(self, path: Path) -> None: ...
+    def prepare_standby(self, path: Path, *, is_stopped: Callable[[Path], bool] | None = None) -> None: ...
+
+
+class ZfsCommandError(RuntimeError):
+    def __init__(self, argv: list[str], cause: subprocess.CalledProcessError):
+        details = [f"command {argv!r} failed"]
+        for label, output in (("stderr", cause.stderr), ("stdout", cause.stdout)):
+            if output:
+                details.append(f"{label}: {str(output).strip()}")
+        super().__init__(redact_error("; ".join(details)))
+        self.argv = argv
+        self.cause = cause
+        self.stderr = cause.stderr
+        self.stdout = cause.stdout
 
 
 class ZfsBranchEngine:
@@ -275,27 +288,43 @@ class ZfsBranchEngine:
             relative = Path(path.parent.name) / path.name
         return "/".join((self.pool, *relative.parts))
 
+    def _run_zfs(self, argv: list[str]):
+        try:
+            return self.run(argv)
+        except subprocess.CalledProcessError as exc:
+            raise ZfsCommandError(argv, exc) from exc
+
+    def _lazy_unmount(self, path: Path) -> None:
+        root = BRANCH_ROOT.resolve()
+        target = path.resolve()
+        if target == root or root not in target.parents:
+            raise RuntimeError(
+                f"refusing lazy unmount outside MOSAIC_BRANCH_ROOT: {target}"
+            )
+        logger.warning("lazy-detaching ZFS standby mountpoint %s", target)
+        self.run(["mosaic-umount", "-l", str(target)])
+
     def create_database(self, path: Path, password: str, port: int, host_id: str = "local"):
-        self.run(["zfs", "create", "-p", "-o", f"mountpoint={path.resolve()}", self._dataset(path)])
+        self._run_zfs(["zfs", "create", "-p", "-o", f"mountpoint={path.resolve()}", self._dataset(path)])
         _initdb(path, password, port, self.run, host_id)
 
     def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None, target_port: int | None = None, parent_host_id: str = "local", target_host_id: str = "local"):
         snap = f"{self._dataset(parent)}@branch-{target.name}"
         if parent_port:
             _checkpoint(parent_host_id, parent_port, parent_password)
-        self.run(["zfs", "snapshot", snap])
-        self.run(["zfs", "clone", "-o", f"mountpoint={target.resolve()}", snap, self._dataset(target)])
+        self._run_zfs(["zfs", "snapshot", snap])
+        self._run_zfs(["zfs", "clone", "-o", f"mountpoint={target.resolve()}", snap, self._dataset(target)])
         if target_port is not None:
             _rewrite_postgres_config(target, target_port, target_host_id)
 
     def destroy(self, path: Path):
-        self.run(["zfs", "destroy", "-r", self._dataset(path)])
+        self._run_zfs(["zfs", "destroy", "-r", self._dataset(path)])
 
-    def prepare_standby(self, path: Path):
+    def prepare_standby(self, path: Path, *, is_stopped: Callable[[Path], bool] | None = None):
         dataset = self._dataset(path)
         try:
-            self.run(["zfs", "list", "-H", "-o", "name", dataset])
-        except subprocess.CalledProcessError as exc:
+            self._run_zfs(["zfs", "list", "-H", "-o", "name", dataset])
+        except ZfsCommandError as exc:
             detail = " ".join(
                 part for part in (exc.stdout or "", exc.stderr or "", str(exc))
                 if part
@@ -305,8 +334,30 @@ class ZfsBranchEngine:
             if path.exists():
                 shutil.rmtree(path)
         else:
-            self.run(["zfs", "destroy", "-r", dataset])
-        self.run(["zfs", "create", "-p", "-o", f"mountpoint={path.resolve()}", dataset])
+            try:
+                self._run_zfs(["zfs", "destroy", "-r", dataset])
+            except ZfsCommandError as exc:
+                detail = str(exc).lower()
+                if not any(marker in detail for marker in ("busy", "unmount failed", "umount failed")):
+                    raise
+                if is_stopped is None or not is_stopped(path):
+                    raise RuntimeError(
+                        f"cannot safely remove busy standby target {path}: "
+                        "postmaster could not be proven stopped"
+                    ) from exc
+                try:
+                    self._run_zfs(["zfs", "unmount", "-f", dataset])
+                    self._run_zfs(["zfs", "destroy", "-r", dataset])
+                except ZfsCommandError as unmount_error:
+                    detail = str(unmount_error).lower()
+                    if not any(
+                        marker in detail
+                        for marker in ("busy", "unmount failed", "umount failed")
+                    ):
+                        raise
+                    self._lazy_unmount(path)
+                    self._run_zfs(["zfs", "destroy", "-r", dataset])
+        self._run_zfs(["zfs", "create", "-p", "-o", f"mountpoint={path.resolve()}", dataset])
 
 
 class CopyBranchEngine:
@@ -338,7 +389,7 @@ class CopyBranchEngine:
     def destroy(self, path: Path):
         shutil.rmtree(path, ignore_errors=True)
 
-    def prepare_standby(self, path: Path):
+    def prepare_standby(self, path: Path, *, is_stopped: Callable[[Path], bool] | None = None):
         shutil.rmtree(path, ignore_errors=True)
 
 
@@ -508,23 +559,50 @@ class Supervisor:
             raise RuntimeError(f"branch {branch_id} has no PostgreSQL cluster at {path}")
         if psycopg is None:
             raise RuntimeError("psycopg is required to supervise PostgreSQL branches")
-        subprocess.run([pg_bin("pg_ctl"), "-D", str(path), "-o", f"-p {port}", "-l", str(path / "postgres.log"), "-w", "start"], check=True, capture_output=True)
         branch_password = payload["password"]
-        for candidate in [branch_password, *payload.get("parent_passwords", [])]:
+        if not self._cluster_is_running(str(path)):
+            subprocess.run([pg_bin("pg_ctl"), "-D", str(path), "-o", f"-p {port}", "-l", str(path / "postgres.log"), "-w", "start"], check=True, capture_output=True)
+        self._reconcile_password(
+            path,
+            port,
+            host_id,
+            branch_id,
+            branch_password,
+            payload.get("parent_passwords", []),
+        )
+        pid = int((path / "postmaster.pid").read_text().splitlines()[0])
+        return {"status": "running", "pid": pid}
+
+    def _reconcile_password(
+        self,
+        path: Path,
+        port: int,
+        host_id: str,
+        branch_id: str,
+        branch_password: str,
+        parent_passwords: list[str],
+    ) -> None:
+        try:
+            with psycopg.connect(host=node_address(host_id), port=port, user="postgres", password=branch_password, dbname="postgres", connect_timeout=5):
+                return
+        except Exception:
+            pass
+        for candidate in parent_passwords:
             try:
                 with psycopg.connect(host=node_address(host_id), port=port, user="postgres", password=candidate, dbname="postgres", connect_timeout=5) as connection:
                     connection.execute(psycopg_sql.SQL("ALTER ROLE postgres PASSWORD {}").format(psycopg_sql.Literal(branch_password)))
                     connection.commit()
-                break
+                return
             except Exception:
                 continue
-        else:
-            raise RuntimeError(f"unable to set password for branch {branch_id}")
-        pid = int((path / "postmaster.pid").read_text().splitlines()[0])
-        return {"status": "running", "pid": pid}
+        raise RuntimeError(f"unable to set password for branch {branch_id}")
 
-    def _cluster_is_running(self, path: str) -> bool:
+    def _cluster_is_running(self, path: str, require_path: bool = False) -> bool:
         if not Path(path).exists():
+            if require_path:
+                raise RuntimeError(
+                    f"cannot verify PostgreSQL cluster at {path}: data directory is absent"
+                )
             return False
         status_argv = [pg_bin("pg_ctl"), "-D", path, "status"]
         try:
@@ -538,24 +616,32 @@ class Supervisor:
             if (
                 "no server running" in detail
                 or "not running" in detail
-                or "not a database cluster directory" in detail
                 or "does not exist" in detail
             ):
                 return False
+            if "not a database cluster directory" in detail:
+                if require_path:
+                    raise RuntimeError(
+                        f"cannot verify PostgreSQL cluster at {path}: "
+                        f"data directory is not a usable cluster ({_command_error_detail(exc)})"
+                    ) from exc
+                return False
             else:
                 raise RuntimeError(
-                    f"cannot verify PostgreSQL cluster at {path} is stopped"
+                    f"cannot verify PostgreSQL cluster at {path} is stopped: "
+                    f"{_command_error_detail(exc)}"
                 ) from exc
 
     def stop_local(self, payload: dict):
-        running = self._cluster_is_running(payload["path"])
+        require_path = bool(payload.get("require_path"))
+        running = self._cluster_is_running(payload["path"], require_path=require_path)
         if running:
             subprocess.run(
                 [pg_bin("pg_ctl"), "-D", payload["path"], "-m", "fast", "-w", "stop"],
                 check=False,
                 capture_output=True,
             )
-            running = self._cluster_is_running(payload["path"])
+            running = self._cluster_is_running(payload["path"], require_path=require_path)
             if running:
                 raise RuntimeError(
                     f"PostgreSQL cluster at {payload['path']} is still running after stop"
@@ -579,7 +665,13 @@ class Supervisor:
             idle_seconds = int(os.getenv("MOSAIC_BRANCH_IDLE_SECONDS", str(IDLE_REAPER_SECONDS)))
         cutoff = time.time() - idle_seconds
         count = 0
-        for row in c.execute("SELECT * FROM branches WHERE status='running'").fetchall():
+        for row in c.execute(
+            "SELECT b.* FROM branches b "
+            "WHERE b.status='running' "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM replicas r WHERE r.primary_branch_id=b.id"
+            ")"
+        ).fetchall():
             if datetime.fromisoformat(row["last_query_at"]).timestamp() < cutoff:
                 self.stop(row, c)
                 count += 1
@@ -607,44 +699,75 @@ class NodeAgent:
         try:
             self.run([pg_bin("pg_ctl"), "-D", str(target), "status"])
         except Exception as exc:
-            return {"status": "failed", "error": str(exc)}
+            return {"status": "failed", "error": _command_error_detail(exc)}
         return {"status": "ready"}
 
     def _standby_status_is_not_running(self, target: Path) -> bool:
+        if not target.exists():
+            return True
+        if (
+            not (target / "PG_VERSION").exists()
+            and not (target / "postmaster.pid").exists()
+        ):
+            return True
         try:
             self.run([pg_bin("pg_ctl"), "-D", str(target), "status"])
         except Exception as exc:
-            detail = str(exc).lower()
+            detail = _command_error_detail(exc)
+            normalized = detail.lower()
             if isinstance(exc, subprocess.CalledProcessError):
-                detail = " ".join(
-                    part for part in (
-                        exc.stdout or "",
-                        exc.stderr or "",
-                        detail,
-                    ) if part
-                ).lower()
-            if "no server running" in detail or "not running" in detail:
+                if (
+                    "not a database cluster directory" in normalized
+                    or "does not exist" in normalized
+                ):
+                    return True
+            if "no server running" in normalized or "not running" in normalized:
                 return True
-            raise RuntimeError(
-                f"cannot remove standby target {target}: "
-                f"postmaster status could not be verified: {exc}"
-            ) from exc
+            pid = None
+            try:
+                pid = int((target / "postmaster.pid").read_text().splitlines()[0])
+            except FileNotFoundError:
+                return True
+            except (ValueError, IndexError):
+                return True
+            except OSError as read_error:
+                raise RuntimeError(
+                    f"cannot remove standby target {target}: "
+                    f"postmaster status could not be verified: "
+                    f"{_command_error_detail(read_error)}"
+                ) from read_error
+            if not alive(pid):
+                return True
+            if _pid_owns_postgres_directory(pid, target):
+                return False
+            return True
         return False
 
     def _is_in_recovery(self, target: Path, payload: dict) -> bool:
-        if psycopg is None:
-            raise RuntimeError("psycopg is required to promote a standby")
-        with psycopg.connect(
-            host=node_address(payload["target_host_id"]),
-            port=int(payload["target_port"]),
-            user="postgres",
-            password=payload["postgres_password"],
-            dbname="postgres",
-            connect_timeout=5,
-        ) as connection:
-            row = connection.execute("SELECT pg_is_in_recovery()").fetchone()
-        value = row[0] if not isinstance(row, dict) else next(iter(row.values()))
-        return bool(value)
+        result = self.run([pg_bin("pg_controldata"), "-D", str(target)])
+        output = getattr(result, "stdout", result)
+        if isinstance(output, bytes):
+            output = output.decode()
+        state = None
+        for line in str(output).splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key.strip() == "Database cluster state":
+                state = value.strip().lower()
+                break
+        if state == "in production":
+            return False
+        if state and "recovery" in state:
+            return True
+        signal_state = "present" if (target / "standby.signal").exists() else "absent"
+        if state is None:
+            raise RuntimeError(
+                f"could not determine PostgreSQL recovery state from {target} "
+                f"(standby.signal {signal_state})"
+            )
+        raise RuntimeError(
+            f"unsupported PostgreSQL cluster state {state!r} at {target} "
+            f"(standby.signal {signal_state})"
+        )
 
     def promote_standby(self, target: Path, payload: dict) -> dict:
         with self._standby_jobs_lock:
@@ -666,6 +789,7 @@ class NodeAgent:
             int(payload["target_port"]),
             payload["target_host_id"],
         )
+        self.run([pg_bin("pg_ctl"), "-D", str(target), "reload"])
         pid = int((target / "postmaster.pid").read_text().splitlines()[0])
         return {
             "status": "promoted",
@@ -699,14 +823,23 @@ class NodeAgent:
                     else:
                         stop_error = None
                     if pid_file.exists() and alive(postmaster_pid):
-                        detail = f"; stop error: {stop_error}" if stop_error else ""
+                        detail = (
+                            f"; stop error: {_command_error_detail(stop_error)}"
+                            if stop_error else ""
+                        )
                         raise RuntimeError(
                             f"cannot remove standby target {target}: "
                             f"postmaster pid {postmaster_pid} is still alive{detail}"
                         )
-                engine().prepare_standby(target)
+                engine().prepare_standby(
+                    target,
+                    is_stopped=self._standby_status_is_not_running,
+                )
             else:
-                engine().prepare_standby(target)
+                engine().prepare_standby(
+                    target,
+                    is_stopped=self._standby_status_is_not_running,
+                )
             argv = [
                 pg_bin("pg_basebackup"), "-D", str(target),
                 "-h", payload["primary_address"], "-p", str(payload["primary_port"]),
@@ -731,27 +864,40 @@ class NodeAgent:
             self.run([pg_bin("pg_ctl"), "-D", str(target), "status"])
             result = {"status": "ready"}
         except Exception as exc:
-            result = {"status": "failed", "error": str(exc)}
+            result = {"status": "failed", "error": _command_error_detail(exc)}
         with self._standby_jobs_lock:
-            self._standby_jobs[target] = result
+            job = self._standby_jobs.get(target)
+            if job and job.get("superseded"):
+                self._standby_jobs[target] = {
+                    "status": "failed",
+                    "error": "standby build superseded by forced rebuild",
+                }
+            else:
+                self._standby_jobs[target] = result
 
     def _start_standby_build(self, target: Path, payload: dict) -> dict:
         force_rebuild = bool(payload.get("force_rebuild"))
-        with self._standby_jobs_lock:
-            job = self._standby_jobs.get(target)
-            if force_rebuild:
+        if force_rebuild:
+            with self._standby_jobs_lock:
+                job = self._standby_jobs.get(target)
+                if job and job["status"] == "building":
+                    job["superseded"] = True
+                    return {"status": "building", "superseded": True}
                 self._standby_jobs.pop(target, None)
-            elif job and job["status"] == "building":
-                return {"status": "building"}
-        if not force_rebuild:
+                self._standby_jobs[target] = {"status": "building"}
+        else:
+            with self._standby_jobs_lock:
+                job = self._standby_jobs.get(target)
+                if job and job["status"] == "building":
+                    return {"status": "building"}
             existing = self._standby_status(target)
             if existing["status"] == "ready":
                 return existing
-        with self._standby_jobs_lock:
-            job = self._standby_jobs.get(target)
-            if not force_rebuild and job and job["status"] == "building":
-                return {"status": "building"}
-            self._standby_jobs[target] = {"status": "building"}
+            with self._standby_jobs_lock:
+                job = self._standby_jobs.get(target)
+                if job and job["status"] == "building":
+                    return {"status": "building"}
+                self._standby_jobs[target] = {"status": "building"}
         threading.Thread(
             target=self._run_standby_build,
             args=(target, dict(payload)),
@@ -817,7 +963,7 @@ class NodeAgent:
                 listen_setting is not None
                 and listen_setting.group(1) != node_address(payload["host_id"])
             )
-            was_running = alive(payload.get("pid"))
+            was_running = supervisor._cluster_is_running(str(primary_path))
             _rewrite_postgres_config(
                 primary_path,
                 int(payload["port"]),
@@ -894,7 +1040,7 @@ class NodeAgent:
                 row_factory=dict_row,
             ) as connection:
                 rows = connection.execute(
-                    "SELECT client_addr::text AS client_addr, application_name, "
+                    "SELECT host(client_addr) AS client_addr, application_name, "
                     "COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0)::bigint AS lag_bytes "
                     "FROM pg_stat_replication"
                 ).fetchall()
@@ -1019,6 +1165,56 @@ def redact_error(error: str, sensitive: tuple[str, ...] = ()) -> str:
     return error
 
 
+def _command_error_detail(exc: Exception) -> str:
+    parts = [str(part).strip() for part in (
+        getattr(exc, "stderr", None),
+        getattr(exc, "stdout", None),
+        str(exc),
+    ) if part]
+    return redact_error("; ".join(parts))
+
+
+def _pid_process_evidence(pid: int) -> tuple[list[str], Path | None]:
+    proc = Path("/proc") / str(pid)
+    try:
+        raw = (proc / "cmdline").read_bytes()
+    except FileNotFoundError:
+        return [], None
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot inspect process {pid} while checking standby ownership: {exc}"
+        ) from exc
+    args = [arg.decode(errors="replace") for arg in raw.split(b"\0") if arg]
+    try:
+        cwd = (proc / "cwd").resolve()
+    except FileNotFoundError:
+        cwd = None
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot inspect process {pid} working directory: {exc}"
+        ) from exc
+    return args, cwd
+
+
+def _pid_owns_postgres_directory(pid: int, target: Path) -> bool:
+    args, cwd = _pid_process_evidence(pid)
+    resolved = str(target.resolve())
+    if cwd is not None and str(cwd) == resolved:
+        return True
+    for index, arg in enumerate(args):
+        if arg in {"-D", "--pgdata"} and index + 1 < len(args):
+            return str(Path(args[index + 1]).resolve()) == resolved
+        if arg.startswith("-D") and len(arg) > 2:
+            return str(Path(arg[2:]).resolve()) == resolved
+        if arg.startswith("--pgdata="):
+            return str(Path(arg.split("=", 1)[1]).resolve()) == resolved
+    if not args and cwd is None:
+        raise RuntimeError(
+            f"cannot determine whether process {pid} owns standby target {target}"
+        )
+    return False
+
+
 def _retry_replica(c: Conn, replica, exc: Exception, sensitive: tuple[str, ...] = ()):
     attempts = int(replica["attempts"]) + 1
     delay = min(300, 5 * (2 ** min(attempts - 1, 6)))
@@ -1036,6 +1232,48 @@ def _retry_replica(c: Conn, replica, exc: Exception, sensitive: tuple[str, ...] 
     )
 
 
+def _ensure_primary_running(
+    c: Conn,
+    *,
+    branch_id: str,
+    path: str,
+    port: int,
+    pid: int | None,
+    status: str,
+    host_id: str,
+    password: str,
+) -> dict:
+    if status == "running":
+        return {"status": status, "pid": pid}
+    result = node_transport.call(host_id, "start", {
+        "branch_id": branch_id,
+        "path": path,
+        "port": port,
+        "pid": pid,
+        "status": status,
+        "host_id": host_id,
+        "password": password,
+        "parent_passwords": [],
+    })
+    c.execute(
+        "UPDATE branches SET status=?,pid=? WHERE id=?",
+        (result["status"], result["pid"], branch_id),
+    )
+    return result
+
+
+def _standby_is_verifiably_stopped(result: dict) -> bool:
+    if result.get("status") != "failed":
+        return False
+    error = str(result.get("error", "")).lower()
+    return (
+        "standby postmaster is not running" in error
+        or "no server running" in error
+        or "not running" in error
+        or "not a database cluster directory" in error
+    )
+
+
 def _reconcile_database_replicas(c: Conn, due: list):
     primary = due[0]
     postgres_password = ""
@@ -1048,10 +1286,26 @@ def _reconcile_database_replicas(c: Conn, due: list):
         row for row in due
         if row["status"] in ("pending", "retryable", "rebuild_required")
     ]
+    try:
+        postgres_password = cipher().decrypt(primary["credential_encrypted"].encode()).decode()
+        replication_password = cipher().decrypt(primary["replication_credential"].encode()).decode()
+        _ensure_primary_running(
+            c,
+            branch_id=primary["branch_id"],
+            path=primary["primary_path"],
+            port=primary["primary_port"],
+            pid=primary["primary_pid"],
+            status=primary["primary_status"],
+            host_id=primary["primary_host_id"],
+            password=postgres_password,
+        )
+    except Exception as exc:
+        for row in due:
+            if row["status"] != "ready":
+                _retry_replica(c, row, exc, (postgres_password, replication_password))
+        return
     if pending:
         try:
-            postgres_password = cipher().decrypt(primary["credential_encrypted"].encode()).decode()
-            replication_password = cipher().decrypt(primary["replication_credential"].encode()).decode()
             prepared = node_transport.call(primary["primary_host_id"], "prepare_primary", {
                 "branch_id": primary["branch_id"],
                 "path": primary["primary_path"],
@@ -1074,6 +1328,21 @@ def _reconcile_database_replicas(c: Conn, due: list):
                 _retry_replica(c, row, exc, (postgres_password, replication_password))
             return
     for replica in due:
+        if replica["status"] == "ready":
+            try:
+                result = node_transport.call(replica["host_id"], "inspect_standby", {
+                    "target_path": replica["path"],
+                })
+            except Exception:
+                continue
+            if _standby_is_verifiably_stopped(result):
+                c.execute(
+                    "UPDATE replicas SET status='rebuild_required',"
+                    "lag_bytes=NULL,lag_sampled_at=NULL,next_attempt_at=NULL,"
+                    "last_error=NULL WHERE id=?",
+                    (replica["id"],),
+                )
+            continue
         try:
             if replica["status"] == "building":
                 result = node_transport.call(replica["host_id"], "inspect_standby", {
@@ -1098,10 +1367,11 @@ def _reconcile_database_replicas(c: Conn, due: list):
                     (replica["id"],),
                 )
             elif status == "building":
-                c.execute(
-                    "UPDATE replicas SET status='building',next_attempt_at=NULL,last_error=NULL WHERE id=?",
-                    (replica["id"],),
-                )
+                if not result.get("superseded"):
+                    c.execute(
+                        "UPDATE replicas SET status='building',next_attempt_at=NULL,last_error=NULL WHERE id=?",
+                        (replica["id"],),
+                    )
             elif status == "failed":
                 raise RuntimeError(result.get("error", "standby build failed"))
             else:
@@ -1116,8 +1386,7 @@ def reconcile_replicas(c: Conn):
         "b.pid AS primary_pid, b.status AS primary_status, b.host_id AS primary_host_id, "
         "b.credential_encrypted, rc.username, rc.credential_encrypted AS replication_credential "
         "FROM replicas r JOIN branches b ON b.id=r.primary_branch_id "
-        "JOIN replication_credentials rc ON rc.database_id=r.database_id "
-        "WHERE r.status IN ('pending','retryable','building','rebuild_required')"
+        "JOIN replication_credentials rc ON rc.database_id=r.database_id"
     ).fetchall()
     due = []
     for row in rows:
@@ -1167,6 +1436,16 @@ def refresh_replica_lag(c: Conn, database_id: str):
         return {"error": "replication lag sampling unavailable"}
     try:
         postgres_password = cipher().decrypt(main_row["credential_encrypted"].encode()).decode()
+        _ensure_primary_running(
+            c,
+            branch_id=main_row["id"],
+            path=main_row["path"],
+            port=main_row["port"],
+            pid=main_row["pid"],
+            status=main_row["status"],
+            host_id=main_row["host_id"],
+            password=postgres_password,
+        )
         sampled = node_transport.call(main_row["host_id"], "inspect_replication", {
             "primary_host_id": main_row["host_id"],
             "primary_port": main_row["port"],
@@ -1186,7 +1465,8 @@ def refresh_replica_lag(c: Conn, database_id: str):
                 (f"replica host unavailable: {exc}"[:500], row["id"]),
             )
     for replica in sampled.get("replicas", []):
-        row = by_address.get(replica.get("client_addr"))
+        client_addr = str(replica.get("client_addr") or "").split("/", 1)[0]
+        row = by_address.get(client_addr)
         if row:
             c.execute(
                 "UPDATE replicas SET lag_bytes=?,lag_sampled_at=?,last_error=NULL "
@@ -1263,7 +1543,13 @@ def _run_replication_sweep():
 def reap_branches(c: Conn) -> int:
     cutoff = time.time() - int(os.getenv("MOSAIC_BRANCH_IDLE_SECONDS", str(IDLE_REAPER_SECONDS)))
     count = 0
-    for row in c.execute("SELECT * FROM branches WHERE status='running'").fetchall():
+    for row in c.execute(
+        "SELECT b.* FROM branches b "
+        "WHERE b.status='running' "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM replicas r WHERE r.primary_branch_id=b.id"
+        ")"
+    ).fetchall():
         if datetime.fromisoformat(row["last_query_at"]).timestamp() >= cutoff:
             continue
         try:
@@ -1529,6 +1815,9 @@ def _promote_database_locked(database_id: str, payload: PromotionRequest):
                 postgres_password = cipher().decrypt(
                     main_row["credential_encrypted"].encode()
                 ).decode()
+            except InvalidToken as exc:
+                raise HTTPException(503, "primary credentials cannot be decrypted") from exc
+            try:
                 result = node_transport.call(payload.host_id, "promote_standby", {
                     "target_path": main_row["path"],
                     "target_port": main_row["port"],
@@ -1590,6 +1879,7 @@ def _promote_database_locked(database_id: str, payload: PromotionRequest):
             node_transport.call(main_row["host_id"], "stop", {
                 "path": main_row["path"],
                 "pid": main_row["pid"],
+                "require_path": True,
             })
         except Exception as exc:
             if not payload.force:
