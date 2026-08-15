@@ -48,7 +48,7 @@ test("renders signup reuse refusal and capacity guidance", async () => {
   assert.match(html, /database-api\.mosaicos\.com\/v1\/public\/signup/);
   assert.match(html, /returned exactly once/);
   assert.match(html, /signup is refused/);
-  assert.match(html, /at capacity/);
+  assert.match(html, /capacity ceiling has been reached/);
 });
 
 test("includes the PostgreSQL service switcher entry", async () => {

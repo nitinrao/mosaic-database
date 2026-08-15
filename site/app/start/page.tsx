@@ -66,7 +66,7 @@ export default function StartPage() {
         Enter an email and Mosaic will create a shared tenant. The API key is returned exactly once. If you sign up
         again with the same email, signup is refused and the existing key remains unchanged. Use your existing key or contact Mosaic.
       </p>
-      <p className="result-note">Signup endpoint: <code>{API_ENDPOINT}</code>. A <code>503</code> response means the shared database capacity ceiling is currently at capacity.</p>
+      <p className="result-note">Signup endpoint: <code>{API_ENDPOINT}</code>. A <code>503</code> response means the global database capacity ceiling has been reached.</p>
 
       <form className="access-form" onSubmit={submit}>
         <label>Work email<input name="email" type="email" required /></label>
