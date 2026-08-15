@@ -225,6 +225,76 @@ def test_zfs_engine_exact_argv(tmp_path):
     ]
 
 
+def test_zfs_busy_standby_destroy_unmounts_after_verified_stop_and_retries(tmp_path):
+    calls = []
+    destroy_attempts = 0
+    standby = tmp_path / "cluster" / ".replicas" / "sv2"
+
+    def run(argv, env=None):
+        nonlocal destroy_attempts
+        calls.append(argv)
+        if argv[:3] == ["zfs", "destroy", "-r"]:
+            destroy_attempts += 1
+            if destroy_attempts == 1:
+                raise subprocess.CalledProcessError(1, argv, stderr="dataset is busy")
+
+    engine = main.ZfsBranchEngine("mosaic/db", run)
+    engine.prepare_standby(standby, is_stopped=lambda path: True)
+    dataset = engine._dataset(standby)
+    assert ["zfs", "unmount", "-f", dataset] in calls
+    assert calls.count(
+        ["zfs", "destroy", "-r", dataset]
+    ) == 2
+
+
+def test_zfs_busy_standby_destroy_does_not_unmount_unverified_target(tmp_path):
+    calls = []
+    standby = tmp_path / "cluster" / ".replicas" / "sv2"
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[:3] == ["zfs", "destroy", "-r"]:
+            raise subprocess.CalledProcessError(1, argv, stderr="mount is busy")
+
+    engine = main.ZfsBranchEngine("mosaic/db", run)
+    with pytest.raises(RuntimeError, match="could not be proven stopped"):
+        engine.prepare_standby(standby, is_stopped=lambda path: False)
+    assert ["zfs", "unmount", "-f", engine._dataset(standby)] not in calls
+
+
+def test_zfs_nonbusy_standby_destroy_failure_is_not_retried(tmp_path):
+    calls = []
+    standby = tmp_path / "cluster" / ".replicas" / "sv2"
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[:3] == ["zfs", "destroy", "-r"]:
+            raise subprocess.CalledProcessError(1, argv, stderr="permission denied")
+
+    engine = main.ZfsBranchEngine("mosaic/db", run)
+    with pytest.raises(main.ZfsCommandError, match="permission denied"):
+        engine.prepare_standby(standby, is_stopped=lambda path: True)
+    assert ["zfs", "unmount", "-f", engine._dataset(standby)] not in calls
+
+
+def test_zfs_failure_includes_stderr_and_stdout(tmp_path):
+    path = tmp_path / "cluster"
+    argv = ["zfs", "destroy", "-r", f"mosaic/db/{tmp_path.name}/cluster"]
+
+    def run(actual, env=None):
+        raise subprocess.CalledProcessError(
+            1,
+            actual,
+            output="zfs stdout detail",
+            stderr="zfs stderr detail",
+        )
+
+    with pytest.raises(main.ZfsCommandError) as caught:
+        main.ZfsBranchEngine("mosaic/db", run).destroy(path)
+    assert "zfs stderr detail" in str(caught.value)
+    assert "zfs stdout detail" in str(caught.value)
+
+
 def test_clone_rewrites_postgres_port_and_socket(tmp_path):
     config = tmp_path / "postgresql.conf"
     config.write_text("port = 55432\nlisten_addresses = '*'\nunix_socket_directories = '/old'\nshared_buffers = '128MB'\n")

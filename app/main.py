@@ -255,7 +255,20 @@ class BranchEngine(Protocol):
     def create_database(self, path: Path, password: str, port: int, host_id: str = "local") -> None: ...
     def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None, target_port: int | None = None, parent_host_id: str = "local", target_host_id: str = "local") -> None: ...
     def destroy(self, path: Path) -> None: ...
-    def prepare_standby(self, path: Path) -> None: ...
+    def prepare_standby(self, path: Path, *, is_stopped: Callable[[Path], bool] | None = None) -> None: ...
+
+
+class ZfsCommandError(RuntimeError):
+    def __init__(self, argv: list[str], cause: subprocess.CalledProcessError):
+        details = [f"command {argv!r} failed"]
+        for label, output in (("stderr", cause.stderr), ("stdout", cause.stdout)):
+            if output:
+                details.append(f"{label}: {str(output).strip()}")
+        super().__init__(redact_error("; ".join(details)))
+        self.argv = argv
+        self.cause = cause
+        self.stderr = cause.stderr
+        self.stdout = cause.stdout
 
 
 class ZfsBranchEngine:
@@ -275,27 +288,33 @@ class ZfsBranchEngine:
             relative = Path(path.parent.name) / path.name
         return "/".join((self.pool, *relative.parts))
 
+    def _run_zfs(self, argv: list[str]):
+        try:
+            return self.run(argv)
+        except subprocess.CalledProcessError as exc:
+            raise ZfsCommandError(argv, exc) from exc
+
     def create_database(self, path: Path, password: str, port: int, host_id: str = "local"):
-        self.run(["zfs", "create", "-p", "-o", f"mountpoint={path.resolve()}", self._dataset(path)])
+        self._run_zfs(["zfs", "create", "-p", "-o", f"mountpoint={path.resolve()}", self._dataset(path)])
         _initdb(path, password, port, self.run, host_id)
 
     def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None, target_port: int | None = None, parent_host_id: str = "local", target_host_id: str = "local"):
         snap = f"{self._dataset(parent)}@branch-{target.name}"
         if parent_port:
             _checkpoint(parent_host_id, parent_port, parent_password)
-        self.run(["zfs", "snapshot", snap])
-        self.run(["zfs", "clone", "-o", f"mountpoint={target.resolve()}", snap, self._dataset(target)])
+        self._run_zfs(["zfs", "snapshot", snap])
+        self._run_zfs(["zfs", "clone", "-o", f"mountpoint={target.resolve()}", snap, self._dataset(target)])
         if target_port is not None:
             _rewrite_postgres_config(target, target_port, target_host_id)
 
     def destroy(self, path: Path):
-        self.run(["zfs", "destroy", "-r", self._dataset(path)])
+        self._run_zfs(["zfs", "destroy", "-r", self._dataset(path)])
 
-    def prepare_standby(self, path: Path):
+    def prepare_standby(self, path: Path, *, is_stopped: Callable[[Path], bool] | None = None):
         dataset = self._dataset(path)
         try:
-            self.run(["zfs", "list", "-H", "-o", "name", dataset])
-        except subprocess.CalledProcessError as exc:
+            self._run_zfs(["zfs", "list", "-H", "-o", "name", dataset])
+        except ZfsCommandError as exc:
             detail = " ".join(
                 part for part in (exc.stdout or "", exc.stderr or "", str(exc))
                 if part
@@ -305,8 +324,20 @@ class ZfsBranchEngine:
             if path.exists():
                 shutil.rmtree(path)
         else:
-            self.run(["zfs", "destroy", "-r", dataset])
-        self.run(["zfs", "create", "-p", "-o", f"mountpoint={path.resolve()}", dataset])
+            try:
+                self._run_zfs(["zfs", "destroy", "-r", dataset])
+            except ZfsCommandError as exc:
+                detail = str(exc).lower()
+                if "busy" not in detail:
+                    raise
+                if is_stopped is None or not is_stopped(path):
+                    raise RuntimeError(
+                        f"cannot safely remove busy standby target {path}: "
+                        "postmaster could not be proven stopped"
+                    ) from exc
+                self._run_zfs(["zfs", "unmount", "-f", dataset])
+                self._run_zfs(["zfs", "destroy", "-r", dataset])
+        self._run_zfs(["zfs", "create", "-p", "-o", f"mountpoint={path.resolve()}", dataset])
 
 
 class CopyBranchEngine:
@@ -338,7 +369,7 @@ class CopyBranchEngine:
     def destroy(self, path: Path):
         shutil.rmtree(path, ignore_errors=True)
 
-    def prepare_standby(self, path: Path):
+    def prepare_standby(self, path: Path, *, is_stopped: Callable[[Path], bool] | None = None):
         shutil.rmtree(path, ignore_errors=True)
 
 
@@ -750,9 +781,15 @@ class NodeAgent:
                             f"cannot remove standby target {target}: "
                             f"postmaster pid {postmaster_pid} is still alive{detail}"
                         )
-                engine().prepare_standby(target)
+                engine().prepare_standby(
+                    target,
+                    is_stopped=self._standby_status_is_not_running,
+                )
             else:
-                engine().prepare_standby(target)
+                engine().prepare_standby(
+                    target,
+                    is_stopped=self._standby_status_is_not_running,
+                )
             argv = [
                 pg_bin("pg_basebackup"), "-D", str(target),
                 "-h", payload["primary_address"], "-p", str(payload["primary_port"]),
