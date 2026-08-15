@@ -113,12 +113,14 @@ def node_private_addresses() -> dict[str, str]:
 
 
 def node_address(node_id: str) -> str:
-    if node_id == "local":
-        return "127.0.0.1"
     if node_id not in node_ids():
         raise RuntimeError(f"unknown database node {node_id}")
+    if node_id == "local" and len(node_ids()) == 1 and not node_private_addresses().get(node_id):
+        return "127.0.0.1"
     address = node_private_addresses().get(node_id)
     if not address:
+        if len(node_ids()) == 1 and node_id == "local":
+            return "127.0.0.1"
         raise RuntimeError("MOSAIC_NODE_PRIVATE_ADDRESSES must map every configured node for multi-host deployment")
     return address
 
@@ -300,7 +302,7 @@ def _rewrite_postgres_config(path: Path, port: int, host_id: str = "local"):
         f"unix_socket_directories = '{path.resolve()}'",
     ])
     config.write_text("\n".join(retained) + "\n")
-    if len(node_ids()) > 1:
+    if listen_address not in {"127.0.0.1", "::1"}:
         addresses = node_private_addresses()
         if set(node_ids()) - set(addresses):
             raise RuntimeError("MOSAIC_NODE_PRIVATE_ADDRESSES must map every configured node for multi-host deployment")
@@ -436,9 +438,19 @@ class Supervisor:
 
 class NodeAgent:
     def handle(self, operation: str, payload: dict):
+        if operation not in {"provision", "clone", "start", "stop", "inspect", "destroy"}:
+            raise RuntimeError(f"unknown node operation {operation}")
+        root = BRANCH_ROOT.resolve()
+
+        def confined(value: str, field: str) -> Path:
+            path = Path(value).resolve()
+            if path == root or root not in path.parents:
+                raise RuntimeError(f"{field} must be under MOSAIC_BRANCH_ROOT")
+            return path
+
         if operation == "provision":
             engine().create_database(
-                Path(payload["path"]),
+                confined(payload["path"], "path"),
                 payload["password"],
                 int(payload["port"]),
                 payload.get("host_id", current_node_id()),
@@ -446,8 +458,8 @@ class NodeAgent:
             return {"status": "provisioned"}
         if operation == "clone":
             engine().clone(
-                Path(payload["parent"]),
-                Path(payload["target"]),
+                confined(payload["parent"], "parent"),
+                confined(payload["target"], "target"),
                 parent_port=payload.get("parent_port"),
                 parent_password=payload.get("parent_password"),
                 target_port=payload.get("target_port"),
@@ -456,13 +468,13 @@ class NodeAgent:
             )
             return {"status": "cloned"}
         if operation == "start":
-            return supervisor.start_local(payload)
+            return supervisor.start_local({**payload, "path": str(confined(payload["path"], "path"))})
         if operation == "stop":
-            return supervisor.stop_local(payload)
+            return supervisor.stop_local({**payload, "path": str(confined(payload["path"], "path"))})
         if operation == "inspect":
             return {"status": payload.get("status"), "pid": payload.get("pid"), "alive": alive(payload.get("pid"))}
         if operation == "destroy":
-            engine().destroy(Path(payload["path"]))
+            engine().destroy(confined(payload["path"], "path"))
             return {"status": "destroyed"}
         raise RuntimeError(f"unknown node operation {operation}")
 
@@ -476,7 +488,9 @@ class NodeTransport:
         self.agent = agent
 
     def call(self, node_id: str, operation: str, payload: dict):
-        if len(node_ids()) == 1 or node_id == current_node_id():
+        if node_id not in node_ids():
+            raise RuntimeError(f"unknown database node {node_id}")
+        if node_id == current_node_id():
             return self.agent.handle(operation, payload)
         base_url = node_url(node_id)
         if not base_url:
@@ -508,7 +522,10 @@ async def _reaper_loop():
         await asyncio.sleep(max(1, int(os.getenv("MOSAIC_BRANCH_REAPER_INTERVAL", "60"))))
         c = db()
         try:
-            reap_branches(c)
+            try:
+                reap_branches(c)
+            except Exception:
+                pass
         finally:
             c.close()
 
@@ -519,7 +536,10 @@ def reap_branches(c: Conn) -> int:
     for row in c.execute("SELECT * FROM branches WHERE status='running'").fetchall():
         if datetime.fromisoformat(row["last_query_at"]).timestamp() >= cutoff:
             continue
-        result = node_transport.call(row["host_id"], "stop", {"path": row["path"], "pid": row["pid"]})
+        try:
+            result = node_transport.call(row["host_id"], "stop", {"path": row["path"], "pid": row["pid"]})
+        except (RuntimeError, OSError):
+            continue
         record_stop(c, row, result)
         count += 1
     return count
