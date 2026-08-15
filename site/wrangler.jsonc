@@ -1,0 +1,11 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "mosaic-database",
+  "main": "./dist/server/index.js",
+  "compatibility_date": "2026-08-01",
+  "assets": { "directory": "./dist/client" },
+  "routes": [
+    { "pattern": "database.mosaicos.com", "custom_domain": true }
+  ],
+  "observability": { "enabled": true }
+}
