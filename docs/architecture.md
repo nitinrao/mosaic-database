@@ -7,6 +7,21 @@ a tenant is refused with `409`; no tenant or key state is changed. Its public ba
 `MOSAIC_PUBLIC_ENDPOINT` (default `https://database-api.mosaicos.com`).
 Self-serve signup is rate-limited independently by IP and email.
 
+Mosaic-issued `msk_live_…` credentials are accepted additively through the
+Sandbox `POST /v1/introspect` endpoint. The database service forwards the
+presented key verbatim, never stores it or a Sandbox admin credential, and
+maps the returned `organization_id` to a local tenant in
+`mosaic_organization_tenants`. `POST /v1/tenants/discover` provisions that
+shared tenant on first use. Mosaic-key reads require `database:read`; every
+other request requires `database:write`, and the mapped organization must own
+the tenant ID in the URL. Introspection results are cached briefly by key
+digest (positive entries for about three seconds and negative entries for about
+two); an outage may serve a warm positive result for at most 60 seconds, but
+never fails open on a cold cache. This makes Sandbox availability part of the
+availability of new Mosaic-key credentials, while revocation propagates within
+a few seconds. Existing `mdb_live_…` local-ledger keys retain their full
+tenant access and local rate limiting.
+
 The control plane enforces a global database ceiling with
 `MOSAIC_MAX_DATABASES_TOTAL` (default `50`). This applies to every database
 creation caller and returns `503` at capacity; refusals are written to the

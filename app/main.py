@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import asyncio
+from collections import OrderedDict
 import ipaddress
 import json
 import logging
@@ -20,6 +21,7 @@ from glob import glob
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Annotated, Any, Callable, Literal, Protocol
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -52,6 +54,13 @@ RATE_LIMIT_SWEEP_THRESHOLD = 256
 RATE_LIMIT_SWEEP_INTERVAL_SECONDS = 60.0
 MAX_DATABASES_TOTAL = int(os.getenv("MOSAIC_MAX_DATABASES_TOTAL", "50"))
 MOSAIC_PUBLIC_ENDPOINT = os.getenv("MOSAIC_PUBLIC_ENDPOINT", "https://database-api.mosaicos.com")
+MOSAIC_INTROSPECTION_URL = os.getenv(
+    "MOSAIC_INTROSPECTION_URL",
+    "https://sandbox.mosaicos.com/v1/introspect",
+)
+MOSAIC_INTROSPECTION_TIMEOUT_SECONDS = float(
+    os.getenv("MOSAIC_INTROSPECTION_TIMEOUT_SECONDS", "3")
+)
 TRUST_CLOUDFLARE_IP = os.getenv("MOSAIC_TRUST_CLOUDFLARE_IP", "").lower() == "true"
 NODE_ID = os.getenv("MOSAIC_NODE_ID", "local")
 PROMOTION_MAX_LAG_BYTES = int(os.getenv("MOSAIC_PROMOTION_MAX_LAG_BYTES", str(10 * 1024 * 1024 * 1024)))
@@ -79,6 +88,18 @@ _rate_last_sweep = 0.0
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class MosaicIdentityCacheEntry:
+    identity: dict | None
+    cached_at: float
+    expires_at: float
+    stale_until: float
+
+
+_mosaic_identity_cache: OrderedDict[str, MosaicIdentityCacheEntry] = OrderedDict()
+_mosaic_identity_cache_lock = threading.Lock()
+
+
 def background_interval(name: str, default: int) -> int:
     raw = os.getenv(name, str(default))
     try:
@@ -98,6 +119,149 @@ def token(prefix: str) -> str:
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def mosaic_identity_cache_ttl(negative: bool = False) -> float:
+    name = "MOSAIC_INTROSPECTION_NEGATIVE_TTL_SECONDS" if negative else "MOSAIC_INTROSPECTION_CACHE_TTL_SECONDS"
+    default = "2" if negative else "3"
+    try:
+        return max(0.0, float(os.getenv(name, default)))
+    except ValueError:
+        return float(default)
+
+
+def mosaic_identity_stale_seconds() -> float:
+    try:
+        return max(0.0, float(os.getenv("MOSAIC_INTROSPECTION_STALE_SECONDS", "60")))
+    except ValueError:
+        return 60.0
+
+
+def mosaic_identity_cache_cap() -> int:
+    try:
+        return max(1, int(os.getenv("MOSAIC_INTROSPECTION_CACHE_CAP", "1024")))
+    except ValueError:
+        return 1024
+
+
+def _mosaic_cache_get(key_digest: str, current: float) -> tuple[dict | None, bool] | None:
+    with _mosaic_identity_cache_lock:
+        entry = _mosaic_identity_cache.get(key_digest)
+        if not entry:
+            return None
+        _mosaic_identity_cache.move_to_end(key_digest)
+        if current <= entry.expires_at:
+            return entry.identity, False
+        if entry.identity is not None and current <= entry.stale_until:
+            return entry.identity, True
+        if entry.identity is None:
+            _mosaic_identity_cache.pop(key_digest, None)
+        return None
+
+
+def _mosaic_cache_put(key_digest: str, identity: dict | None, current: float):
+    negative = identity is None
+    ttl = mosaic_identity_cache_ttl(negative)
+    stale_until = current + ttl
+    if not negative:
+        stale_until += mosaic_identity_stale_seconds()
+    entry = MosaicIdentityCacheEntry(identity, current, current + ttl, stale_until)
+    with _mosaic_identity_cache_lock:
+        _mosaic_identity_cache[key_digest] = entry
+        _mosaic_identity_cache.move_to_end(key_digest)
+        while len(_mosaic_identity_cache) > mosaic_identity_cache_cap():
+            _mosaic_identity_cache.popitem(last=False)
+
+
+def _mosaic_identity_unavailable() -> HTTPException:
+    return HTTPException(503, "identity service unavailable")
+
+
+def _parse_mosaic_identity(body: bytes) -> dict:
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError) as exc:
+        raise _mosaic_identity_unavailable() from exc
+    if not isinstance(payload, dict):
+        raise _mosaic_identity_unavailable()
+    organization_id = payload.get("organization_id")
+    scopes = payload.get("scopes")
+    status = payload.get("status")
+    if not isinstance(organization_id, str) or not organization_id:
+        raise _mosaic_identity_unavailable()
+    if not isinstance(scopes, list) or not all(isinstance(scope, str) for scope in scopes):
+        raise _mosaic_identity_unavailable()
+    if not isinstance(status, str):
+        raise _mosaic_identity_unavailable()
+    return {
+        "organization_id": organization_id,
+        "scopes": scopes,
+        "resource_profile": payload.get("resource_profile"),
+        "status": status,
+    }
+
+
+def introspect_mosaic_key(key: str) -> dict:
+    url = os.getenv("MOSAIC_INTROSPECTION_URL", MOSAIC_INTROSPECTION_URL)
+    if not url:
+        raise HTTPException(401, "invalid tenant API key")
+    key_digest = digest(key)
+    current = time.time()
+    cached = _mosaic_cache_get(key_digest, current)
+    if cached is not None:
+        identity, stale = cached
+        if identity is None:
+            raise HTTPException(401, "invalid tenant API key")
+        if not stale:
+            return identity
+    request = urllib.request.Request(
+        url,
+        method="POST",
+        headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=float(os.getenv(
+                "MOSAIC_INTROSPECTION_TIMEOUT_SECONDS",
+                str(MOSAIC_INTROSPECTION_TIMEOUT_SECONDS),
+            )),
+        ) as response:
+            status = getattr(response, "status", None)
+            if status is None:
+                status = response.getcode()
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            _mosaic_cache_put(key_digest, None, current)
+            raise HTTPException(401, "invalid tenant API key") from None
+        if exc.code < 500:
+            raise _mosaic_identity_unavailable() from None
+        cached = _mosaic_cache_get(key_digest, current)
+        if cached is not None and cached[0] is not None:
+            return cached[0]
+        raise _mosaic_identity_unavailable() from None
+    except (OSError, TimeoutError, ValueError):
+        cached = _mosaic_cache_get(key_digest, current)
+        if cached is not None and cached[0] is not None:
+            return cached[0]
+        raise _mosaic_identity_unavailable() from None
+    if status == 401:
+        _mosaic_cache_put(key_digest, None, current)
+        raise HTTPException(401, "invalid tenant API key")
+    if status >= 500:
+        cached = _mosaic_cache_get(key_digest, current)
+        if cached is not None and cached[0] is not None:
+            return cached[0]
+        raise _mosaic_identity_unavailable()
+    if status != 200:
+        raise _mosaic_identity_unavailable()
+    identity = _parse_mosaic_identity(body)
+    if identity["status"] != "active":
+        _mosaic_cache_put(key_digest, None, current)
+        raise HTTPException(401, "Mosaic identity is not active")
+    _mosaic_cache_put(key_digest, identity, current)
+    return identity
 
 
 def normalize_email(value: str) -> str:
@@ -226,7 +390,8 @@ def db() -> Conn:
 def initialize_schema(c: Conn):
     integer = "BIGSERIAL PRIMARY KEY" if c.postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
     c.script(f"""
-    CREATE TABLE IF NOT EXISTS tenants (id TEXT PRIMARY KEY, name TEXT NOT NULL, plan TEXT NOT NULL, api_key_hash TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS tenants (id TEXT PRIMARY KEY, name TEXT NOT NULL, plan TEXT NOT NULL, api_key_hash TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, origin TEXT NOT NULL DEFAULT 'local');
+    CREATE TABLE IF NOT EXISTS mosaic_organization_tenants (organization_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL UNIQUE REFERENCES tenants(id), created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS public_signups (email TEXT PRIMARY KEY, tenant_id TEXT NOT NULL UNIQUE REFERENCES tenants(id), tenant_name TEXT NOT NULL, last_key_created_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS databases (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id), name TEXT NOT NULL, root_path TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(tenant_id,name));
     CREATE TABLE IF NOT EXISTS branches (id TEXT PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id), name TEXT NOT NULL, parent_id TEXT, path TEXT NOT NULL, port INTEGER NOT NULL, pid INTEGER, status TEXT NOT NULL, credential_encrypted TEXT NOT NULL, last_query_at TEXT NOT NULL, created_at TEXT NOT NULL, host_id TEXT NOT NULL DEFAULT 'local', UNIQUE(database_id,name));
@@ -247,6 +412,15 @@ def initialize_schema(c: Conn):
     )
     if "host_id" not in columns:
         c.execute("ALTER TABLE branches ADD COLUMN host_id TEXT NOT NULL DEFAULT 'local'")
+    tenant_columns = (
+        [row["column_name"] for row in c.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name='tenants'"
+        ).fetchall()]
+        if c.postgres
+        else [row["name"] for row in c.execute("PRAGMA table_info(tenants)").fetchall()]
+    )
+    if "origin" not in tenant_columns:
+        c.execute("ALTER TABLE tenants ADD COLUMN origin TEXT NOT NULL DEFAULT 'local'")
     replica_columns = (
         [row["column_name"] for row in c.execute(
             "SELECT column_name FROM information_schema.columns WHERE table_name='replicas'"
@@ -1784,14 +1958,109 @@ def require_admin(x_admin_key: str | None = Header(default=None, alias="X-Admin-
         raise HTTPException(401, "admin authentication required")
 
 
-def tenant_auth(tid: str, x_api_key: str | None = Header(default=None, alias="X-API-Key"), authorization: str | None = Header(default=None)):
-    key = x_api_key or (authorization or "").removeprefix("Bearer ").strip()
+def _required_database_scope(method: str) -> str:
+    return "database:read" if method.upper() == "GET" else "database:write"
+
+
+def _key_from_headers(x_api_key: str | None, authorization: str | None) -> str:
+    return x_api_key or (authorization or "").removeprefix("Bearer ").strip()
+
+
+def _mosaic_tenant(c: Conn, identity: dict, *, create: bool = True):
+    organization_id = identity["organization_id"]
+    mapping = c.execute(
+        "SELECT t.* FROM mosaic_organization_tenants m "
+        "JOIN tenants t ON t.id=m.tenant_id WHERE m.organization_id=?",
+        (organization_id,),
+    ).fetchone()
+    if mapping:
+        return mapping
+    if not create:
+        raise HTTPException(401, "Mosaic identity is not mapped to a tenant")
+    tenant_id = token("ten_")
+    created = now()
+    tenant_name = f"Mosaic workspace {organization_id[:12]}"
+    try:
+        c.execute(
+            "INSERT INTO tenants(id,name,plan,api_key_hash,status,created_at,origin) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (tenant_id, tenant_name, "shared", "", "active", created, "sandbox"),
+        )
+        c.execute(
+            "INSERT INTO mosaic_organization_tenants(organization_id,tenant_id,created_at) "
+            "VALUES(?,?,?)",
+            (organization_id, tenant_id, created),
+        )
+        audit(c, tenant_id, "mosaic_tenant.provisioned", {
+            "organization_id": organization_id,
+            "origin": "sandbox",
+        }, actor="mosaic")
+        c.commit()
+    except Exception as exc:
+        if not is_unique_violation(exc):
+            raise
+        c.rollback()
+        mapping = c.execute(
+            "SELECT t.* FROM mosaic_organization_tenants m "
+            "JOIN tenants t ON t.id=m.tenant_id WHERE m.organization_id=?",
+            (organization_id,),
+        ).fetchone()
+        if not mapping:
+            raise
+        return mapping
+    return c.execute("SELECT * FROM tenants WHERE id=?", (tenant_id,)).fetchone()
+
+
+def authenticate_api_key(
+    c: Conn,
+    key: str,
+    *,
+    tid: str | None = None,
+    method: str = "GET",
+    required_scope: str | None = None,
+    provision: bool = True,
+):
+    url = os.getenv("MOSAIC_INTROSPECTION_URL", MOSAIC_INTROSPECTION_URL)
+    if key.startswith("msk_live_") and url:
+        identity = introspect_mosaic_key(key)
+        scope = required_scope or _required_database_scope(method)
+        if scope not in identity["scopes"]:
+            raise HTTPException(403, f"required scope {scope}")
+        tenant = _mosaic_tenant(c, identity, create=provision)
+        if not tenant or tenant["status"] != "active":
+            raise HTTPException(401, "invalid tenant API key")
+        if tid is not None and tenant["id"] != tid:
+            raise HTTPException(401, "invalid tenant API key")
+        check_rate_limit(tenant["id"])
+        return tenant, identity
+    if tid is None:
+        tenant = c.execute(
+            "SELECT * FROM tenants WHERE api_key_hash=? AND status='active'",
+            (digest(key),),
+        ).fetchone()
+    else:
+        tenant = c.execute(
+            "SELECT * FROM tenants WHERE id=? AND status='active'",
+            (tid,),
+        ).fetchone()
+        if not tenant or not key or not secrets.compare_digest(tenant["api_key_hash"], digest(key)):
+            raise HTTPException(401, "invalid tenant API key")
+    if not tenant:
+        raise HTTPException(401, "invalid tenant API key")
+    check_rate_limit(tenant["id"])
+    return tenant, None
+
+
+def tenant_auth(
+    tid: str,
+    request: Request,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    authorization: str | None = Header(default=None),
+):
+    key = _key_from_headers(x_api_key, authorization)
     c = db()
     try:
-        row = c.execute("SELECT * FROM tenants WHERE id=? AND status='active'", (tid,)).fetchone()
-        if not row or not key or not secrets.compare_digest(row["api_key_hash"], digest(key)):
-            raise HTTPException(401, "invalid tenant API key")
-        check_rate_limit(tid)
+        row, _ = authenticate_api_key(c, key, tid=tid, method=request.method)
         return row
     finally:
         c.close()
@@ -2308,13 +2577,29 @@ def mcp(payload: dict, request: Request, response: Response, x_api_key: str | No
         client_ip = public_signup_client_ip(request)
         check_rate_limit(f"public-mcp-ip:{client_ip}", PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS)
         return {"jsonrpc": "2.0", "id": payload.get("id"), "result": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "mosaic-database", "version": "0.1.0"}}}
-    key = x_api_key or (authorization or "").removeprefix("Bearer ").strip()
+    key = _key_from_headers(x_api_key, authorization)
     c = db()
     try:
-        tenant = c.execute("SELECT * FROM tenants WHERE api_key_hash=? AND status='active'", (digest(key),)).fetchone()
-        if not tenant:
-            raise HTTPException(401, "valid tenant API key required")
-        check_rate_limit(tenant["id"])
+        mosaic = key.startswith("msk_live_") and os.getenv(
+            "MOSAIC_INTROSPECTION_URL", MOSAIC_INTROSPECTION_URL
+        )
+        if mosaic:
+            tool_name = payload.get("params", {}).get("name")
+            read_tools = {"inspect_schema", "get_deploy", "list_branches"}
+            required_scope = "database:read" if (
+                payload.get("method") == "tools/list" or tool_name in read_tools
+            ) else "database:write"
+            tenant, _ = authenticate_api_key(
+                c,
+                key,
+                method="GET" if required_scope == "database:read" else "POST",
+                required_scope=required_scope,
+            )
+        else:
+            tenant = c.execute("SELECT * FROM tenants WHERE api_key_hash=? AND status='active'", (digest(key),)).fetchone()
+            if not tenant:
+                raise HTTPException(401, "valid tenant API key required")
+            check_rate_limit(tenant["id"])
         if payload.get("method") == "tools/list":
             return {"jsonrpc": "2.0", "id": payload.get("id"), "result": {"tools": MCP_TOOLS}}
         args, name = payload.get("params", {}).get("arguments", {}), payload.get("params", {}).get("name")
@@ -2351,6 +2636,34 @@ def mcp(payload: dict, request: Request, response: Response, x_api_key: str | No
         c.close()
 
 
+@app.post("/v1/tenants/discover")
+def discover_tenant(
+    request: Request,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    authorization: str | None = Header(default=None),
+):
+    key = _key_from_headers(x_api_key, authorization)
+    c = db()
+    try:
+        mosaic = key.startswith("msk_live_") and os.getenv(
+            "MOSAIC_INTROSPECTION_URL", MOSAIC_INTROSPECTION_URL
+        )
+        tenant, identity = authenticate_api_key(c, key, method=request.method)
+        if mosaic and identity:
+            check_rate_limit(
+                f"mosaic-discovery-org:{identity['organization_id']}",
+                PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS,
+            )
+        return {
+            "tenant_id": tenant["id"],
+            "tenant_name": tenant["name"],
+            "plan": tenant["plan"],
+            "origin": tenant["origin"],
+        }
+    finally:
+        c.close()
+
+
 @app.post("/v1/tenants", dependencies=[Depends(require_admin)])
 def create_tenant(payload: TenantCreate):
     if payload.plan not in PLANS:
@@ -2358,7 +2671,11 @@ def create_tenant(payload: TenantCreate):
     tid, key = token("ten_"), token("mdb_live_")
     c = db()
     try:
-        c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", (tid, payload.name, payload.plan, digest(key), "active", now()))
+        c.execute(
+            "INSERT INTO tenants(id,name,plan,api_key_hash,status,created_at,origin) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (tid, payload.name, payload.plan, digest(key), "active", now(), "local"),
+        )
         audit(c, tid, "tenant.created", {"plan": payload.plan})
         c.commit()
         return {"tenant_id": tid, "api_key": key, "plan": payload.plan}
@@ -2391,8 +2708,9 @@ def public_signup(payload: PublicSignupCreate, request: Request):
             effective_name = tenant_name
             try:
                 c.execute(
-                    "INSERT INTO tenants VALUES(?,?,?,?,?,?)",
-                    (tenant_id, effective_name, "shared", digest(api_key), "active", created),
+                    "INSERT INTO tenants(id,name,plan,api_key_hash,status,created_at,origin) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (tenant_id, effective_name, "shared", digest(api_key), "active", created, "local"),
                 )
                 c.execute(
                     "INSERT INTO public_signups VALUES(?,?,?,?,?,?)",
