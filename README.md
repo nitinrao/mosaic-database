@@ -11,12 +11,15 @@ available for development and CI.
 Customers may also authenticate with a Mosaic-issued `msk_live_…` key. The
 control plane forwards that key to the Sandbox introspection endpoint, maps its
 organization to a local shared tenant on first use, and requires
-`database:read` for reads or `database:write` for mutations. Call
-`POST /v1/tenants/discover` with the Mosaic key to obtain the mapped tenant ID.
+`database:read` for reads (including discovery) or `database:write` for
+mutations. Call `POST /v1/tenants/discover` with the Mosaic key to obtain the
+mapped tenant ID.
 Sandbox availability is therefore part of the availability of new Mosaic-key
 credentials; revocation propagates within a few seconds, with a bounded stale
 cache window of up to 60 seconds during a Sandbox outage. Existing
-`mdb_live_…` local-ledger keys remain supported unchanged.
+`mdb_live_…` local-ledger keys remain supported unchanged. Sandbox-origin
+tenants have no local key lifecycle: their credential must be revoked in
+Sandbox, and they cannot mint or revoke an `mdb_live_…` key.
 
 This is deliberately single-primary. V0 has no HA, no PITR, and no DR promise.
 DDL is not accepted by the query endpoint; schema changes belong to deploy

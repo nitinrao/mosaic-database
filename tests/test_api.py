@@ -378,6 +378,35 @@ def test_auth_limits_and_key_rotation(client):
     assert client.get(f"/v1/tenants/{tid}/usage", headers={"X-API-Key": rotated}).status_code == 200
 
 
+def test_sandbox_tenant_rejects_local_key_lifecycle_but_local_rotation_works(client, monkeypatch):
+    monkeypatch.setattr(main, "MOSAIC_INTROSPECTION_URL", "https://sandbox.test/v1/introspect")
+    mosaic_urlopen(monkeypatch, [FakeIntrospectionResponse(200, {
+        "organization_id": "org-managed",
+        "scopes": ["database:read", "database:write"],
+        "resource_profile": "standard",
+        "status": "active",
+    })])
+    discovered = client.post(
+        "/v1/tenants/discover",
+        headers={"Authorization": "Bearer msk_live_managed"},
+    ).json()
+    tid = discovered["tenant_id"]
+    headers = {"Authorization": "Bearer msk_live_managed"}
+    for method in ("post", "delete"):
+        response = getattr(client, method)(
+            f"/v1/tenants/{tid}/api-key",
+            headers=headers,
+        )
+        assert response.status_code == 409
+        assert "managed in Sandbox" in response.json()["detail"]
+    local = tenant(client)
+    rotated = client.post(
+        f"/v1/tenants/{local['tenant_id']}/api-key",
+        headers={"X-API-Key": local["api_key"]},
+    )
+    assert rotated.status_code == 200
+
+
 def request_with_client(client_ip, forwarded_ip=None):
     headers = []
     if forwarded_ip:
@@ -516,6 +545,73 @@ def test_mosaic_key_mapping_mismatch_is_refused(client, monkeypatch):
     assert owner["tenant_id"] != other["tenant_id"]
 
 
+def test_mosaic_tenant_path_does_not_provision_before_ownership_check(client, monkeypatch):
+    monkeypatch.setattr(main, "MOSAIC_INTROSPECTION_URL", "https://sandbox.test/v1/introspect")
+    calls = mosaic_urlopen(monkeypatch, [FakeIntrospectionResponse(200, {
+        "organization_id": "org-unmapped",
+        "scopes": ["database:read"],
+        "resource_profile": "standard",
+        "status": "active",
+    })])
+    response = client.get(
+        "/v1/tenants/ten-not-owned/databases",
+        headers={"Authorization": "Bearer msk_live_unmapped"},
+    )
+    assert response.status_code == 401
+    assert len(calls) == 1
+    c = main.db()
+    try:
+        assert c.execute("SELECT COUNT(*) AS n FROM tenants").fetchone()["n"] == 0
+        assert c.execute(
+            "SELECT COUNT(*) AS n FROM mosaic_organization_tenants",
+        ).fetchone()["n"] == 0
+        assert c.execute(
+            "SELECT COUNT(*) AS n FROM audit_log",
+        ).fetchone()["n"] == 0
+    finally:
+        c.close()
+
+
+def test_mosaic_read_scope_can_discover_tenant(client, monkeypatch):
+    monkeypatch.setattr(main, "MOSAIC_INTROSPECTION_URL", "https://sandbox.test/v1/introspect")
+    mosaic_urlopen(monkeypatch, [FakeIntrospectionResponse(200, {
+        "organization_id": "org-read-discovery",
+        "scopes": ["database:read"],
+        "resource_profile": "standard",
+        "status": "active",
+    })])
+    response = client.post(
+        "/v1/tenants/discover",
+        headers={"Authorization": "Bearer msk_live_read_discovery"},
+    )
+    assert response.status_code == 200
+    assert response.json()["origin"] == "sandbox"
+
+
+def test_discovery_rate_limits_anonymous_attempts_before_introspection(client, monkeypatch):
+    monkeypatch.setattr(main, "MOSAIC_INTROSPECTION_URL", "https://sandbox.test/v1/introspect")
+    calls = mosaic_urlopen(monkeypatch, [
+        urllib.error.HTTPError(
+            "https://sandbox.test/v1/introspect",
+            401,
+            "unauthorized",
+            {},
+            None,
+        )
+        for _ in range(main.PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS)
+    ])
+    responses = [
+        client.post(
+            "/v1/tenants/discover",
+            headers={"Authorization": f"Bearer msk_live_junk_{index}"},
+        )
+        for index in range(main.PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS + 1)
+    ]
+    assert [response.status_code for response in responses[:-1]] == [401] * main.PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS
+    assert responses[-1].status_code == 429
+    assert len(calls) == main.PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS
+
+
 @pytest.mark.parametrize(
     ("identity", "expected_status"),
     [
@@ -644,6 +740,11 @@ def test_mcp_accepts_mosaic_key(client, monkeypatch):
         "resource_profile": "standard",
         "status": "active",
     })])
+    discovered = client.post(
+        "/v1/tenants/discover",
+        headers={"Authorization": "Bearer msk_live_mcp"},
+    )
+    assert discovered.status_code == 200
     response = client.post(
         "/mcp",
         headers={"Authorization": "Bearer msk_live_mcp"},

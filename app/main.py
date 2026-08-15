@@ -2060,7 +2060,7 @@ def tenant_auth(
     key = _key_from_headers(x_api_key, authorization)
     c = db()
     try:
-        row, _ = authenticate_api_key(c, key, tid=tid, method=request.method)
+        row, _ = authenticate_api_key(c, key, tid=tid, method=request.method, provision=False)
         return row
     finally:
         c.close()
@@ -2594,6 +2594,7 @@ def mcp(payload: dict, request: Request, response: Response, x_api_key: str | No
                 key,
                 method="GET" if required_scope == "database:read" else "POST",
                 required_scope=required_scope,
+                provision=False,
             )
         else:
             tenant = c.execute("SELECT * FROM tenants WHERE api_key_hash=? AND status='active'", (digest(key),)).fetchone()
@@ -2643,12 +2644,19 @@ def discover_tenant(
     authorization: str | None = Header(default=None),
 ):
     key = _key_from_headers(x_api_key, authorization)
+    client_ip = public_signup_client_ip(request)
+    check_rate_limit(f"public-signup-ip:{client_ip}", PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS)
     c = db()
     try:
         mosaic = key.startswith("msk_live_") and os.getenv(
             "MOSAIC_INTROSPECTION_URL", MOSAIC_INTROSPECTION_URL
         )
-        tenant, identity = authenticate_api_key(c, key, method=request.method)
+        tenant, identity = authenticate_api_key(
+            c,
+            key,
+            method=request.method,
+            required_scope="database:read",
+        )
         if mosaic and identity:
             check_rate_limit(
                 f"mosaic-discovery-org:{identity['organization_id']}",
@@ -3030,6 +3038,11 @@ def _promote_database_locked(database_id: str, payload: PromotionRequest):
 
 @app.post("/v1/tenants/{tid}/api-key")
 def rotate_key(tid: str, tenant=Depends(tenant_auth)):
+    if tenant["origin"] == "sandbox":
+        raise HTTPException(
+            409,
+            "credential is managed in Sandbox and must be revoked there",
+        )
     key = token("mdb_live_")
     c = db()
     try:
@@ -3043,6 +3056,11 @@ def rotate_key(tid: str, tenant=Depends(tenant_auth)):
 
 @app.delete("/v1/tenants/{tid}/api-key")
 def revoke_key(tid: str, tenant=Depends(tenant_auth)):
+    if tenant["origin"] == "sandbox":
+        raise HTTPException(
+            409,
+            "credential is managed in Sandbox and must be revoked there",
+        )
     c = db()
     try:
         c.execute("UPDATE tenants SET api_key_hash='' WHERE id=?", (tid,))

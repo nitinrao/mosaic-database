@@ -154,10 +154,15 @@ export default function DocsPage() {
             </p>
             <CodeBlock value={mosaicKey} />
             <p>
-              Mosaic-key reads require <code>database:read</code>; every non-GET request, including{" "}
+              Mosaic-key reads, including discovery, require <code>database:read</code>; every non-GET request, including{" "}
               <code>/query</code>, requires <code>database:write</code>. Sandbox availability becomes this
               service&apos;s availability for new Mosaic-key credentials. Revocation propagates within a few
               seconds, while a warm identity may be served for up to 60 seconds during a Sandbox outage.
+            </p>
+            <p>
+              Tenants provisioned from a Mosaic organization do not have a local <code>mdb_live_…</code> key.
+              Their credential lifecycle is managed by Sandbox, so revoke it there instead of rotating or
+              revoking a local database key.
             </p>
           </section>
 
