@@ -352,7 +352,7 @@ def test_standby_build_argv(tmp_path, monkeypatch):
     started = threading.Event()
     release = threading.Event()
 
-    def run(argv):
+    def run(argv, env=None):
         calls.append(argv)
         if argv[0] == main.pg_bin("pg_basebackup"):
             target.mkdir(parents=True, exist_ok=True)
@@ -411,7 +411,7 @@ def test_standby_build_stops_before_removing_target(tmp_path, monkeypatch):
     (target / "postmaster.pid").write_text("123\n")
     calls = []
 
-    def run(argv):
+    def run(argv, env=None):
         calls.append(argv)
         if argv[-1] == "status":
             raise RuntimeError("stale postmaster")
@@ -439,6 +439,67 @@ def test_standby_build_stops_before_removing_target(tmp_path, monkeypatch):
     ]
     assert calls[2][0] == main.pg_bin("pg_basebackup")
     assert not target.exists()
+
+
+def test_standby_build_does_not_remove_live_target_after_failed_stop(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
+    target.mkdir()
+    (target / "postmaster.pid").write_text("123\n")
+    calls = []
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[-1] == "status":
+            raise RuntimeError("standby status unavailable")
+        if argv[-3:] == ["-m", "immediate", "stop"]:
+            raise RuntimeError("permission denied")
+
+    monkeypatch.setattr(main, "alive", lambda pid: pid == 123)
+    agent = main.NodeAgent(run)
+    assert agent.handle("build_standby", {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "local",
+        "primary_address": "127.0.0.1",
+        "primary_port": 55432,
+        "replication_user": "mosaic_repl_db",
+        "replication_password": "secret",
+    }) == {"status": "building"}
+    for _ in range(100):
+        result = agent.handle("inspect_standby", {"target_path": str(target)})
+        if result["status"] == "failed":
+            break
+        time.sleep(0.01)
+    assert result["status"] == "failed"
+    assert target.exists()
+    assert (target / "postmaster.pid").exists()
+    assert not any(call[0] == main.pg_bin("pg_basebackup") for call in calls)
+
+
+def test_copy_clone_passes_password_per_command_without_mutating_environment(tmp_path, monkeypatch):
+    parent = tmp_path / "parent"
+    target = tmp_path / "target"
+    parent.mkdir()
+    calls = []
+
+    monkeypatch.delenv("PGPASSWORD", raising=False)
+    monkeypatch.setattr(main, "_checkpoint", lambda *args: None)
+
+    def run(argv, env=None):
+        calls.append((argv, env))
+        assert os.environ.get("PGPASSWORD") is None
+
+    main.CopyBranchEngine(run).clone(
+        parent,
+        target,
+        parent_port=55432,
+        parent_password="parent-secret",
+    )
+    assert calls[0][1] == {"PGPASSWORD": "parent-secret"}
+    assert os.environ.get("PGPASSWORD") is None
 
 
 def test_replica_build_failure_does_not_downgrade_ready_sibling(client, monkeypatch):
@@ -660,19 +721,27 @@ def test_removed_replica_host_lag_sample_is_reported(client, monkeypatch):
         "INSERT INTO replication_credentials VALUES(?,?,?,?)",
         (database["id"], "mosaic_repl_removed", main.cipher().encrypt(b"repl").decode(), main.now()),
     )
-    c.execute(
-        "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        ("rep_removed", database["id"], primary["id"], "sv2", "/standby", 55433, "ready", 0, main.now(), main.now(), "slot_removed"),
-    )
+    for replica_id, host_id, slot_name in (
+        ("rep_removed", "sv2", "slot_removed"),
+        ("rep_healthy", "sv3", "slot_healthy"),
+    ):
+        c.execute(
+            "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (replica_id, database["id"], primary["id"], host_id, f"/{replica_id}", 55433 + (host_id == "sv3"), "ready", 0, main.now(), main.now(), slot_name),
+        )
     c.commit()
     c.close()
-    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local")
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv3")
+    monkeypatch.setenv(
+        "MOSAIC_NODE_PRIVATE_ADDRESSES",
+        "local=10.0.0.1,sv3=10.0.0.3",
+    )
     monkeypatch.setattr(
         main, "node_transport",
         type("Transport", (), {
             "call": lambda self, *args, **kwargs: {
                 "sampled_at": "2025-01-01T00:00:00+00:00",
-                "replicas": [],
+                "replicas": [{"client_addr": "10.0.0.3", "lag_bytes": 42}],
             }
         })(),
     )
@@ -681,7 +750,9 @@ def test_removed_replica_host_lag_sample_is_reported(client, monkeypatch):
         headers={"X-API-Key": created["api_key"]},
     )
     assert response.status_code == 200
-    assert response.json()["lag_sample_error"] == "replication lag sampling failed"
+    replicas = {row["host_id"]: row for row in response.json()["replicas"]}
+    assert replicas["sv3"]["lag_bytes"] == 42
+    assert replicas["sv2"]["last_error"].startswith("replica host unavailable:")
 
 
 def test_plaintext_remote_transport_requires_opt_out(monkeypatch):
@@ -935,7 +1006,7 @@ def test_standby_build_clears_partial_target_before_backup(tmp_path, monkeypatch
     (target / "partial").write_text("stale")
     seen = []
 
-    def run(argv):
+    def run(argv, env=None):
         if argv[0] == main.pg_bin("pg_basebackup"):
             seen.append(target.exists())
             raise RuntimeError("backup failed")
@@ -994,7 +1065,7 @@ def test_prepare_primary_refreshes_pid_after_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(main.supervisor, "start_local", lambda payload: {"status": "running", "pid": 111})
     monkeypatch.setattr(main, "alive", lambda pid: True)
 
-    def run(argv):
+    def run(argv, env=None):
         calls.append(argv)
         if argv[-1] == "restart":
             (primary / "postmaster.pid").write_text("222\n")

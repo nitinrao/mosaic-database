@@ -241,7 +241,11 @@ def cipher() -> Fernet:
     return Fernet(CREDENTIAL_ENCRYPTION_KEY.encode())
 
 
-CommandRunner = Callable[[list[str]], Any]
+CommandRunner = Callable[[list[str], dict[str, str] | None], Any]
+
+
+def command_environment(overlay: dict[str, str] | None = None) -> dict[str, str] | None:
+    return {**os.environ, **overlay} if overlay else None
 
 
 class BranchEngine(Protocol):
@@ -253,7 +257,12 @@ class BranchEngine(Protocol):
 class ZfsBranchEngine:
     def __init__(self, pool: str | None = None, runner: CommandRunner | None = None):
         self.pool = pool or os.getenv("MOSAIC_ZFS_POOL", "rpool/mosaic")
-        self.run = runner or (lambda argv: subprocess.run(argv, check=True, capture_output=True, text=True))
+        self.run = runner or (
+            lambda argv, env=None: subprocess.run(
+                argv, check=True, capture_output=True, text=True,
+                env=command_environment(env),
+            )
+        )
 
     def _dataset(self, path: Path) -> str:
         try:
@@ -282,7 +291,11 @@ class ZfsBranchEngine:
 class CopyBranchEngine:
     """CI engine: pg_basebackup is consistent; cp -a of a running PG dir is not."""
     def __init__(self, runner: CommandRunner | None = None):
-        self.run = runner or (lambda argv: subprocess.run(argv, check=True))
+        self.run = runner or (
+            lambda argv, env=None: subprocess.run(
+                argv, check=True, env=command_environment(env),
+            )
+        )
 
     def create_database(self, path: Path, password: str, port: int, host_id: str = "local"):
         _initdb(path, password, port, self.run, host_id)
@@ -292,16 +305,10 @@ class CopyBranchEngine:
         if parent_port:
             _checkpoint(parent_host_id, parent_port, parent_password)
             argv = [pg_bin("pg_basebackup"), "-D", str(target), "-h", node_address(parent_host_id), "-p", str(parent_port), "-U", "postgres", "-Fp", "-X", "stream", "-R"]
-            old_password = os.environ.get("PGPASSWORD")
-            if parent_password:
-                os.environ["PGPASSWORD"] = parent_password
-            try:
-                self.run(argv)
-            finally:
-                if old_password is None:
-                    os.environ.pop("PGPASSWORD", None)
-                else:
-                    os.environ["PGPASSWORD"] = old_password
+            self.run(
+                argv,
+                env={"PGPASSWORD": parent_password} if parent_password else None,
+            )
         else:
             shutil.copytree(parent, target)
         if target_port is not None:
@@ -508,10 +515,14 @@ class Supervisor:
 
 class NodeAgent:
     def __init__(self, runner: CommandRunner | None = None):
-        self.run = runner or (lambda argv: subprocess.run(argv, check=True, capture_output=True, text=True))
+        self.run = runner or (
+            lambda argv, env=None: subprocess.run(
+                argv, check=True, capture_output=True, text=True,
+                env=command_environment(env),
+            )
+        )
         self._standby_jobs: dict[Path, dict[str, str]] = {}
         self._standby_jobs_lock = threading.Lock()
-        self._standby_env_lock = threading.Lock()
 
     def _standby_status(self, target: Path) -> dict:
         with self._standby_jobs_lock:
@@ -530,14 +541,31 @@ class NodeAgent:
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.exists():
+                postmaster_pid = None
+                pid_file = target / "postmaster.pid"
                 if (target / "postmaster.pid").exists():
+                    try:
+                        postmaster_pid = int(pid_file.read_text().splitlines()[0])
+                    except (OSError, ValueError, IndexError):
+                        raise RuntimeError(
+                            f"cannot remove standby target {target}: "
+                            "postmaster pid cannot be verified"
+                        )
                     try:
                         self.run([
                             pg_bin("pg_ctl"), "-D", str(target),
                             "-m", "immediate", "stop",
                         ])
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        stop_error = exc
+                    else:
+                        stop_error = None
+                    if pid_file.exists() and alive(postmaster_pid):
+                        detail = f"; stop error: {stop_error}" if stop_error else ""
+                        raise RuntimeError(
+                            f"cannot remove standby target {target}: "
+                            f"postmaster pid {postmaster_pid} is still alive{detail}"
+                        )
                 shutil.rmtree(target)
             argv = [
                 pg_bin("pg_basebackup"), "-D", str(target),
@@ -546,16 +574,10 @@ class NodeAgent:
             ]
             if payload.get("replication_slot"):
                 argv.extend(["-S", payload["replication_slot"]])
-            with self._standby_env_lock:
-                old_password = os.environ.get("PGPASSWORD")
-                os.environ["PGPASSWORD"] = payload["replication_password"]
-                try:
-                    self.run(argv)
-                finally:
-                    if old_password is None:
-                        os.environ.pop("PGPASSWORD", None)
-                    else:
-                        os.environ["PGPASSWORD"] = old_password
+            self.run(
+                argv,
+                env={"PGPASSWORD": payload["replication_password"]},
+            )
             _rewrite_postgres_config(
                 target,
                 int(payload["target_port"]),
@@ -960,18 +982,29 @@ def refresh_replica_lag(c: Conn, database_id: str):
         })
     except Exception:
         return {"error": "replication lag sampling failed"}
-    try:
-        by_address = {node_address(row["host_id"]): row for row in c.execute(
-            "SELECT host_id FROM replicas WHERE database_id=?", (database_id,)
-        ).fetchall()}
-    except Exception:
-        return {"error": "replication lag sampling failed"}
+    by_address = {}
+    for row in c.execute(
+        "SELECT id,host_id FROM replicas WHERE database_id=?", (database_id,)
+    ).fetchall():
+        try:
+            by_address[node_address(row["host_id"])] = row
+        except Exception as exc:
+            c.execute(
+                "UPDATE replicas SET last_error=? WHERE id=?",
+                (f"replica host unavailable: {exc}"[:500], row["id"]),
+            )
     for replica in sampled.get("replicas", []):
         row = by_address.get(replica.get("client_addr"))
         if row:
             c.execute(
-                "UPDATE replicas SET lag_bytes=?,lag_sampled_at=? WHERE database_id=? AND host_id=?",
-                (int(replica.get("lag_bytes", 0)), sampled["sampled_at"], database_id, row["host_id"]),
+                "UPDATE replicas SET lag_bytes=?,lag_sampled_at=?,last_error=NULL "
+                "WHERE database_id=? AND host_id=?",
+                (
+                    int(replica.get("lag_bytes", 0)),
+                    sampled["sampled_at"],
+                    database_id,
+                    row["host_id"],
+                ),
             )
     if sampled.get("invalid_slots"):
         placeholders = ",".join("?" for _ in sampled["invalid_slots"])
@@ -1403,7 +1436,7 @@ def replicas_get(tid: str, did: str, tenant=Depends(tenant_auth)):
         database(c, tid, did)
         sampling = refresh_replica_lag(c, did)
         rows = c.execute(
-            "SELECT id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at "
+            "SELECT id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,last_error "
             "FROM replicas WHERE database_id=? ORDER BY host_id",
             (did,),
         ).fetchall()
