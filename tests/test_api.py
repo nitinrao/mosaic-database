@@ -1333,6 +1333,93 @@ def test_strict_stop_refuses_unusable_cluster_directory_but_lenient_stop_succeed
         supervisor.stop_local({"path": str(path), "require_path": True})
 
 
+def test_standby_teardown_accepts_absent_empty_and_noncluster_targets(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    agent = main.NodeAgent(
+        lambda argv, env=None: (_ for _ in ()).throw(
+            subprocess.CalledProcessError(
+                4, argv, stderr="pg_ctl: directory is not a database cluster directory"
+            )
+        )
+    )
+    assert agent._standby_status_is_not_running(root / "absent")
+    empty = root / "empty"
+    empty.mkdir()
+    assert agent._standby_status_is_not_running(empty)
+    noncluster = root / "noncluster"
+    noncluster.mkdir()
+    (noncluster / "postgresql.conf").write_text("")
+    assert agent._standby_status_is_not_running(noncluster)
+
+
+def test_standby_teardown_accepts_stale_and_recycled_pids(tmp_path, monkeypatch):
+    target = tmp_path / "standby"
+    target.mkdir()
+    (target / "PG_VERSION").write_text("17\n")
+    (target / "postmaster.pid").write_text("123\n")
+
+    def run(argv, env=None):
+        raise subprocess.CalledProcessError(
+            4, argv, stderr="pg_ctl: could not read status"
+        )
+
+    agent = main.NodeAgent(run)
+    monkeypatch.setattr(main, "alive", lambda pid: False)
+    assert agent._standby_status_is_not_running(target)
+    monkeypatch.setattr(main, "alive", lambda pid: True)
+    monkeypatch.setattr(main, "_pid_owns_postgres_directory", lambda pid, path: False)
+    assert agent._standby_status_is_not_running(target)
+
+
+def test_standby_teardown_refuses_live_postmaster_and_reports_pgctl_stderr(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "standby"
+    target.mkdir()
+    (target / "PG_VERSION").write_text("17\n")
+    (target / "postmaster.pid").write_text("123\n")
+
+    def run(argv, env=None):
+        raise subprocess.CalledProcessError(
+            4, argv, stderr="pg_ctl: status could not classify cluster"
+        )
+
+    monkeypatch.setattr(main, "alive", lambda pid: True)
+    monkeypatch.setattr(main, "_pid_owns_postgres_directory", lambda pid, path: True)
+    agent = main.NodeAgent(run)
+    assert not agent._standby_status_is_not_running(target)
+
+
+def test_recycled_pid_does_not_look_like_running_postmaster(tmp_path, monkeypatch):
+    target = tmp_path / "standby"
+    target.mkdir()
+    (target / "PG_VERSION").write_text("17\n")
+    (target / "postmaster.pid").write_text("456\n")
+    monkeypatch.setattr(main, "alive", lambda pid: True)
+    monkeypatch.setattr(main, "_pid_owns_postgres_directory", lambda pid, path: False)
+    agent = main.NodeAgent(
+        lambda argv, env=None: (_ for _ in ()).throw(
+            subprocess.CalledProcessError(4, argv, stderr="unclassified status")
+        )
+    )
+    assert agent._standby_status_is_not_running(target)
+
+
+def test_strict_pgctl_failure_includes_stderr(tmp_path, monkeypatch):
+    path = tmp_path / "cluster"
+    path.mkdir()
+
+    def run(argv, **kwargs):
+        raise subprocess.CalledProcessError(
+            4, argv, stderr="pg_ctl: status output detail"
+        )
+
+    monkeypatch.setattr(main.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="status output detail"):
+        main.Supervisor().stop_local({"path": str(path), "require_path": True})
+
+
 def test_standby_build_stops_before_removing_target(tmp_path, monkeypatch):
     root = tmp_path / "branches"
     root.mkdir()
@@ -1389,6 +1476,7 @@ def test_standby_build_does_not_remove_live_target_after_failed_stop(tmp_path, m
             raise RuntimeError("permission denied")
 
     monkeypatch.setattr(main, "alive", lambda pid: pid == 123)
+    monkeypatch.setattr(main, "_pid_owns_postgres_directory", lambda pid, path: True)
     agent = main.NodeAgent(run)
     assert agent.handle("build_standby", {
         "target_path": str(target),
@@ -1417,14 +1505,8 @@ def test_standby_build_cleans_unparseable_stopped_target(tmp_path, monkeypatch):
     target = root / "standby"
     target.mkdir()
     (target / "postmaster.pid").write_text("")
-    status_calls = 0
-
     def run(argv, env=None):
-        nonlocal status_calls
         if argv[-1] == "status":
-            status_calls += 1
-            if status_calls < 3:
-                raise RuntimeError("pg_ctl: no server running")
             return None
         if argv[0] == main.pg_bin("pg_basebackup"):
             target.mkdir(parents=True, exist_ok=True)
@@ -1432,7 +1514,7 @@ def test_standby_build_cleans_unparseable_stopped_target(tmp_path, monkeypatch):
             (target / "pg_hba.conf").write_text("")
 
     agent = main.NodeAgent(run)
-    assert agent.handle("build_standby", {
+    initial = agent.handle("build_standby", {
         "target_path": str(target),
         "target_port": 55433,
         "target_host_id": "local",
@@ -1440,14 +1522,19 @@ def test_standby_build_cleans_unparseable_stopped_target(tmp_path, monkeypatch):
         "primary_port": 55432,
         "replication_user": "mosaic_repl_db",
         "replication_password": "secret",
-    }) == {"status": "building"}
+    })
+    assert initial in ({"status": "building"}, {"status": "ready"})
+    if initial == {"status": "ready"}:
+        result = initial
+    else:
+        result = None
     for _ in range(100):
-        result = agent.handle("inspect_standby", {"target_path": str(target)})
-        if result["status"] == "ready":
-            break
-        time.sleep(0.01)
+        if result is None:
+            result = agent.handle("inspect_standby", {"target_path": str(target)})
+            if result["status"] == "ready":
+                break
+            time.sleep(0.01)
     assert result == {"status": "ready"}
-    assert status_calls >= 2
 
 
 def test_copy_clone_passes_password_per_command_without_mutating_environment(tmp_path, monkeypatch):

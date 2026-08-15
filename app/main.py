@@ -603,12 +603,13 @@ class Supervisor:
                 if require_path:
                     raise RuntimeError(
                         f"cannot verify PostgreSQL cluster at {path}: "
-                        "data directory is not a usable cluster"
+                        f"data directory is not a usable cluster ({_command_error_detail(exc)})"
                     ) from exc
                 return False
             else:
                 raise RuntimeError(
-                    f"cannot verify PostgreSQL cluster at {path} is stopped"
+                    f"cannot verify PostgreSQL cluster at {path} is stopped: "
+                    f"{_command_error_detail(exc)}"
                 ) from exc
 
     def stop_local(self, payload: dict):
@@ -678,28 +679,48 @@ class NodeAgent:
         try:
             self.run([pg_bin("pg_ctl"), "-D", str(target), "status"])
         except Exception as exc:
-            return {"status": "failed", "error": str(exc)}
+            return {"status": "failed", "error": _command_error_detail(exc)}
         return {"status": "ready"}
 
     def _standby_status_is_not_running(self, target: Path) -> bool:
+        if not target.exists():
+            return True
+        if (
+            not (target / "PG_VERSION").exists()
+            and not (target / "postmaster.pid").exists()
+        ):
+            return True
         try:
             self.run([pg_bin("pg_ctl"), "-D", str(target), "status"])
         except Exception as exc:
-            detail = str(exc).lower()
+            detail = _command_error_detail(exc)
+            normalized = detail.lower()
             if isinstance(exc, subprocess.CalledProcessError):
-                detail = " ".join(
-                    part for part in (
-                        exc.stdout or "",
-                        exc.stderr or "",
-                        detail,
-                    ) if part
-                ).lower()
-            if "no server running" in detail or "not running" in detail:
+                if (
+                    "not a database cluster directory" in normalized
+                    or "does not exist" in normalized
+                ):
+                    return True
+            if "no server running" in normalized or "not running" in normalized:
                 return True
-            raise RuntimeError(
-                f"cannot remove standby target {target}: "
-                f"postmaster status could not be verified: {exc}"
-            ) from exc
+            pid = None
+            try:
+                pid = int((target / "postmaster.pid").read_text().splitlines()[0])
+            except FileNotFoundError:
+                return True
+            except (ValueError, IndexError):
+                return True
+            except OSError as read_error:
+                raise RuntimeError(
+                    f"cannot remove standby target {target}: "
+                    f"postmaster status could not be verified: "
+                    f"{_command_error_detail(read_error)}"
+                ) from read_error
+            if not alive(pid):
+                return True
+            if _pid_owns_postgres_directory(pid, target):
+                return False
+            return True
         return False
 
     def _is_in_recovery(self, target: Path, payload: dict) -> bool:
@@ -782,7 +803,10 @@ class NodeAgent:
                     else:
                         stop_error = None
                     if pid_file.exists() and alive(postmaster_pid):
-                        detail = f"; stop error: {stop_error}" if stop_error else ""
+                        detail = (
+                            f"; stop error: {_command_error_detail(stop_error)}"
+                            if stop_error else ""
+                        )
                         raise RuntimeError(
                             f"cannot remove standby target {target}: "
                             f"postmaster pid {postmaster_pid} is still alive{detail}"
@@ -820,7 +844,7 @@ class NodeAgent:
             self.run([pg_bin("pg_ctl"), "-D", str(target), "status"])
             result = {"status": "ready"}
         except Exception as exc:
-            result = {"status": "failed", "error": str(exc)}
+            result = {"status": "failed", "error": _command_error_detail(exc)}
         with self._standby_jobs_lock:
             job = self._standby_jobs.get(target)
             if job and job.get("superseded"):
@@ -1119,6 +1143,37 @@ def redact_error(error: str, sensitive: tuple[str, ...] = ()) -> str:
         if secret:
             error = error.replace(secret, "[REDACTED]")
     return error
+
+
+def _command_error_detail(exc: Exception) -> str:
+    parts = [str(part).strip() for part in (
+        getattr(exc, "stderr", None),
+        getattr(exc, "stdout", None),
+        str(exc),
+    ) if part]
+    return redact_error("; ".join(parts))
+
+
+def _pid_owns_postgres_directory(pid: int, target: Path) -> bool:
+    proc = Path("/proc") / str(pid)
+    try:
+        raw = (proc / "cmdline").read_bytes()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot inspect process {pid} while checking standby target {target}: {exc}"
+        ) from exc
+    args = [arg.decode(errors="replace") for arg in raw.split(b"\0") if arg]
+    resolved = str(target.resolve())
+    for index, arg in enumerate(args):
+        if arg in {"-D", "--pgdata"} and index + 1 < len(args):
+            return str(Path(args[index + 1]).resolve()) == resolved
+        if arg.startswith("-D") and len(arg) > 2:
+            return str(Path(arg[2:]).resolve()) == resolved
+        if arg.startswith("--pgdata="):
+            return str(Path(arg.split("=", 1)[1]).resolve()) == resolved
+    return False
 
 
 def _retry_replica(c: Conn, replica, exc: Exception, sensitive: tuple[str, ...] = ()):
