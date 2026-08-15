@@ -192,6 +192,45 @@ def test_unknown_branch_host_does_not_resolve_to_loopback(monkeypatch):
         main.node_address("mch-sv2")
 
 
+def test_single_explicit_node_uses_in_process_identity(client, monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "sv1")
+    monkeypatch.delenv("MOSAIC_NODE_ID", raising=False)
+    created = tenant(client)
+    database = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "sv1-db"},
+    )
+    assert database.status_code == 200
+    assert main.current_node_id() == "sv1"
+    did = database.json()["id"]
+    branch = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{did}/branches",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "feature"},
+    )
+    assert branch.status_code == 200
+    assert client.delete(
+        f"/v1/tenants/{created['tenant_id']}/databases/{did}/branches/{branch.json()['id']}",
+        headers={"X-API-Key": created["api_key"]},
+    ).status_code == 200
+
+
+def test_invalid_node_identity_is_rejected_at_startup(monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "sv1,sv2")
+    monkeypatch.setenv("MOSAIC_NODE_ID", "stale")
+    with pytest.raises(RuntimeError, match="not present in MOSAIC_NODE_HOSTS"):
+        with TestClient(main.app):
+            pass
+
+
+def test_stale_node_id_never_dispatches_locally(monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "sv1")
+    monkeypatch.delenv("MOSAIC_NODE_ID", raising=False)
+    with pytest.raises(RuntimeError, match="unknown database node"):
+        main.NodeTransport(main.NodeAgent()).call("stale", "inspect", {})
+
+
 def test_hba_managed_block_is_idempotent(tmp_path, monkeypatch):
     monkeypatch.setenv("MOSAIC_NODE_HOSTS", "sv1,sv2")
     monkeypatch.setenv("MOSAIC_NODE_PRIVATE_ADDRESSES", "sv1=10.0.0.1,sv2=10.0.0.2")
@@ -437,7 +476,7 @@ def test_replica_lag_surfaces_through_api(client, monkeypatch):
 
 
 def test_plaintext_remote_transport_requires_opt_out(monkeypatch):
-    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "sv2=http://10.0.0.2:8000")
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2=http://10.0.0.2:8000")
     monkeypatch.setattr(main, "ALLOW_PLAINTEXT_NODE_AGENT", False)
     with pytest.raises(RuntimeError, match="plaintext node-agent transport"):
         main.NodeTransport(main.NodeAgent()).call("sv2", "inspect", {})

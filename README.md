@@ -35,6 +35,10 @@ Host-aware lifecycle management is available for multi-host deployments.
 Configure `MOSAIC_NODE_HOSTS`, `MOSAIC_NODE_PRIVATE_ADDRESSES`, and the shared
 `MOSAIC_NODE_AGENT_TOKEN`; private addresses are required explicitly and
 PostgreSQL never binds to `0.0.0.0`. A single `local` node remains the default.
+`MOSAIC_NODE_ID` identifies which configured node this process runs on. When
+`MOSAIC_NODE_HOSTS` contains exactly one node and `MOSAIC_NODE_ID` is unset, it
+defaults to that sole node. In a multi-node deployment, every host must set
+`MOSAIC_NODE_ID` to its own ID from `MOSAIC_NODE_HOSTS`.
 Branch placement is recorded in the ledger, with database placement
 deterministically spread across configured nodes and child branches staying
 with their parent.
