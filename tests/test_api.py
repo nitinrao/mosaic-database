@@ -370,7 +370,10 @@ def test_reaper_ignores_standbys(tmp_path, monkeypatch):
     c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_r", "ten_r", "r", str(tmp_path), "ready", main.now()))
     old = "2000-01-01T00:00:00+00:00"
     c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("br_r", "db_r", "main", None, str(tmp_path / "main"), 55432, 123, "running", "x", old, old, "local"))
-    c.execute("INSERT INTO replicas VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("rep_r", "db_r", "br_r", "sv2", str(tmp_path / "standby"), 55433, "ready", 99, old, old, "slot_r"))
+    c.execute(
+        "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("rep_r", "db_r", "br_r", "sv2", str(tmp_path / "standby"), 55433, "ready", 99, old, old, "slot_r"),
+    )
     c.commit()
     calls = []
 
@@ -401,7 +404,7 @@ def test_replica_lag_surfaces_through_api(client, monkeypatch):
         (database["id"], "mosaic_repl_lag", main.cipher().encrypt(b"repl").decode(), main.now()),
     )
     c.execute(
-        "INSERT INTO replicas VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         ("rep_lag", database["id"], main_row["id"], "sv2", "/standby", 55433, "ready", None, None, main.now(), "slot_lag"),
     )
     c.commit()
@@ -429,6 +432,133 @@ def test_plaintext_remote_transport_requires_opt_out(monkeypatch):
     monkeypatch.setattr(main, "ALLOW_PLAINTEXT_NODE_AGENT", False)
     with pytest.raises(RuntimeError, match="plaintext node-agent transport"):
         main.NodeTransport(main.NodeAgent()).call("sv2", "inspect", {})
+
+
+def test_peer_down_replica_is_retryable_without_blocking_database(client, monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2,sv3")
+    monkeypatch.setenv(
+        "MOSAIC_NODE_PRIVATE_ADDRESSES",
+        "local=10.0.0.1,sv2=10.0.0.2,sv3=10.0.0.3",
+    )
+    created = tenant(client)
+
+    class FakeTransport:
+        def call(self, host_id, operation, payload):
+            if operation == "provision":
+                return {"status": "provisioned"}
+            if operation == "prepare_primary":
+                return {"status": "running", "pid": 123}
+            raise RuntimeError("peer unavailable")
+
+    monkeypatch.setattr(main, "node_transport", FakeTransport())
+    response = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "degraded"},
+    )
+    assert response.status_code == 200
+    database_id = response.json()["id"]
+    c = main.db()
+    rows = c.execute(
+        "SELECT status,last_error FROM replicas WHERE database_id=?",
+        (database_id,),
+    ).fetchall()
+    assert rows and all(row["status"] == "pending" for row in rows)
+    c.close()
+    main.reconcile_replicas(main.db())
+    c = main.db()
+    rows = c.execute(
+        "SELECT status,last_error FROM replicas WHERE database_id=?",
+        (database_id,),
+    ).fetchall()
+    assert rows and all(row["status"] == "retryable" for row in rows)
+    assert all(row["last_error"] == "peer unavailable" for row in rows)
+    assert c.execute("SELECT status FROM databases WHERE id=?", (database_id,)).fetchone()["status"] == "ready"
+    c.close()
+
+
+def test_repeated_primary_preparation_is_idempotent(tmp_path, monkeypatch):
+    config = tmp_path / "postgresql.conf"
+    config.write_text("listen_addresses = '127.0.0.1'\n")
+    calls = []
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, query, params=None):
+            calls.append(str(query))
+            if "FROM pg_roles" in str(query):
+                return type("Result", (), {"fetchone": lambda self: {"?column?": 1}})()
+            return self
+
+        def fetchall(self):
+            return []
+
+        def commit(self):
+            return None
+
+    class FakePsycopg:
+        def connect(self, **kwargs):
+            return FakeConnection()
+
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    monkeypatch.setattr(main.supervisor, "start_local", lambda payload: {"status": "running", "pid": 123})
+    monkeypatch.setattr(main, "alive", lambda pid: False)
+    agent = main.NodeAgent(lambda argv: calls.append(" ".join(argv)))
+    payload = {
+        "path": str(tmp_path),
+        "port": 55432,
+        "host_id": "local",
+        "branch_id": "br",
+        "pid": None,
+        "status": "stopped",
+        "postgres_password": "postgres",
+        "replication_user": "mosaic_repl",
+        "replication_password": "secret",
+        "replication_addresses": [],
+        "replication_slots": [],
+    }
+    agent.handle("prepare_primary", payload)
+    agent.handle("prepare_primary", payload)
+    assert sum("ALTER ROLE" in query for query in calls) == 2
+    assert not any("CREATE ROLE" in query for query in calls)
+
+
+def test_failed_lag_sample_is_visible(client, monkeypatch):
+    created = tenant(client)
+    database = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "lag-failure"},
+    ).json()
+    c = main.db()
+    main_row = c.execute("SELECT * FROM branches WHERE database_id=?", (database["id"],)).fetchone()
+    c.execute(
+        "INSERT INTO replication_credentials VALUES(?,?,?,?)",
+        (database["id"], "mosaic_repl_lag_failure", main.cipher().encrypt(b"repl").decode(), main.now()),
+    )
+    c.execute(
+        "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("rep_lag_failure", database["id"], main_row["id"], "sv2", "/standby", 55433, "ready", 0, main.now(), main.now(), "slot_lag_failure"),
+    )
+    c.commit()
+    c.close()
+
+    class FailedTransport:
+        def call(self, *args, **kwargs):
+            raise RuntimeError("primary unavailable")
+
+    monkeypatch.setattr(main, "node_transport", FailedTransport())
+    response = client.get(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/replicas",
+        headers={"X-API-Key": created["api_key"]},
+    )
+    assert response.status_code == 200
+    assert response.json()["lag_sample_error"] == "replication lag sampling failed"
 
 
 def test_existing_ledger_migrates_branch_host(tmp_path):
