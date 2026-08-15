@@ -655,6 +655,8 @@ def test_standby_build_argv(tmp_path, monkeypatch):
             (target / "pg_hba.conf").write_text("")
             started.set()
             release.wait(timeout=2)
+        elif argv[0] == main.pg_bin("pg_ctl") and argv[-1] == "start":
+            (target / "postmaster.pid").write_text("123\n")
 
     agent = main.NodeAgent(run)
     assert agent.handle("build_standby", {
@@ -728,6 +730,21 @@ def test_explicit_standby_rebuild_bypasses_ready_cache(tmp_path, monkeypatch):
     assert agent.handle("build_standby", payload) == {"status": "building"}
     assert rebuilt.wait(timeout=2)
     assert sum(call[0] == main.pg_bin("pg_basebackup") for call in calls) == 1
+
+
+def test_ready_standby_status_probes_cluster_instead_of_using_build_cache(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
+    target.mkdir()
+    agent = main.NodeAgent(lambda argv, env=None: None)
+    agent._standby_jobs[target] = {"status": "ready"}
+
+    assert agent.handle("inspect_standby", {"target_path": str(target)}) == {
+        "status": "failed",
+        "error": "standby postmaster is not running",
+    }
 
 
 def test_forced_standby_rebuild_supersedes_inflight_build(tmp_path, monkeypatch):
