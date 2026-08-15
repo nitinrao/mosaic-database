@@ -46,8 +46,13 @@ dark standby on each other configured node; ephemeral branches are not
 replicated. Replication slots use the bounded
 `MOSAIC_REPLICATION_WAL_RETENTION_BYTES` budget (10 GiB by default), and a
 standby whose slot is invalidated must be rebuilt from a fresh base backup.
+Standby base backups run as asynchronous node-agent jobs. Replica rows move
+through `pending`, `building`, `ready`, and retryable failure states; the
+control plane polls job status rather than holding an HTTP request open.
 Observed lag is exposed as bytes behind the primary WAL replay position with a
 sample timestamp. Standbys use `hot_standby=off` and are never query targets.
+Replica data directories live under the reserved `.replicas` directory beside
+the primary branch, outside the tenant branch namespace.
 Standbys remain dark until a later manual or scripted promotion. There is no
 automatic failover, leader election, or fencing in this scope; losing a host
 loses its ephemeral branches.

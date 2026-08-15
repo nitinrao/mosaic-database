@@ -51,6 +51,7 @@ NODE_AGENT_CA_BUNDLE = os.getenv("MOSAIC_NODE_AGENT_CA_BUNDLE", "")
 ALLOW_PLAINTEXT_NODE_AGENT = os.getenv("MOSAIC_ALLOW_PLAINTEXT_NODE_AGENT", "").lower() == "true"
 REPLICATION_WAL_RETENTION_BYTES = int(os.getenv("MOSAIC_REPLICATION_WAL_RETENTION_BYTES", str(10 * 1024**3)))
 REPLICATION_USER_PREFIX = "mosaic_repl_"
+RESERVED_BRANCH_NAMES = {".replicas", "replicas"}
 PLANS = {
     "shared": {"monthly_cents": 10000, "max_databases": 5, "max_branches": 20, "max_rows": 10000, "max_bytes": 1000000, "statement_timeout_ms": 5000},
     "dedicated": {"monthly_cents": 50000, "max_databases": 20, "max_branches": 100, "max_rows": 100000, "max_bytes": 10000000, "statement_timeout_ms": 30000},
@@ -508,11 +509,94 @@ class Supervisor:
 class NodeAgent:
     def __init__(self, runner: CommandRunner | None = None):
         self.run = runner or (lambda argv: subprocess.run(argv, check=True, capture_output=True, text=True))
+        self._standby_jobs: dict[Path, dict[str, str]] = {}
+        self._standby_jobs_lock = threading.Lock()
+        self._standby_env_lock = threading.Lock()
+
+    def _standby_status(self, target: Path) -> dict:
+        with self._standby_jobs_lock:
+            job = self._standby_jobs.get(target)
+            if job:
+                return dict(job)
+        if not (target / "postmaster.pid").exists():
+            return {"status": "failed", "error": "standby postmaster is not running"}
+        try:
+            self.run([pg_bin("pg_ctl"), "-D", str(target), "status"])
+        except Exception as exc:
+            return {"status": "failed", "error": str(exc)}
+        return {"status": "ready"}
+
+    def _run_standby_build(self, target: Path, payload: dict):
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                if (target / "postmaster.pid").exists():
+                    try:
+                        self.run([
+                            pg_bin("pg_ctl"), "-D", str(target),
+                            "-m", "immediate", "stop",
+                        ])
+                    except Exception:
+                        pass
+                shutil.rmtree(target)
+            argv = [
+                pg_bin("pg_basebackup"), "-D", str(target),
+                "-h", payload["primary_address"], "-p", str(payload["primary_port"]),
+                "-U", payload["replication_user"], "-Fp", "-X", "stream", "-R",
+            ]
+            if payload.get("replication_slot"):
+                argv.extend(["-S", payload["replication_slot"]])
+            with self._standby_env_lock:
+                old_password = os.environ.get("PGPASSWORD")
+                os.environ["PGPASSWORD"] = payload["replication_password"]
+                try:
+                    self.run(argv)
+                finally:
+                    if old_password is None:
+                        os.environ.pop("PGPASSWORD", None)
+                    else:
+                        os.environ["PGPASSWORD"] = old_password
+            _rewrite_postgres_config(
+                target,
+                int(payload["target_port"]),
+                payload["target_host_id"],
+                standby=True,
+            )
+            self.run([
+                pg_bin("pg_ctl"), "-D", str(target),
+                "-l", str(target / "postgres.log"), "start",
+            ])
+            self.run([pg_bin("pg_ctl"), "-D", str(target), "status"])
+            result = {"status": "ready"}
+        except Exception as exc:
+            result = {"status": "failed", "error": str(exc)}
+        with self._standby_jobs_lock:
+            self._standby_jobs[target] = result
+
+    def _start_standby_build(self, target: Path, payload: dict) -> dict:
+        with self._standby_jobs_lock:
+            job = self._standby_jobs.get(target)
+            if job and job["status"] == "building":
+                return {"status": "building"}
+        existing = self._standby_status(target)
+        if existing["status"] == "ready":
+            return existing
+        with self._standby_jobs_lock:
+            job = self._standby_jobs.get(target)
+            if job and job["status"] == "building":
+                return {"status": "building"}
+            self._standby_jobs[target] = {"status": "building"}
+        threading.Thread(
+            target=self._run_standby_build,
+            args=(target, dict(payload)),
+            daemon=True,
+        ).start()
+        return {"status": "building"}
 
     def handle(self, operation: str, payload: dict):
         if operation not in {
             "provision", "clone", "build_standby", "prepare_primary",
-            "inspect_replication", "start", "stop", "inspect", "destroy",
+            "inspect_replication", "inspect_standby", "start", "stop", "inspect", "destroy",
         }:
             raise RuntimeError(f"unknown node operation {operation}")
         root = BRANCH_ROOT.resolve()
@@ -544,37 +628,9 @@ class NodeAgent:
             return {"status": "cloned"}
         if operation == "build_standby":
             target = confined(payload["target_path"], "target_path")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                shutil.rmtree(target)
-            argv = [
-                pg_bin("pg_basebackup"), "-D", str(target),
-                "-h", payload["primary_address"], "-p", str(payload["primary_port"]),
-                "-U", payload["replication_user"], "-Fp", "-X", "stream", "-R",
-            ]
-            if payload.get("replication_slot"):
-                argv.extend(["-S", payload["replication_slot"]])
-            old_password = os.environ.get("PGPASSWORD")
-            os.environ["PGPASSWORD"] = payload["replication_password"]
-            try:
-                self.run(argv)
-            finally:
-                if old_password is None:
-                    os.environ.pop("PGPASSWORD", None)
-                else:
-                    os.environ["PGPASSWORD"] = old_password
-            _rewrite_postgres_config(
-                target,
-                int(payload["target_port"]),
-                payload["target_host_id"],
-                standby=True,
-            )
-            self.run([
-                pg_bin("pg_ctl"), "-D", str(target),
-                "-l", str(target / "postgres.log"), "start",
-            ])
-            self.run([pg_bin("pg_ctl"), "-D", str(target), "status"])
-            return {"status": "ready"}
+            return self._start_standby_build(target, payload)
+        if operation == "inspect_standby":
+            return self._standby_status(confined(payload["target_path"], "target_path"))
         if operation == "prepare_primary":
             if psycopg is None:
                 raise RuntimeError("psycopg is required for replication setup")
@@ -720,8 +776,8 @@ class NodeTransport:
             if base_url.startswith("http://") and not ALLOW_PLAINTEXT_NODE_AGENT:
                 raise RuntimeError("plaintext node-agent transport requires MOSAIC_ALLOW_PLAINTEXT_NODE_AGENT=true")
             context = None
-            if base_url.startswith("https://") and NODE_AGENT_CA_BUNDLE:
-                context = ssl.create_default_context(cafile=NODE_AGENT_CA_BUNDLE)
+            if base_url.startswith("https://"):
+                context = ssl.create_default_context(cafile=NODE_AGENT_CA_BUNDLE or None)
             with urllib.request.urlopen(request, timeout=15, context=context) as response:
                 return json.loads(response.read())
         except (urllib.error.URLError, urllib.error.HTTPError) as exc:
@@ -749,7 +805,7 @@ def create_replicas(c: Conn, database_id: str, main_row, postgres_password: str)
     for node_id in peers:
         replica_id = token("rep_")
         replica_port = supervisor.allocate_port(c)
-        replica_path = Path(main_row["path"]).parent / "replicas" / node_id
+        replica_path = Path(main_row["path"]).parent / ".replicas" / node_id
         c.execute(
             "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (replica_id, database_id, main_row["id"], node_id, str(replica_path), replica_port, "pending", None, None, now(), slots[node_id]),
@@ -778,47 +834,65 @@ def _reconcile_database_replicas(c: Conn, due: list):
         "SELECT host_id,slot_name FROM replicas WHERE database_id=?",
         (primary["database_id"],),
     ).fetchall()
-    try:
-        postgres_password = cipher().decrypt(primary["credential_encrypted"].encode()).decode()
-        replication_password = cipher().decrypt(primary["replication_credential"].encode()).decode()
-        prepared = node_transport.call(primary["primary_host_id"], "prepare_primary", {
-            "branch_id": primary["branch_id"],
-            "path": primary["primary_path"],
-            "port": primary["primary_port"],
-            "pid": primary["primary_pid"],
-            "status": primary["primary_status"],
-            "host_id": primary["primary_host_id"],
-            "postgres_password": postgres_password,
-            "replication_user": primary["username"],
-            "replication_password": replication_password,
-            "replication_addresses": [node_address(row["host_id"]) for row in all_replicas],
-            "replication_slots": [row["slot_name"] for row in all_replicas],
-        })
-        c.execute(
-            "UPDATE branches SET status=?,pid=? WHERE id=?",
-            (prepared["status"], prepared["pid"], primary["branch_id"]),
-        )
-    except (InvalidToken, RuntimeError) as exc:
-        for row in due:
-            _retry_replica(c, row, exc, (postgres_password, replication_password))
-        return
-    for replica in due:
+    pending = [row for row in due if row["status"] in ("pending", "retryable")]
+    if pending:
         try:
-            node_transport.call(replica["host_id"], "build_standby", {
-                "target_path": replica["path"],
-                "target_port": replica["port"],
-                "target_host_id": replica["host_id"],
-                "primary_address": node_address(replica["primary_host_id"]),
-                "primary_port": replica["primary_port"],
+            postgres_password = cipher().decrypt(primary["credential_encrypted"].encode()).decode()
+            replication_password = cipher().decrypt(primary["replication_credential"].encode()).decode()
+            prepared = node_transport.call(primary["primary_host_id"], "prepare_primary", {
+                "branch_id": primary["branch_id"],
+                "path": primary["primary_path"],
+                "port": primary["primary_port"],
+                "pid": primary["primary_pid"],
+                "status": primary["primary_status"],
+                "host_id": primary["primary_host_id"],
+                "postgres_password": postgres_password,
                 "replication_user": primary["username"],
                 "replication_password": replication_password,
-                "replication_slot": replica["slot_name"],
+                "replication_addresses": [node_address(row["host_id"]) for row in all_replicas],
+                "replication_slots": [row["slot_name"] for row in all_replicas],
             })
             c.execute(
-                "UPDATE replicas SET status='ready',next_attempt_at=NULL,last_error=NULL WHERE id=?",
-                (replica["id"],),
+                "UPDATE branches SET status=?,pid=? WHERE id=?",
+                (prepared["status"], prepared["pid"], primary["branch_id"]),
             )
-        except (RuntimeError, OSError) as exc:
+        except Exception as exc:
+            for row in pending:
+                _retry_replica(c, row, exc, (postgres_password, replication_password))
+            return
+    for replica in due:
+        try:
+            if replica["status"] == "building":
+                result = node_transport.call(replica["host_id"], "inspect_standby", {
+                    "target_path": replica["path"],
+                })
+            else:
+                result = node_transport.call(replica["host_id"], "build_standby", {
+                    "target_path": replica["path"],
+                    "target_port": replica["port"],
+                    "target_host_id": replica["host_id"],
+                    "primary_address": node_address(replica["primary_host_id"]),
+                    "primary_port": replica["primary_port"],
+                    "replication_user": primary["username"],
+                    "replication_password": replication_password,
+                    "replication_slot": replica["slot_name"],
+                })
+            status = result.get("status")
+            if status == "ready":
+                c.execute(
+                    "UPDATE replicas SET status='ready',next_attempt_at=NULL,last_error=NULL WHERE id=?",
+                    (replica["id"],),
+                )
+            elif status == "building":
+                c.execute(
+                    "UPDATE replicas SET status='building',next_attempt_at=NULL,last_error=NULL WHERE id=?",
+                    (replica["id"],),
+                )
+            elif status == "failed":
+                raise RuntimeError(result.get("error", "standby build failed"))
+            else:
+                raise RuntimeError(f"unexpected standby status {status!r}")
+        except Exception as exc:
             _retry_replica(c, replica, exc, (postgres_password, replication_password))
 
 
@@ -829,11 +903,11 @@ def reconcile_replicas(c: Conn):
         "b.credential_encrypted, rc.username, rc.credential_encrypted AS replication_credential "
         "FROM replicas r JOIN branches b ON b.id=r.primary_branch_id "
         "JOIN replication_credentials rc ON rc.database_id=r.database_id "
-        "WHERE r.status IN ('pending','retryable')"
+        "WHERE r.status IN ('pending','retryable','building')"
     ).fetchall()
     due = []
     for row in rows:
-        if row["next_attempt_at"]:
+        if row["status"] != "building" and row["next_attempt_at"]:
             if datetime.fromisoformat(row["next_attempt_at"]) > datetime.now(timezone.utc):
                 continue
         due.append(row)
@@ -844,8 +918,25 @@ def reconcile_replicas(c: Conn):
         try:
             _reconcile_database_replicas(c, database_rows)
         except Exception as exc:
+            postgres_password = ""
+            replication_password = ""
+            try:
+                postgres_password = cipher().decrypt(
+                    database_rows[0]["credential_encrypted"].encode()
+                ).decode()
+                replication_password = cipher().decrypt(
+                    database_rows[0]["replication_credential"].encode()
+                ).decode()
+            except Exception:
+                pass
             for row in database_rows:
-                _retry_replica(c, row, exc)
+                current = c.execute(
+                    "SELECT status FROM replicas WHERE id=?", (row["id"],)
+                ).fetchone()
+                if current and current["status"] != "ready":
+                    _retry_replica(
+                        c, row, exc, (postgres_password, replication_password)
+                    )
     c.commit()
 
 
@@ -867,11 +958,14 @@ def refresh_replica_lag(c: Conn, database_id: str):
             "primary_port": main_row["port"],
             "postgres_password": postgres_password,
         })
-    except (InvalidToken, RuntimeError):
+    except Exception:
         return {"error": "replication lag sampling failed"}
-    by_address = {node_address(row["host_id"]): row for row in c.execute(
-        "SELECT host_id FROM replicas WHERE database_id=?", (database_id,)
-    ).fetchall()}
+    try:
+        by_address = {node_address(row["host_id"]): row for row in c.execute(
+            "SELECT host_id FROM replicas WHERE database_id=?", (database_id,)
+        ).fetchall()}
+    except Exception:
+        return {"error": "replication lag sampling failed"}
     for replica in sampled.get("replicas", []):
         row = by_address.get(replica.get("client_addr"))
         if row:
@@ -903,13 +997,7 @@ async def _reaper_loop():
     while True:
         try:
             await asyncio.sleep(background_interval("MOSAIC_BRANCH_REAPER_INTERVAL", 60))
-            c = db()
-            try:
-                reap_branches(c)
-            except Exception:
-                logger.exception("branch reaper sweep failed")
-            finally:
-                c.close()
+            await asyncio.to_thread(_run_reaper_sweep)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -920,17 +1008,31 @@ async def _replication_loop():
     while True:
         try:
             await asyncio.sleep(background_interval("MOSAIC_REPLICATION_RETRY_INTERVAL", 10))
-            c = db()
-            try:
-                reconcile_replicas(c)
-            except Exception:
-                logger.exception("replica reconciliation failed")
-            finally:
-                c.close()
+            await asyncio.to_thread(_run_replication_sweep)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("replication loop iteration failed")
+
+
+def _run_reaper_sweep():
+    c = db()
+    try:
+        reap_branches(c)
+    except Exception:
+        logger.exception("branch reaper sweep failed")
+    finally:
+        c.close()
+
+
+def _run_replication_sweep():
+    c = db()
+    try:
+        reconcile_replicas(c)
+    except Exception:
+        logger.exception("replica reconciliation failed")
+    finally:
+        c.close()
 
 
 def reap_branches(c: Conn) -> int:
@@ -1244,6 +1346,8 @@ def get_database(tid: str, did: str, tenant=Depends(tenant_auth)):
 
 def _create_branch(c: Conn, tid: str, did: str, payload: BranchCreate, tenant):
     parent_db, parent = database(c, tid, did), branch(c, did, payload.parent)
+    if payload.name in RESERVED_BRANCH_NAMES:
+        raise HTTPException(400, "branch name is reserved")
     count = c.execute("SELECT COUNT(*) AS n FROM branches WHERE database_id=?", (did,)).fetchone()
     if count["n"] >= PLANS[tenant["plan"]]["max_branches"]:
         raise HTTPException(403, "branch limit exceeded")
