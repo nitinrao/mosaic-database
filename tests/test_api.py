@@ -284,6 +284,36 @@ def test_reaper_loop_survives_unexpected_sweep_error(tmp_path, monkeypatch):
     assert calls["reap"] == 1
 
 
+def test_reaper_loop_survives_ledger_connection_error(monkeypatch):
+    calls = {"sleep": 0, "db": 0, "reap": 0}
+
+    async def fake_sleep(_):
+        calls["sleep"] += 1
+        if calls["sleep"] > 2:
+            raise asyncio.CancelledError
+
+    class Connection:
+        def close(self):
+            return None
+
+    def fake_db():
+        calls["db"] += 1
+        if calls["db"] == 1:
+            raise RuntimeError("ledger unavailable")
+        return Connection()
+
+    def fake_reap(connection):
+        calls["reap"] += 1
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(main, "db", fake_db)
+    monkeypatch.setattr(main, "reap_branches", fake_reap)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(main._reaper_loop())
+    assert calls["db"] == 2
+    assert calls["reap"] == 1
+
+
 def test_existing_ledger_migrates_branch_host(tmp_path):
     path = tmp_path / "legacy.db"
     raw = main.sqlite3.connect(path)

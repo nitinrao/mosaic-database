@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import asyncio
 import json
+import logging
 import os
 import re
 import secrets
@@ -54,6 +55,7 @@ MCP_TOOLS = [{"name": n, "description": d, "inputSchema": {"type": "object"}} fo
     ("inspect_schema", "Inspect branch schema"), ("query", "Execute one governed statement"),
     ("create_branch", "Create a branch"), ("list_branches", "List branches"))]
 _rate: dict[str, list[float]] = {}
+logger = logging.getLogger(__name__)
 
 
 def now() -> str:
@@ -519,15 +521,19 @@ _branch_mutation_lock = threading.Lock()
 
 async def _reaper_loop():
     while True:
-        await asyncio.sleep(max(1, int(os.getenv("MOSAIC_BRANCH_REAPER_INTERVAL", "60"))))
-        c = db()
         try:
+            await asyncio.sleep(max(1, int(os.getenv("MOSAIC_BRANCH_REAPER_INTERVAL", "60"))))
+            c = db()
             try:
                 reap_branches(c)
             except Exception:
-                pass
-        finally:
-            c.close()
+                logger.exception("branch reaper sweep failed")
+            finally:
+                c.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("branch reaper iteration failed")
 
 
 def reap_branches(c: Conn) -> int:
