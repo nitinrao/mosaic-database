@@ -840,13 +840,41 @@ class NodeAgent:
                     target,
                     is_stopped=self._standby_status_is_not_running,
                 )
+            slot = payload.get("replication_slot")
+            if slot and payload.get("primary_password"):
+                if psycopg is None:
+                    raise RuntimeError("psycopg is required to reset replication slots")
+                with psycopg.connect(
+                    host=payload["primary_address"],
+                    port=payload["primary_port"],
+                    user="postgres",
+                    password=payload["primary_password"],
+                    dbname="postgres",
+                    connect_timeout=5,
+                ) as connection:
+                    existing = connection.execute(
+                        "SELECT 1 FROM pg_replication_slots WHERE slot_name=%s",
+                        (slot,),
+                    ).fetchone()
+                    if existing:
+                        try:
+                            connection.execute(
+                                "SELECT pg_drop_replication_slot(%s)",
+                                (slot,),
+                            )
+                        except Exception as exc:
+                            detail = _command_error_detail(exc).lower()
+                            if "does not exist" not in detail and "undefined object" not in detail:
+                                raise
+                            connection.rollback()
+                    connection.commit()
             argv = [
                 pg_bin("pg_basebackup"), "-D", str(target),
                 "-h", payload["primary_address"], "-p", str(payload["primary_port"]),
                 "-U", payload["replication_user"], "-Fp", "-X", "stream", "-R",
             ]
-            if payload.get("replication_slot"):
-                argv.extend(["-S", payload["replication_slot"]])
+            if slot:
+                argv.extend(["-C", "-S", slot])
             self.run(
                 argv,
                 env={"PGPASSWORD": payload["replication_password"]},
@@ -1010,12 +1038,6 @@ class NodeAgent:
                             psycopg_sql.Identifier(payload["replication_user"]),
                             psycopg_sql.Literal(payload["replication_password"]),
                         )
-                    )
-                for slot in payload["replication_slots"]:
-                    connection.execute(
-                        "SELECT pg_create_physical_replication_slot(%s) "
-                        "WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=%s)",
-                        (slot, slot),
                     )
                 connection.commit()
             if requires_restart and was_running:
@@ -1357,6 +1379,7 @@ def _reconcile_database_replicas(c: Conn, due: list):
                     "primary_port": replica["primary_port"],
                     "replication_user": primary["username"],
                     "replication_password": replication_password,
+                    "primary_password": postgres_password,
                     "replication_slot": replica["slot_name"],
                     "force_rebuild": replica["status"] == "rebuild_required",
                 })
