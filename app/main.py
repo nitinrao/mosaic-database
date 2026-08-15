@@ -60,6 +60,8 @@ NODE_AGENT_CA_BUNDLE = os.getenv("MOSAIC_NODE_AGENT_CA_BUNDLE", "")
 ALLOW_PLAINTEXT_NODE_AGENT = os.getenv("MOSAIC_ALLOW_PLAINTEXT_NODE_AGENT", "").lower() == "true"
 REPLICATION_WAL_RETENTION_BYTES = int(os.getenv("MOSAIC_REPLICATION_WAL_RETENTION_BYTES", str(10 * 1024**3)))
 REPLICATION_USER_PREFIX = "mosaic_repl_"
+REPLICATION_SLOT_INACTIVE_POLLS = 20
+REPLICATION_SLOT_INACTIVE_POLL_SECONDS = 0.05
 RESERVED_BRANCH_NAMES = {".replicas", "replicas"}
 PLANS = {
     "shared": {"monthly_cents": 10000, "max_databases": 5, "max_branches": 20, "max_rows": 10000, "max_bytes": 1000000, "statement_timeout_ms": 5000},
@@ -865,13 +867,16 @@ class NodeAgent:
                     target,
                     is_stopped=self._standby_status_is_not_running,
                 )
+            slot = payload.get("replication_slot")
+            if slot:
+                self._reset_replication_slot(payload, slot)
             argv = [
                 pg_bin("pg_basebackup"), "-D", str(target),
                 "-h", payload["primary_address"], "-p", str(payload["primary_port"]),
                 "-U", payload["replication_user"], "-Fp", "-X", "stream", "-R",
             ]
-            if payload.get("replication_slot"):
-                argv.extend(["-S", payload["replication_slot"]])
+            if slot:
+                argv.extend(["-C", "-S", slot])
             self.run(
                 argv,
                 env={"PGPASSWORD": payload["replication_password"]},
@@ -899,6 +904,79 @@ class NodeAgent:
                 }
             else:
                 self._standby_jobs[target] = result
+
+    def _reset_replication_slot(self, payload: dict, slot: str):
+        if not payload.get("primary_password"):
+            raise RuntimeError(
+                "primary password is required to reset replication slot before standby rebuild"
+            )
+        if psycopg is None:
+            raise RuntimeError("psycopg is required to reset replication slots")
+        with psycopg.connect(
+            host=payload["primary_address"],
+            port=payload["primary_port"],
+            user="postgres",
+            password=payload["primary_password"],
+            dbname="postgres",
+            connect_timeout=5,
+        ) as connection:
+            active = False
+            active_pid = None
+            for _ in range(REPLICATION_SLOT_INACTIVE_POLLS):
+                row = connection.execute(
+                    "SELECT active, active_pid FROM pg_replication_slots WHERE slot_name=%s",
+                    (slot,),
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    return
+                if isinstance(row, dict):
+                    active, active_pid = row["active"], row["active_pid"]
+                else:
+                    active, active_pid = row[0], row[1]
+                if not active:
+                    break
+                time.sleep(REPLICATION_SLOT_INACTIVE_POLL_SECONDS)
+            if active:
+                if active_pid is None:
+                    raise RuntimeError(
+                        f"replication slot {slot} remained active without a backend pid"
+                    )
+                connection.execute(
+                    "SELECT pg_terminate_backend(%s)",
+                    (active_pid,),
+                )
+                connection.commit()
+                for _ in range(REPLICATION_SLOT_INACTIVE_POLLS):
+                    row = connection.execute(
+                        "SELECT active, active_pid FROM pg_replication_slots WHERE slot_name=%s",
+                        (slot,),
+                    ).fetchone()
+                    if row is None:
+                        active = False
+                        break
+                    if isinstance(row, dict):
+                        active, active_pid = row["active"], row["active_pid"]
+                    else:
+                        active, active_pid = row[0], row[1]
+                    if not active:
+                        break
+                    time.sleep(REPLICATION_SLOT_INACTIVE_POLL_SECONDS)
+                if active:
+                    raise RuntimeError(
+                        f"replication slot {slot} remained active after terminating backend"
+                    )
+            try:
+                connection.execute(
+                    "SELECT pg_drop_replication_slot(%s)",
+                    (slot,),
+                )
+            except Exception as exc:
+                detail = _command_error_detail(exc).lower()
+                if "does not exist" not in detail and "undefined object" not in detail:
+                    raise
+                connection.rollback()
+            connection.commit()
 
     def _start_standby_build(self, target: Path, payload: dict) -> dict:
         force_rebuild = bool(payload.get("force_rebuild"))
@@ -1035,12 +1113,6 @@ class NodeAgent:
                             psycopg_sql.Identifier(payload["replication_user"]),
                             psycopg_sql.Literal(payload["replication_password"]),
                         )
-                    )
-                for slot in payload["replication_slots"]:
-                    connection.execute(
-                        "SELECT pg_create_physical_replication_slot(%s) "
-                        "WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=%s)",
-                        (slot, slot),
                     )
                 connection.commit()
             if requires_restart and was_running:
@@ -1304,7 +1376,7 @@ def _reconcile_database_replicas(c: Conn, due: list):
     postgres_password = ""
     replication_password = ""
     all_replicas = c.execute(
-        "SELECT host_id,slot_name FROM replicas WHERE database_id=?",
+        "SELECT host_id FROM replicas WHERE database_id=?",
         (primary["database_id"],),
     ).fetchall()
     pending = [
@@ -1342,7 +1414,6 @@ def _reconcile_database_replicas(c: Conn, due: list):
                 "replication_user": primary["username"],
                 "replication_password": replication_password,
                 "replication_addresses": [node_address(row["host_id"]) for row in all_replicas],
-                "replication_slots": [row["slot_name"] for row in all_replicas],
             })
             c.execute(
                 "UPDATE branches SET status=?,pid=? WHERE id=?",
@@ -1382,6 +1453,7 @@ def _reconcile_database_replicas(c: Conn, due: list):
                     "primary_port": replica["primary_port"],
                     "replication_user": primary["username"],
                     "replication_password": replication_password,
+                    "primary_password": postgres_password,
                     "replication_slot": replica["slot_name"],
                     "force_rebuild": replica["status"] == "rebuild_required",
                 })

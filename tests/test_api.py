@@ -910,6 +910,28 @@ def test_standby_build_argv(tmp_path, monkeypatch):
     started = threading.Event()
     release = threading.Event()
 
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, query, params=None):
+            return self
+
+        def fetchone(self):
+            return None
+
+        def commit(self):
+            pass
+
+    class Psycopg:
+        def connect(self, **kwargs):
+            return Connection()
+
+    monkeypatch.setattr(main, "psycopg", Psycopg())
+
     def run(argv, env=None):
         calls.append(argv)
         if argv[0] == main.pg_bin("pg_basebackup"):
@@ -928,6 +950,7 @@ def test_standby_build_argv(tmp_path, monkeypatch):
         "target_host_id": "sv2",
         "primary_address": "10.0.0.1",
         "primary_port": 55432,
+        "primary_password": "primary-secret",
         "replication_user": "mosaic_repl_db",
         "replication_password": "secret",
         "replication_slot": "mosaic_db_sv2",
@@ -939,6 +962,7 @@ def test_standby_build_argv(tmp_path, monkeypatch):
         "target_host_id": "sv2",
         "primary_address": "10.0.0.1",
         "primary_port": 55432,
+        "primary_password": "primary-secret",
         "replication_user": "mosaic_repl_db",
         "replication_password": "secret",
         "replication_slot": "mosaic_db_sv2",
@@ -953,13 +977,179 @@ def test_standby_build_argv(tmp_path, monkeypatch):
     assert calls[0] == [
         main.pg_bin("pg_basebackup"), "-D", str(target), "-h", "10.0.0.1",
         "-p", "55432", "-U", "mosaic_repl_db", "-Fp", "-X", "stream", "-R",
-        "-S", "mosaic_db_sv2",
+        "-C", "-S", "mosaic_db_sv2",
     ]
     assert calls[1] == [
         main.pg_bin("pg_ctl"), "-D", str(target), "-l",
         str(target / "postgres.log"), "start",
     ]
     assert calls[2] == [main.pg_bin("pg_ctl"), "-D", str(target), "status"]
+
+
+def test_standby_build_replaces_existing_slot_before_backup(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
+    sql = []
+    events = []
+    terminated = [False]
+    release_polls = [2]
+
+    class Result:
+        def fetchone(self):
+            if terminated[0] and release_polls[0]:
+                release_polls[0] -= 1
+                return (True, 123)
+            return (not terminated[0], None if terminated[0] else 123)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, query, params=None):
+            sql.append((str(query), params))
+            if "pg_drop_replication_slot" in str(query):
+                events.append("drop")
+            elif "pg_terminate_backend" in str(query):
+                events.append("terminate")
+                terminated[0] = True
+            return Result()
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+    class Psycopg:
+        def connect(self, **kwargs):
+            return Connection()
+
+    monkeypatch.setattr(main, "psycopg", Psycopg())
+    calls = []
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[0] == main.pg_bin("pg_basebackup"):
+            events.append("backup")
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "postgresql.conf").write_text("")
+            (target / "pg_hba.conf").write_text("")
+
+    agent = main.NodeAgent(run)
+    payload = {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "local",
+        "primary_address": "127.0.0.1",
+        "primary_port": 55432,
+        "primary_password": "primary-secret",
+        "replication_user": "mosaic_repl_db",
+        "replication_password": "secret",
+        "replication_slot": "mosaic_db_sv2",
+    }
+    assert agent.handle("build_standby", payload) == {"status": "building"}
+    for _ in range(300):
+        result = agent.handle("inspect_standby", {"target_path": str(target)})
+        if result["status"] == "ready":
+            break
+        time.sleep(0.01)
+    assert result == {"status": "ready"}
+    assert any("pg_drop_replication_slot" in query for query, _ in sql)
+    assert events == ["terminate", "drop", "backup"]
+    assert calls[0][-3:] == ["-C", "-S", "mosaic_db_sv2"]
+
+
+def test_standby_build_missing_slot_is_not_an_error(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
+
+    class Result:
+        def fetchone(self):
+            return None
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, query, params=None):
+            return Result()
+
+        def commit(self):
+            pass
+
+    class Psycopg:
+        def connect(self, **kwargs):
+            return Connection()
+
+    monkeypatch.setattr(main, "psycopg", Psycopg())
+
+    def run(argv, env=None):
+        if argv[0] == main.pg_bin("pg_basebackup"):
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "postgresql.conf").write_text("")
+            (target / "pg_hba.conf").write_text("")
+
+    agent = main.NodeAgent(run)
+    payload = {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "local",
+        "primary_address": "127.0.0.1",
+        "primary_port": 55432,
+        "primary_password": "primary-secret",
+        "replication_user": "mosaic_repl_db",
+        "replication_password": "secret",
+        "replication_slot": "mosaic_db_sv2",
+    }
+    assert agent.handle("build_standby", payload) == {"status": "building"}
+    for _ in range(100):
+        result = agent.handle("inspect_standby", {"target_path": str(target)})
+        if result["status"] == "ready":
+            break
+        time.sleep(0.01)
+    assert result == {"status": "ready"}
+
+
+def test_standby_build_without_primary_password_fails_before_backup(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
+    calls = []
+
+    def run(argv, env=None):
+        calls.append(argv)
+
+    agent = main.NodeAgent(run)
+    payload = {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "local",
+        "primary_address": "127.0.0.1",
+        "primary_port": 55432,
+        "replication_user": "mosaic_repl_db",
+        "replication_password": "secret",
+        "replication_slot": "mosaic_db_sv2",
+    }
+    assert agent.handle("build_standby", payload) == {"status": "building"}
+    for _ in range(100):
+        result = agent.handle("inspect_standby", {"target_path": str(target)})
+        if result["status"] == "failed":
+            break
+        time.sleep(0.01)
+    assert result["status"] == "failed"
+    assert "primary password is required" in result["error"]
+    assert not any(call[0] == main.pg_bin("pg_basebackup") for call in calls)
 
 
 def test_explicit_standby_rebuild_bypasses_ready_cache(tmp_path, monkeypatch):
@@ -2636,7 +2826,6 @@ def test_repeated_primary_preparation_is_idempotent(tmp_path, monkeypatch):
         "replication_user": "mosaic_repl",
         "replication_password": "secret",
         "replication_addresses": [],
-        "replication_slots": [],
     }
     agent.handle("prepare_primary", payload)
     agent.handle("prepare_primary", payload)
@@ -2737,7 +2926,6 @@ def test_prepare_primary_refreshes_pid_after_restart(tmp_path, monkeypatch):
         "replication_user": "mosaic_repl",
         "replication_password": "secret",
         "replication_addresses": [],
-        "replication_slots": [],
     })
     assert result["pid"] == 222
 

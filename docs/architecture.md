@@ -96,3 +96,8 @@ abandoned and reserves its port until an operator cleans it up. Fencing
 verifies the old primary's actual cluster state from its data directory rather
 than trusting the recorded ledger PID; promotion refuses while that cluster is
 still running unless `force=true`.
+Before each standby rebuild, the node agent drops that standby's existing
+physical replication slot on the current primary, tolerating an already
+missing slot, and runs `pg_basebackup -C -S` so the backup creates a fresh slot
+at its own start LSN. The primary preparation path does not pre-create rebuild
+slots, avoiding stale WAL-retention state after a promotion.
