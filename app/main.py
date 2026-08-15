@@ -342,6 +342,7 @@ class ZfsBranchEngine:
             _checkpoint(parent_host_id, parent_port, parent_password)
         self._run_zfs(["zfs", "snapshot", snap])
         self._run_zfs(["zfs", "clone", "-o", f"mountpoint={target.resolve()}", snap, self._dataset(target)])
+        _clear_cloned_runtime_state(target)
         if target_port is not None:
             _rewrite_postgres_config(target, target_port, target_host_id)
 
@@ -411,6 +412,7 @@ class CopyBranchEngine:
             )
         else:
             shutil.copytree(parent, target)
+        _clear_cloned_runtime_state(target)
         if target_port is not None:
             _clear_standby_configuration(target, target_port, target_host_id)
 
@@ -516,6 +518,21 @@ def _clear_standby_configuration(path: Path, port: int, host_id: str):
         )
     (path / "standby.signal").unlink(missing_ok=True)
     _rewrite_postgres_config(path, port, host_id, standby=False)
+
+
+def _clear_cloned_runtime_state(path: Path):
+    for name in ("postmaster.pid", "postmaster.opts"):
+        (path / name).unlink(missing_ok=True)
+
+
+def _postmaster_pidfile_matches_path(path: Path) -> bool | None:
+    try:
+        lines = (path / "postmaster.pid").read_text().splitlines()
+        if len(lines) < 2 or not lines[1].strip():
+            return None
+        return Path(lines[1]).resolve() == path.resolve()
+    except (OSError, ValueError):
+        return None
 
 
 def _checkpoint(host_id: str, port: int, password: str | None):
@@ -626,12 +643,17 @@ class Supervisor:
         raise RuntimeError(f"unable to set password for branch {branch_id}")
 
     def _cluster_is_running(self, path: str, require_path: bool = False) -> bool:
-        if not Path(path).exists():
+        cluster_path = Path(path)
+        if not cluster_path.exists():
             if require_path:
                 raise RuntimeError(
                     f"cannot verify PostgreSQL cluster at {path}: data directory is absent"
                 )
             return False
+        if (cluster_path / "postmaster.pid").exists():
+            pidfile_matches = _postmaster_pidfile_matches_path(cluster_path)
+            if pidfile_matches is False:
+                return False
         status_argv = [pg_bin("pg_ctl"), "-D", path, "status"]
         try:
             subprocess.run(status_argv, check=True, capture_output=True, text=True)
