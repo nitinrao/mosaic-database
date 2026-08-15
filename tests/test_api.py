@@ -476,10 +476,35 @@ def test_replica_lag_surfaces_through_api(client, monkeypatch):
 
 
 def test_plaintext_remote_transport_requires_opt_out(monkeypatch):
-    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2=http://10.0.0.2:8000")
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "sv2=http://10.0.0.2:8000")
     monkeypatch.setattr(main, "ALLOW_PLAINTEXT_NODE_AGENT", False)
     with pytest.raises(RuntimeError, match="plaintext node-agent transport"):
         main.NodeTransport(main.NodeAgent()).call("sv2", "inspect", {})
+
+
+def test_single_remote_node_is_not_adopted_as_local_identity(monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "sv1=https://10.0.0.1:8000")
+    monkeypatch.delenv("MOSAIC_NODE_ID", raising=False)
+    calls = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return b'{"status": "ok"}'
+
+    def urlopen(request, timeout, context):
+        calls.append((request.full_url, timeout, context))
+        return Response()
+
+    monkeypatch.setattr(main.urllib.request, "urlopen", urlopen)
+    assert main.current_node_id() == "local"
+    assert main.NodeTransport(main.NodeAgent()).call("sv1", "inspect", {}) == {"status": "ok"}
+    assert calls and calls[0][0] == "https://10.0.0.1:8000/internal/node/inspect"
 
 
 def test_peer_down_replica_is_retryable_without_blocking_database(client, monkeypatch):

@@ -697,21 +697,20 @@ def current_node_id() -> str:
     configured = os.getenv("MOSAIC_NODE_ID")
     if configured is not None:
         return configured
-    nodes = node_ids()
-    if len(nodes) == 1:
-        return nodes[0]
+    nodes = configured_nodes()
+    if len(nodes) == 1 and not nodes[0][1]:
+        return nodes[0][0]
     return NODE_ID
 
 
 def validate_node_identity():
     configured = os.getenv("MOSAIC_NODE_ID")
-    nodes = node_ids()
-    if configured is None and len(nodes) == 1:
+    if configured is None:
         return
-    identity = current_node_id()
-    if identity not in nodes:
+    nodes = node_ids()
+    if configured not in nodes:
         raise RuntimeError(
-            f"MOSAIC_NODE_ID={identity!r} is not present in MOSAIC_NODE_HOSTS"
+            f"MOSAIC_NODE_ID={configured!r} is not present in MOSAIC_NODE_HOSTS"
         )
 
 
