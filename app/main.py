@@ -1154,18 +1154,33 @@ def _command_error_detail(exc: Exception) -> str:
     return redact_error("; ".join(parts))
 
 
-def _pid_owns_postgres_directory(pid: int, target: Path) -> bool:
+def _pid_process_evidence(pid: int) -> tuple[list[str], Path | None]:
     proc = Path("/proc") / str(pid)
     try:
         raw = (proc / "cmdline").read_bytes()
     except FileNotFoundError:
-        return False
+        return [], None
     except OSError as exc:
         raise RuntimeError(
-            f"cannot inspect process {pid} while checking standby target {target}: {exc}"
+            f"cannot inspect process {pid} while checking standby ownership: {exc}"
         ) from exc
     args = [arg.decode(errors="replace") for arg in raw.split(b"\0") if arg]
+    try:
+        cwd = (proc / "cwd").resolve()
+    except FileNotFoundError:
+        cwd = None
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot inspect process {pid} working directory: {exc}"
+        ) from exc
+    return args, cwd
+
+
+def _pid_owns_postgres_directory(pid: int, target: Path) -> bool:
+    args, cwd = _pid_process_evidence(pid)
     resolved = str(target.resolve())
+    if cwd is not None and str(cwd) == resolved:
+        return True
     for index, arg in enumerate(args):
         if arg in {"-D", "--pgdata"} and index + 1 < len(args):
             return str(Path(args[index + 1]).resolve()) == resolved
@@ -1173,6 +1188,10 @@ def _pid_owns_postgres_directory(pid: int, target: Path) -> bool:
             return str(Path(arg[2:]).resolve()) == resolved
         if arg.startswith("--pgdata="):
             return str(Path(arg.split("=", 1)[1]).resolve()) == resolved
+    if not args and cwd is None:
+        raise RuntimeError(
+            f"cannot determine whether process {pid} owns standby target {target}"
+        )
     return False
 
 

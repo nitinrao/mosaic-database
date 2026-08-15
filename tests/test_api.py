@@ -1406,6 +1406,29 @@ def test_recycled_pid_does_not_look_like_running_postmaster(tmp_path, monkeypatc
     assert agent._standby_status_is_not_running(target)
 
 
+def test_live_pid_owned_by_working_directory_is_running(tmp_path, monkeypatch):
+    target = tmp_path / "standby"
+    target.mkdir()
+    monkeypatch.setattr(
+        main,
+        "_pid_process_evidence",
+        lambda pid: (["postgres"], target),
+    )
+    assert main._pid_owns_postgres_directory(123, target)
+
+
+def test_live_pid_without_ownership_evidence_is_ambiguous(tmp_path, monkeypatch):
+    target = tmp_path / "standby"
+    target.mkdir()
+    monkeypatch.setattr(
+        main,
+        "_pid_process_evidence",
+        lambda pid: ([], None),
+    )
+    with pytest.raises(RuntimeError, match="cannot determine"):
+        main._pid_owns_postgres_directory(123, target)
+
+
 def test_strict_pgctl_failure_includes_stderr(tmp_path, monkeypatch):
     path = tmp_path / "cluster"
     path.mkdir()
