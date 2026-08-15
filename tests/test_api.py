@@ -1487,6 +1487,8 @@ def test_replica_build_failure_does_not_downgrade_ready_sibling(client, monkeypa
         def call(self, host_id, operation, payload):
             if operation == "provision":
                 return {"status": "provisioned"}
+            if operation == "start":
+                return {"status": "running", "pid": 123}
             if operation == "prepare_primary":
                 return {"status": "running", "pid": 123}
             if operation == "build_standby" and host_id == self.failure_host:
@@ -1522,6 +1524,120 @@ def test_replica_build_failure_does_not_downgrade_ready_sibling(client, monkeypa
         status == "ready"
         for host, status in statuses.items()
         if host != FakeTransport.failure_host
+    )
+    c.close()
+
+
+def test_reconciler_starts_stopped_primary_before_building_standbys(client, monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2")
+    monkeypatch.setenv("MOSAIC_NODE_PRIVATE_ADDRESSES", "local=10.0.0.1,sv2=10.0.0.2")
+    created = tenant(client)
+    calls = []
+
+    class FakeTransport:
+        def call(self, host_id, operation, payload):
+            calls.append(operation)
+            if operation == "provision":
+                return {"status": "provisioned"}
+            if operation == "start":
+                return {"status": "running", "pid": 321}
+            if operation == "prepare_primary":
+                return {"status": "running", "pid": 321}
+            if operation == "build_standby":
+                return {"status": "ready"}
+            raise AssertionError(operation)
+
+    monkeypatch.setattr(main, "node_transport", FakeTransport())
+    response = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "starts-primary"},
+    )
+    c = main.db()
+    main.reconcile_replicas(c)
+    assert calls.index("start") < calls.index("build_standby")
+    assert c.execute(
+        "SELECT status,pid FROM branches WHERE database_id=? AND name='main'",
+        (response.json()["id"],),
+    ).fetchone()["status"] == "running"
+    c.close()
+
+
+def test_ready_replica_with_stopped_cluster_requires_rebuild(client, monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2")
+    monkeypatch.setenv("MOSAIC_NODE_PRIVATE_ADDRESSES", "local=10.0.0.1,sv2=10.0.0.2")
+    created = tenant(client)
+
+    class FakeTransport:
+        def call(self, host_id, operation, payload):
+            if operation == "provision":
+                return {"status": "provisioned"}
+            if operation == "start":
+                return {"status": "running", "pid": 321}
+            if operation == "inspect_standby":
+                return {"status": "failed", "error": "standby postmaster is not running"}
+            raise AssertionError(operation)
+
+    monkeypatch.setattr(main, "node_transport", FakeTransport())
+    response = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "missing-standby"},
+    )
+    c = main.db()
+    c.execute(
+        "UPDATE replicas SET status='ready',lag_bytes=0,lag_sampled_at=? WHERE database_id=?",
+        (main.now(), response.json()["id"]),
+    )
+    c.commit()
+    main.reconcile_replicas(c)
+    assert all(
+        row["status"] == "rebuild_required"
+        for row in c.execute(
+            "SELECT status FROM replicas WHERE database_id=?",
+            (response.json()["id"],),
+        ).fetchall()
+    )
+    c.close()
+
+
+@pytest.mark.parametrize("failure", ["transport", "primary"])
+def test_ready_replica_stays_ready_on_inconclusive_or_primary_failure(client, monkeypatch, failure):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2")
+    monkeypatch.setenv("MOSAIC_NODE_PRIVATE_ADDRESSES", "local=10.0.0.1,sv2=10.0.0.2")
+    created = tenant(client)
+
+    class FakeTransport:
+        def call(self, host_id, operation, payload):
+            if operation == "provision":
+                return {"status": "provisioned"}
+            if operation == "start":
+                raise RuntimeError("primary unavailable")
+            if operation == "inspect_standby":
+                if failure == "transport":
+                    raise RuntimeError("standby unavailable")
+                return {"status": "failed", "error": "probe inconclusive"}
+            raise AssertionError(operation)
+
+    monkeypatch.setattr(main, "node_transport", FakeTransport())
+    response = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": f"ready-{failure}"},
+    )
+    c = main.db()
+    c.execute(
+        "UPDATE replicas SET status='ready',lag_bytes=0,lag_sampled_at=? WHERE database_id=?",
+        (main.now(), response.json()["id"]),
+    )
+    c.commit()
+    main.reconcile_replicas(c)
+    assert all(
+        row["status"] == "ready"
+        for row in c.execute(
+            "SELECT status FROM replicas WHERE database_id=?",
+            (response.json()["id"],),
+        ).fetchall()
     )
     c.close()
 
@@ -1581,6 +1697,7 @@ def test_reaper_ignores_standbys(tmp_path, monkeypatch):
     c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_r", "ten_r", "r", str(tmp_path), "ready", main.now()))
     old = "2000-01-01T00:00:00+00:00"
     c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("br_r", "db_r", "main", None, str(tmp_path / "main"), 55432, 123, "running", "x", old, old, "local"))
+    c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("br_e", "db_r", "ephemeral", None, str(tmp_path / "ephemeral"), 55436, 124, "running", "x", old, old, "local"))
     c.execute(
         "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         ("rep_r", "db_r", "br_r", "sv2", str(tmp_path / "standby"), 55433, "ready", 99, old, old, "slot_r"),
@@ -1596,7 +1713,41 @@ def test_reaper_ignores_standbys(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "node_transport", FakeTransport())
     assert main.reap_branches(c) == 1
     assert len(calls) == 1 and calls[0][1] == "stop"
+    assert c.execute("SELECT status FROM branches WHERE id='br_r'").fetchone()["status"] == "running"
+    assert c.execute("SELECT status FROM branches WHERE id='br_e'").fetchone()["status"] == "stopped"
     assert c.execute("SELECT status FROM replicas").fetchone()["status"] == "ready"
+    c.close()
+
+
+def test_supervisor_reaper_skips_replicated_primary(tmp_path, monkeypatch):
+    main.DB_PATH = tmp_path / "supervisor-reaper-replica.db"
+    c = main.db()
+    main.initialize_schema(c)
+    c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_r", "r", "shared", "h", "active", main.now()))
+    c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_r", "ten_r", "r", str(tmp_path), "ready", main.now()))
+    old = "2000-01-01T00:00:00+00:00"
+    for branch_id, name in (("br_r", "main"), ("br_e", "ephemeral")):
+        c.execute(
+            "INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (branch_id, "db_r", name, None, str(tmp_path / name), 55432 if name == "main" else 55436,
+             123, "running", "x", old, old, "local"),
+        )
+    c.execute(
+        "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("rep_r", "db_r", "br_r", "sv2", str(tmp_path / "standby"), 55433, "ready", 0, old, old, "slot_r"),
+    )
+    c.commit()
+    stopped = []
+    supervisor = main.Supervisor()
+    monkeypatch.setattr(
+        supervisor,
+        "stop",
+        lambda row, connection: stopped.append(row["id"]) or {"status": "stopped", "pid": None},
+    )
+    assert supervisor.reap(c, idle_seconds=1) == 1
+    assert stopped == ["br_e"]
+    assert c.execute("SELECT status FROM branches WHERE id='br_r'").fetchone()["status"] == "running"
     c.close()
 
 
@@ -1609,7 +1760,10 @@ def test_replica_lag_surfaces_through_api(client, monkeypatch):
     ).json()
     c = main.db()
     main_row = c.execute("SELECT * FROM branches WHERE database_id=?", (database["id"],)).fetchone()
-    c.execute("UPDATE branches SET host_id='local' WHERE id=?", (main_row["id"],))
+    c.execute(
+        "UPDATE branches SET host_id='local',status='running',pid=123 WHERE id=?",
+        (main_row["id"],),
+    )
     c.execute(
         "INSERT INTO replication_credentials VALUES(?,?,?,?)",
         (database["id"], "mosaic_repl_lag", main.cipher().encrypt(b"repl").decode(), main.now()),
@@ -1703,6 +1857,10 @@ def test_removed_replica_host_lag_sample_is_reported(client, monkeypatch):
     primary = c.execute(
         "SELECT * FROM branches WHERE database_id=?", (database["id"],)
     ).fetchone()
+    c.execute(
+        "UPDATE branches SET status='running',pid=123 WHERE id=?",
+        (primary["id"],),
+    )
     c.execute(
         "INSERT INTO replication_credentials VALUES(?,?,?,?)",
         (database["id"], "mosaic_repl_removed", main.cipher().encrypt(b"repl").decode(), main.now()),
@@ -1829,6 +1987,8 @@ def test_replica_reconciliation_isolated_per_database(client, monkeypatch):
         def call(self, host_id, operation, payload):
             if operation == "provision":
                 return {"status": "provisioned"}
+            if operation == "start":
+                return {"status": "running", "pid": 123}
             if operation == "prepare_primary":
                 calls.append(("prepare", payload["path"], payload["replication_user"], payload["replication_password"]))
                 return {"status": "running", "pid": 123}

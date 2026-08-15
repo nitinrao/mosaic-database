@@ -131,7 +131,11 @@ states while the control plane polls job status. Replica data directories live
 under the reserved
 `.replicas` directory beside the primary branch, outside the tenant branch
 namespace. A replica is not a branch and is never selected by the idle branch
-reaper. HTTPS node-agent connections always use certificate verification via
+reaper; a branch with replica rows is also never idle-reaped, and the
+replication reconciler starts that primary before building standbys or
+sampling lag. A ready replica whose standby cluster is verifiably gone is
+marked `rebuild_required` and rebuilt instead of being reported healthy.
+HTTPS node-agent connections always use certificate verification via
 the system trust store or the configured `MOSAIC_NODE_AGENT_CA_BUNDLE`.
 
 V0 remains single-primary per host with no HA, PITR, or DR promise.

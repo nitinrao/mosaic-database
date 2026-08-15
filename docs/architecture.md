@@ -57,6 +57,11 @@ Observed lag is exposed as bytes behind the primary WAL replay position with a
 sample timestamp. Standbys use `hot_standby=off` and are never query targets.
 Replica data directories live under the reserved `.replicas` directory beside
 the primary branch, outside the tenant branch namespace.
+Any branch with replica rows is treated as a replicated primary and is never
+idle-reaped. The replication reconciler starts a stopped replicated primary
+before building standbys or sampling lag. A replica is reported healthy only
+while its standby cluster is verifiably running; a ready row whose cluster is
+gone is marked `rebuild_required` and rebuilt.
 Standbys remain dark until a later manual or scripted promotion. There is no
 automatic failover, leader election, watchdog, synchronous replication, or
 PITR in this scope. Promotion is an operator-only action through the admin

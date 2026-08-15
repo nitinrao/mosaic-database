@@ -644,7 +644,13 @@ class Supervisor:
             idle_seconds = int(os.getenv("MOSAIC_BRANCH_IDLE_SECONDS", str(IDLE_REAPER_SECONDS)))
         cutoff = time.time() - idle_seconds
         count = 0
-        for row in c.execute("SELECT * FROM branches WHERE status='running'").fetchall():
+        for row in c.execute(
+            "SELECT b.* FROM branches b "
+            "WHERE b.status='running' "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM replicas r WHERE r.primary_branch_id=b.id"
+            ")"
+        ).fetchall():
             if datetime.fromisoformat(row["last_query_at"]).timestamp() < cutoff:
                 self.stop(row, c)
                 count += 1
@@ -1132,6 +1138,48 @@ def _retry_replica(c: Conn, replica, exc: Exception, sensitive: tuple[str, ...] 
     )
 
 
+def _ensure_primary_running(
+    c: Conn,
+    *,
+    branch_id: str,
+    path: str,
+    port: int,
+    pid: int | None,
+    status: str,
+    host_id: str,
+    password: str,
+) -> dict:
+    if status == "running":
+        return {"status": status, "pid": pid}
+    result = node_transport.call(host_id, "start", {
+        "branch_id": branch_id,
+        "path": path,
+        "port": port,
+        "pid": pid,
+        "status": status,
+        "host_id": host_id,
+        "password": password,
+        "parent_passwords": [],
+    })
+    c.execute(
+        "UPDATE branches SET status=?,pid=? WHERE id=?",
+        (result["status"], result["pid"], branch_id),
+    )
+    return result
+
+
+def _standby_is_verifiably_stopped(result: dict) -> bool:
+    if result.get("status") != "failed":
+        return False
+    error = str(result.get("error", "")).lower()
+    return (
+        "standby postmaster is not running" in error
+        or "no server running" in error
+        or "not running" in error
+        or "not a database cluster directory" in error
+    )
+
+
 def _reconcile_database_replicas(c: Conn, due: list):
     primary = due[0]
     postgres_password = ""
@@ -1144,10 +1192,26 @@ def _reconcile_database_replicas(c: Conn, due: list):
         row for row in due
         if row["status"] in ("pending", "retryable", "rebuild_required")
     ]
+    try:
+        postgres_password = cipher().decrypt(primary["credential_encrypted"].encode()).decode()
+        replication_password = cipher().decrypt(primary["replication_credential"].encode()).decode()
+        _ensure_primary_running(
+            c,
+            branch_id=primary["branch_id"],
+            path=primary["primary_path"],
+            port=primary["primary_port"],
+            pid=primary["primary_pid"],
+            status=primary["primary_status"],
+            host_id=primary["primary_host_id"],
+            password=postgres_password,
+        )
+    except Exception as exc:
+        for row in due:
+            if row["status"] != "ready":
+                _retry_replica(c, row, exc, (postgres_password, replication_password))
+        return
     if pending:
         try:
-            postgres_password = cipher().decrypt(primary["credential_encrypted"].encode()).decode()
-            replication_password = cipher().decrypt(primary["replication_credential"].encode()).decode()
             prepared = node_transport.call(primary["primary_host_id"], "prepare_primary", {
                 "branch_id": primary["branch_id"],
                 "path": primary["primary_path"],
@@ -1170,6 +1234,21 @@ def _reconcile_database_replicas(c: Conn, due: list):
                 _retry_replica(c, row, exc, (postgres_password, replication_password))
             return
     for replica in due:
+        if replica["status"] == "ready":
+            try:
+                result = node_transport.call(replica["host_id"], "inspect_standby", {
+                    "target_path": replica["path"],
+                })
+            except Exception:
+                continue
+            if _standby_is_verifiably_stopped(result):
+                c.execute(
+                    "UPDATE replicas SET status='rebuild_required',"
+                    "lag_bytes=NULL,lag_sampled_at=NULL,next_attempt_at=NULL,"
+                    "last_error=NULL WHERE id=?",
+                    (replica["id"],),
+                )
+            continue
         try:
             if replica["status"] == "building":
                 result = node_transport.call(replica["host_id"], "inspect_standby", {
@@ -1213,8 +1292,7 @@ def reconcile_replicas(c: Conn):
         "b.pid AS primary_pid, b.status AS primary_status, b.host_id AS primary_host_id, "
         "b.credential_encrypted, rc.username, rc.credential_encrypted AS replication_credential "
         "FROM replicas r JOIN branches b ON b.id=r.primary_branch_id "
-        "JOIN replication_credentials rc ON rc.database_id=r.database_id "
-        "WHERE r.status IN ('pending','retryable','building','rebuild_required')"
+        "JOIN replication_credentials rc ON rc.database_id=r.database_id"
     ).fetchall()
     due = []
     for row in rows:
@@ -1264,6 +1342,16 @@ def refresh_replica_lag(c: Conn, database_id: str):
         return {"error": "replication lag sampling unavailable"}
     try:
         postgres_password = cipher().decrypt(main_row["credential_encrypted"].encode()).decode()
+        _ensure_primary_running(
+            c,
+            branch_id=main_row["id"],
+            path=main_row["path"],
+            port=main_row["port"],
+            pid=main_row["pid"],
+            status=main_row["status"],
+            host_id=main_row["host_id"],
+            password=postgres_password,
+        )
         sampled = node_transport.call(main_row["host_id"], "inspect_replication", {
             "primary_host_id": main_row["host_id"],
             "primary_port": main_row["port"],
@@ -1361,7 +1449,13 @@ def _run_replication_sweep():
 def reap_branches(c: Conn) -> int:
     cutoff = time.time() - int(os.getenv("MOSAIC_BRANCH_IDLE_SECONDS", str(IDLE_REAPER_SECONDS)))
     count = 0
-    for row in c.execute("SELECT * FROM branches WHERE status='running'").fetchall():
+    for row in c.execute(
+        "SELECT b.* FROM branches b "
+        "WHERE b.status='running' "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM replicas r WHERE r.primary_branch_id=b.id"
+        ")"
+    ).fetchall():
         if datetime.fromisoformat(row["last_query_at"]).timestamp() >= cutoff:
             continue
         try:
