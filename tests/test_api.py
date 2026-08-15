@@ -594,6 +594,25 @@ def test_replication_loop_survives_ledger_connection_error(monkeypatch):
     assert calls["reconcile"] == 1
 
 
+def test_replication_loop_invalid_interval_still_yields(monkeypatch):
+    monkeypatch.setenv("MOSAIC_REPLICATION_RETRY_INTERVAL", "10s")
+    calls = {"sleep": 0}
+
+    async def fake_sleep(_):
+        calls["sleep"] += 1
+        if calls["sleep"] > 1:
+            raise asyncio.CancelledError
+
+    def unavailable_db():
+        raise RuntimeError("ledger unavailable")
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(main, "db", unavailable_db)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(main._replication_loop())
+    assert calls["sleep"] == 2
+
+
 def test_repeated_primary_preparation_is_idempotent(tmp_path, monkeypatch):
     root = tmp_path / "branches"
     root.mkdir()
