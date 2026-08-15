@@ -41,8 +41,13 @@ for its node, and `pg_hba.conf` permits the configured peer addresses; it
 never binds to `0.0.0.0`. Single-host mode remains loopback-only. Existing
 ledgers migrate branch placement to `local`.
 
-Replication is future work and is intentionally not implemented here. The
-approved design is asynchronous replication of `main` branches only.
-Ephemeral branches are not replicated, so losing a host loses those branches.
+Physical streaming replication is asynchronous. Each `main` branch gets one
+dark standby on each other configured node; ephemeral branches are not
+replicated. Replication slots use the bounded
+`MOSAIC_REPLICATION_WAL_RETENTION_BYTES` budget (10 GiB by default), and a
+standby whose slot is invalidated must be rebuilt from a fresh base backup.
+Observed lag is exposed as bytes behind the primary WAL replay position with a
+sample timestamp. Standbys use `hot_standby=off` and are never query targets.
 Standbys remain dark until a later manual or scripted promotion. There is no
-automatic failover, leader election, or fencing in this scope.
+automatic failover, leader election, or fencing in this scope; losing a host
+loses its ephemeral branches.
