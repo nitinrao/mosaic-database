@@ -14,3 +14,15 @@ The supervisor records port, PID, status, and last-query time in the ledger.
 It starts stopped branches on demand and stops idle postmasters while retaining
 data. V0 is single-primary, with no HA, PITR, or DR promise. DDL is deferred to
 deploy requests.
+
+Production ZFS datasets are created and cloned with an explicit mountpoint equal
+to the branch's absolute path under `MOSAIC_BRANCH_ROOT`; relying on ZFS's
+default mountpoint would initialize a different filesystem location and make
+snapshots ineffective. Clones also rewrite their PostgreSQL port and Unix socket
+directory before startup.
+
+`MOSAIC_CREDENTIAL_ENCRYPTION_KEY` is mandatory and must be stable across
+restarts so encrypted branch credentials remain decryptable. The explicit
+development/test escape hatch `MOSAIC_ALLOW_EPHEMERAL_CREDENTIAL_KEY=true`
+persists a generated key under the branch root and must not be used for
+production data.

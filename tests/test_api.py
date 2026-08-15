@@ -19,7 +19,7 @@ def client(tmp_path, monkeypatch):
     main._rate.clear()
     class FakeEngine:
         def create_database(self, path, password, port): Path(path).mkdir(parents=True, exist_ok=True)
-        def clone(self, parent, target, parent_port=None, parent_password=None): Path(target).mkdir(parents=True, exist_ok=True)
+        def clone(self, parent, target, parent_port=None, parent_password=None, target_port=None): Path(target).mkdir(parents=True, exist_ok=True)
         def destroy(self, path): return None
     monkeypatch.setattr(main, "engine", lambda: FakeEngine())
     with TestClient(main.app) as test_client:
@@ -136,17 +136,30 @@ def test_zfs_engine_exact_argv(tmp_path):
     engine = main.ZfsBranchEngine("tank/mosaic", calls.append)
     parent, child = tmp_path / "db", tmp_path / "feature"
     engine.create_database(parent, "secret", 55432)
-    engine.clone(parent, child)
+    engine.clone(parent, child, target_port=55433)
     engine.destroy(child)
-    assert calls[0] == ["zfs", "create", "-p", f"tank/mosaic/{tmp_path.name}/db"]
+    assert calls[0] == ["zfs", "create", "-p", "-o", f"mountpoint={parent.resolve()}", f"tank/mosaic/{tmp_path.name}/db"]
     assert calls[1][0].endswith("/initdb")
     assert calls[1][1:6] == ["-D", str(parent), "-U", "postgres", "--auth=scram-sha-256"]
     assert calls[1][6] == "--pwfile"
     assert calls[2:] == [
         [ "zfs", "snapshot", f"tank/mosaic/{tmp_path.name}/db@branch-{child.name}"],
-        [ "zfs", "clone", f"tank/mosaic/{tmp_path.name}/db@branch-{child.name}", f"tank/mosaic/{tmp_path.name}/{child.name}"],
+        ["zfs", "clone", "-o", f"mountpoint={child.resolve()}", f"tank/mosaic/{tmp_path.name}/db@branch-{child.name}", f"tank/mosaic/{tmp_path.name}/{child.name}"],
         ["zfs", "destroy", "-r", f"tank/mosaic/{tmp_path.name}/{child.name}"],
     ]
+
+
+def test_clone_rewrites_postgres_port_and_socket(tmp_path):
+    config = tmp_path / "postgresql.conf"
+    config.write_text("port = 55432\nlisten_addresses = '*'\nunix_socket_directories = '/old'\nshared_buffers = '128MB'\n")
+    main._rewrite_postgres_config(tmp_path, 55433)
+    text = config.read_text()
+    assert "port = 55433" in text
+    assert "listen_addresses = '127.0.0.1'" in text
+    assert f"unix_socket_directories = '{tmp_path.resolve()}'" in text
+    assert "port = 55432" not in text
+    assert "unix_socket_directories = '/old'" not in text
+    assert "shared_buffers = '128MB'" in text
 
 
 def test_reaper_stop_cycle(tmp_path, monkeypatch):
