@@ -140,7 +140,7 @@ CommandRunner = Callable[[list[str]], Any]
 
 class BranchEngine(Protocol):
     def create_database(self, path: Path, password: str, port: int) -> None: ...
-    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None) -> None: ...
+    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None, target_port: int | None = None) -> None: ...
     def destroy(self, path: Path) -> None: ...
 
 
@@ -157,15 +157,17 @@ class ZfsBranchEngine:
         return "/".join((self.pool, *relative.parts))
 
     def create_database(self, path: Path, password: str, port: int):
-        self.run(["zfs", "create", "-p", self._dataset(path)])
+        self.run(["zfs", "create", "-p", "-o", f"mountpoint={path.resolve()}", self._dataset(path)])
         _initdb(path, password, port, self.run)
 
-    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None):
+    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None, target_port: int | None = None):
         snap = f"{self._dataset(parent)}@branch-{target.name}"
         if parent_port:
             _checkpoint(parent_port, parent_password)
         self.run(["zfs", "snapshot", snap])
-        self.run(["zfs", "clone", snap, self._dataset(target)])
+        self.run(["zfs", "clone", "-o", f"mountpoint={target.resolve()}", snap, self._dataset(target)])
+        if target_port is not None:
+            _rewrite_postgres_config(target, target_port)
 
     def destroy(self, path: Path):
         self.run(["zfs", "destroy", "-r", self._dataset(path)])
@@ -179,7 +181,7 @@ class CopyBranchEngine:
     def create_database(self, path: Path, password: str, port: int):
         _initdb(path, password, port, self.run)
 
-    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None):
+    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None, target_port: int | None = None):
         target.parent.mkdir(parents=True, exist_ok=True)
         if parent_port:
             _checkpoint(parent_port, parent_password)
@@ -196,6 +198,8 @@ class CopyBranchEngine:
                     os.environ["PGPASSWORD"] = old_password
         else:
             shutil.copytree(parent, target)
+        if target_port is not None:
+            _rewrite_postgres_config(target, target_port)
 
     def destroy(self, path: Path):
         shutil.rmtree(path, ignore_errors=True)
@@ -216,9 +220,22 @@ def _initdb(path: Path, password: str, port: int, run: CommandRunner):
         run([pg_bin("initdb"), "-D", str(path), "-U", "postgres", "--auth=scram-sha-256", "--pwfile", str(pwfile_path)])
     finally:
         pwfile_path.unlink(missing_ok=True)
+    _rewrite_postgres_config(path, port)
+
+
+def _rewrite_postgres_config(path: Path, port: int):
     config = path / "postgresql.conf"
-    with config.open("a") as handle:
-        handle.write(f"\nport = {port}\nlisten_addresses = '127.0.0.1'\nunix_socket_directories = '{path}'\n")
+    if not config.exists():
+        return
+    lines = config.read_text().splitlines()
+    settings = re.compile(r"^\s*(?:port|listen_addresses|unix_socket_directories)\s*=")
+    retained = [line for line in lines if not settings.match(line)]
+    retained.extend([
+        f"port = {port}",
+        "listen_addresses = '127.0.0.1'",
+        f"unix_socket_directories = '{path.resolve()}'",
+    ])
+    config.write_text("\n".join(retained) + "\n")
 
 
 def _checkpoint(port: int, password: str | None):
@@ -588,11 +605,17 @@ def _create_branch(c: Conn, tid: str, did: str, payload: BranchCreate, tenant):
     if c.execute("SELECT 1 FROM branches WHERE database_id=? AND name=?", (did, payload.name)).fetchone():
         raise HTTPException(409, "branch already exists")
     bid, path = token("br_"), Path(parent_db["root_path"]) / payload.name
-    parent_password = cipher().decrypt(parent["credential_encrypted"].encode()).decode()
-    engine().clone(Path(parent["path"]), path, parent_port=parent["port"] if parent["status"] == "running" else None, parent_password=parent_password)
     password = secrets.token_urlsafe(24)
     with _branch_mutation_lock:
         port = supervisor.allocate_port(c)
+        parent_password = cipher().decrypt(parent["credential_encrypted"].encode()).decode()
+        engine().clone(
+            Path(parent["path"]),
+            path,
+            parent_port=parent["port"] if parent["status"] == "running" else None,
+            parent_password=parent_password,
+            target_port=port,
+        )
         c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?)", (bid, did, payload.name, parent["id"], str(path), port, None, "stopped", cipher().encrypt(password.encode()).decode(), now(), now()))
     audit(c, tid, "branch.created", {"branch_id": bid, "parent": parent["id"]})
     c.commit()
