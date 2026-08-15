@@ -60,12 +60,14 @@ export default function StartPage() {
         <span className="mark" aria-hidden="true">M</span>
         <span>Mosaic Database</span>
       </ServiceSwitcher>
+      <span className="badge alpha-badge">ALPHA</span>
       <div className="eyebrow"><span className="live" /> Self-serve shared signup</div>
       <h1>Create your PostgreSQL key.</h1>
       <p className="lead">
         Enter an email and Mosaic will create a shared tenant. The API key is returned exactly once. If you sign up
         again with the same email, signup is refused and the existing key remains unchanged. Use your existing key or contact Mosaic.
       </p>
+      <p className="docs-note">This is early access: interfaces and the API surface may change. Replication and rehearsed failover exist, but there is no point-in-time recovery or WAL archiving yet, so do not keep data here whose only copy is this service.</p>
       <p className="result-note">Signup endpoint: <code>{API_ENDPOINT}</code>. A <code>503</code> response means the global database capacity ceiling has been reached.</p>
 
       <form className="access-form" onSubmit={submit}>

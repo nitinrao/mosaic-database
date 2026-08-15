@@ -26,6 +26,7 @@ export default function Home() {
             SQL over HTTP. Each database&apos;s main branch is replicated asynchronously to dark standbys on the other
             hosts.
           </p>
+          <p className="docs-note">Alpha means early access: interfaces and the API surface may change. Replication and rehearsed failover exist, but there is no point-in-time recovery or WAL archiving yet, so do not keep data here whose only copy is this service.</p>
           <div className="actions">
             <a className="button" href="/start">Create your API key</a>
             <a className="text-link" href="/docs#quickstart">Run the quickstart →</a>
