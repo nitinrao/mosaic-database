@@ -3244,12 +3244,9 @@ def _apply_deploy(deploy_id: str, tid: str):
                     logger.warning("failed to close deploy connection for %s", deploy_id)
     except Exception:
         logger.exception("deploy apply failed for %s", deploy_id)
-        try:
-            row = deploy_row(c, deploy_id, tid)
-            if row["status"] == "applying":
-                _finish_deploy(c, row, "failed", row["schema_version"], "deploy failed")
-        finally:
-            c.close()
+        row = deploy_row(c, deploy_id, tid)
+        if row["status"] == "applying":
+            _finish_deploy(c, row, "failed", row["schema_version"], "deploy failed")
     finally:
         c.close()
 
