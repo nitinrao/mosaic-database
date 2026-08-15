@@ -524,8 +524,52 @@ class Supervisor:
         return {"status": "running", "pid": pid}
 
     def stop_local(self, payload: dict):
-        if alive(payload.get("pid")):
-            subprocess.run([pg_bin("pg_ctl"), "-D", payload["path"], "-m", "fast", "-w", "stop"], check=False, capture_output=True)
+        status_argv = [pg_bin("pg_ctl"), "-D", payload["path"], "status"]
+        try:
+            subprocess.run(status_argv, check=True, capture_output=True, text=True)
+            running = True
+        except subprocess.CalledProcessError as exc:
+            detail = " ".join(
+                part for part in (exc.stdout or "", exc.stderr or "", str(exc))
+                if part
+            ).lower()
+            if (
+                "no server running" in detail
+                or "not running" in detail
+                or "not a database cluster directory" in detail
+            ):
+                running = False
+            else:
+                raise RuntimeError(
+                    f"cannot verify PostgreSQL cluster at {payload['path']} is stopped"
+                ) from exc
+        if running:
+            subprocess.run(
+                [pg_bin("pg_ctl"), "-D", payload["path"], "-m", "fast", "-w", "stop"],
+                check=False,
+                capture_output=True,
+            )
+            try:
+                subprocess.run(status_argv, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as exc:
+                detail = " ".join(
+                    part for part in (exc.stdout or "", exc.stderr or "", str(exc))
+                    if part
+                ).lower()
+                if (
+                    "no server running" in detail
+                    or "not running" in detail
+                    or "not a database cluster directory" in detail
+                ):
+                    running = False
+                else:
+                    raise RuntimeError(
+                        f"cannot verify PostgreSQL cluster at {payload['path']} is stopped"
+                    ) from exc
+            if running:
+                raise RuntimeError(
+                    f"PostgreSQL cluster at {payload['path']} is still running after stop"
+                )
         return {"status": "stopped", "pid": None}
 
     def start(self, row, c: Conn):
@@ -613,6 +657,8 @@ class NodeAgent:
         return bool(value)
 
     def promote_standby(self, target: Path, payload: dict) -> dict:
+        with self._standby_jobs_lock:
+            self._standby_jobs.pop(target, None)
         recovery = self._is_in_recovery(target, payload)
         if recovery:
             self.run([
@@ -700,16 +746,20 @@ class NodeAgent:
             self._standby_jobs[target] = result
 
     def _start_standby_build(self, target: Path, payload: dict) -> dict:
+        force_rebuild = bool(payload.get("force_rebuild"))
         with self._standby_jobs_lock:
             job = self._standby_jobs.get(target)
-            if job and job["status"] == "building":
+            if force_rebuild:
+                self._standby_jobs.pop(target, None)
+            elif job and job["status"] == "building":
                 return {"status": "building"}
-        existing = self._standby_status(target)
-        if existing["status"] == "ready":
-            return existing
+        if not force_rebuild:
+            existing = self._standby_status(target)
+            if existing["status"] == "ready":
+                return existing
         with self._standby_jobs_lock:
             job = self._standby_jobs.get(target)
-            if job and job["status"] == "building":
+            if not force_rebuild and job and job["status"] == "building":
                 return {"status": "building"}
             self._standby_jobs[target] = {"status": "building"}
         threading.Thread(
@@ -942,7 +992,13 @@ def replica_root(main_path: str | Path) -> Path:
     return path.parent.parent if path.parent.name == ".replicas" else path.parent
 
 
-def create_replicas(c: Conn, database_id: str, main_row, postgres_password: str):
+def create_replicas(
+    c: Conn,
+    database_id: str,
+    main_row,
+    postgres_password: str,
+    status: str = "pending",
+):
     peers = replica_nodes(main_row["host_id"])
     if not peers:
         return
@@ -962,21 +1018,31 @@ def create_replicas(c: Conn, database_id: str, main_row, postgres_password: str)
         replica_path = replica_root(main_row["path"]) / ".replicas" / node_id
         c.execute(
             "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (replica_id, database_id, main_row["id"], node_id, str(replica_path), replica_port, "pending", None, None, now(), slots[node_id]),
+            (replica_id, database_id, main_row["id"], node_id, str(replica_path), replica_port, status, None, None, now(), slots[node_id]),
         )
+
+
+def redact_error(error: str, sensitive: tuple[str, ...] = ()) -> str:
+    for secret in sensitive:
+        if secret:
+            error = error.replace(secret, "[REDACTED]")
+    return error
 
 
 def _retry_replica(c: Conn, replica, exc: Exception, sensitive: tuple[str, ...] = ()):
     attempts = int(replica["attempts"]) + 1
     delay = min(300, 5 * (2 ** min(attempts - 1, 6)))
     next_attempt = datetime.now(timezone.utc) + timedelta(seconds=delay)
-    error = str(exc)
-    for secret in sensitive:
-        if secret:
-            error = error.replace(secret, "[REDACTED]")
+    error = redact_error(str(exc), sensitive)
     c.execute(
-        "UPDATE replicas SET status='retryable',attempts=?,next_attempt_at=?,last_error=? WHERE id=?",
-        (attempts, next_attempt.isoformat(), error[:500], replica["id"]),
+        "UPDATE replicas SET status=?,attempts=?,next_attempt_at=?,last_error=? WHERE id=?",
+        (
+            "rebuild_required" if replica["status"] == "rebuild_required" else "retryable",
+            attempts,
+            next_attempt.isoformat(),
+            error[:500],
+            replica["id"],
+        ),
     )
 
 
@@ -988,7 +1054,10 @@ def _reconcile_database_replicas(c: Conn, due: list):
         "SELECT host_id,slot_name FROM replicas WHERE database_id=?",
         (primary["database_id"],),
     ).fetchall()
-    pending = [row for row in due if row["status"] in ("pending", "retryable")]
+    pending = [
+        row for row in due
+        if row["status"] in ("pending", "retryable", "rebuild_required")
+    ]
     if pending:
         try:
             postgres_password = cipher().decrypt(primary["credential_encrypted"].encode()).decode()
@@ -1030,6 +1099,7 @@ def _reconcile_database_replicas(c: Conn, due: list):
                     "replication_user": primary["username"],
                     "replication_password": replication_password,
                     "replication_slot": replica["slot_name"],
+                    "force_rebuild": replica["status"] == "rebuild_required",
                 })
             status = result.get("status")
             if status == "ready":
@@ -1057,7 +1127,7 @@ def reconcile_replicas(c: Conn):
         "b.credential_encrypted, rc.username, rc.credential_encrypted AS replication_credential "
         "FROM replicas r JOIN branches b ON b.id=r.primary_branch_id "
         "JOIN replication_credentials rc ON rc.database_id=r.database_id "
-        "WHERE r.status IN ('pending','retryable','building')"
+        "WHERE r.status IN ('pending','retryable','building','rebuild_required')"
     ).fetchall()
     due = []
     for row in rows:
@@ -1451,6 +1521,11 @@ def promote_database(
     payload: PromotionRequest,
     _: None = Depends(require_admin),
 ):
+    with _branch_mutation_lock:
+        return _promote_database_locked(database_id, payload)
+
+
+def _promote_database_locked(database_id: str, payload: PromotionRequest):
     c = db()
     try:
         main_row = c.execute(
@@ -1471,7 +1546,8 @@ def promote_database(
                     "postgres_password": postgres_password,
                 })
             except Exception as exc:
-                raise HTTPException(503, f"promotion failed: {exc}") from exc
+                error = redact_error(str(exc), (postgres_password,))
+                raise HTTPException(503, f"promotion failed: {error[:500]}") from exc
             audit(
                 c,
                 None,
@@ -1595,7 +1671,8 @@ def promote_database(
                 actor="admin",
             )
             c.commit()
-            raise HTTPException(503, f"promotion failed: {exc}") from exc
+            error = redact_error(str(exc), (postgres_password,))
+            raise HTTPException(503, f"promotion failed: {error[:500]}") from exc
 
         cleanup = "destroyed"
         cleanup_error = None
@@ -1643,7 +1720,13 @@ def promote_database(
         new_main = c.execute(
             "SELECT * FROM branches WHERE id=?", (main_row["id"],)
         ).fetchone()
-        create_replicas(c, database_id, new_main, postgres_password)
+        create_replicas(
+            c,
+            database_id,
+            new_main,
+            postgres_password,
+            status="rebuild_required",
+        )
         audit(
             c,
             None,
