@@ -11,6 +11,8 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import urllib.error
+import urllib.request
 from glob import glob
 import time
 from datetime import datetime, timezone
@@ -41,6 +43,8 @@ BRANCH_ENGINE_NAME = os.getenv("MOSAIC_BRANCH_ENGINE", "copy")
 IDLE_REAPER_SECONDS = int(os.getenv("MOSAIC_BRANCH_IDLE_SECONDS", "900"))
 PORT_MIN = int(os.getenv("MOSAIC_POSTGRES_PORT_MIN", "55432"))
 RATE_LIMIT_REQUESTS = int(os.getenv("MOSAIC_RATE_LIMIT_REQUESTS", "120"))
+NODE_ID = os.getenv("MOSAIC_NODE_ID", "local")
+NODE_AGENT_TOKEN = os.getenv("MOSAIC_NODE_AGENT_TOKEN", "")
 PLANS = {
     "shared": {"monthly_cents": 10000, "max_databases": 5, "max_branches": 20, "max_rows": 10000, "max_bytes": 1000000, "statement_timeout_ms": 5000},
     "dedicated": {"monthly_cents": 50000, "max_databases": 20, "max_branches": 100, "max_rows": 100000, "max_bytes": 10000000, "statement_timeout_ms": 30000},
@@ -73,6 +77,56 @@ def pg_bin(name: str) -> str:
         if candidate and Path(candidate).exists():
             return candidate
     return name
+
+
+def configured_nodes() -> list[tuple[str, str]]:
+    raw = os.getenv("MOSAIC_NODE_HOSTS", "local")
+    nodes = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        node_id, separator, address = item.partition("=")
+        nodes.append((node_id.strip(), address.strip() if separator else ""))
+    return nodes or [("local", "")]
+
+
+def node_ids() -> list[str]:
+    return [node_id for node_id, _ in configured_nodes()]
+
+
+def node_url(node_id: str) -> str:
+    for configured_id, address in configured_nodes():
+        if configured_id == node_id:
+            return address
+    raise RuntimeError(f"unknown database node {node_id}")
+
+
+def node_private_addresses() -> dict[str, str]:
+    raw = os.getenv("MOSAIC_NODE_PRIVATE_ADDRESSES", "")
+    result = {}
+    for item in raw.split(","):
+        node_id, separator, address = item.strip().partition("=")
+        if separator and node_id and address:
+            result[node_id.strip()] = address.strip()
+    return result
+
+
+def node_address(node_id: str) -> str:
+    if node_id == "local":
+        return "127.0.0.1"
+    if node_id not in node_ids():
+        raise RuntimeError(f"unknown database node {node_id}")
+    address = node_private_addresses().get(node_id)
+    if not address:
+        raise RuntimeError("MOSAIC_NODE_PRIVATE_ADDRESSES must map every configured node for multi-host deployment")
+    return address
+
+
+def placement_node(database_id: str) -> str:
+    nodes = node_ids()
+    index = int.from_bytes(hashlib.sha256(database_id.encode()).digest()[:8], "big") % len(nodes)
+    return nodes[index]
 
 
 class Conn:
@@ -120,10 +174,19 @@ def initialize_schema(c: Conn):
     c.script(f"""
     CREATE TABLE IF NOT EXISTS tenants (id TEXT PRIMARY KEY, name TEXT NOT NULL, plan TEXT NOT NULL, api_key_hash TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS databases (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id), name TEXT NOT NULL, root_path TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(tenant_id,name));
-    CREATE TABLE IF NOT EXISTS branches (id TEXT PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id), name TEXT NOT NULL, parent_id TEXT, path TEXT NOT NULL, port INTEGER NOT NULL, pid INTEGER, status TEXT NOT NULL, credential_encrypted TEXT NOT NULL, last_query_at TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(database_id,name));
+    CREATE TABLE IF NOT EXISTS branches (id TEXT PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id), name TEXT NOT NULL, parent_id TEXT, path TEXT NOT NULL, port INTEGER NOT NULL, pid INTEGER, status TEXT NOT NULL, credential_encrypted TEXT NOT NULL, last_query_at TEXT NOT NULL, created_at TEXT NOT NULL, host_id TEXT NOT NULL DEFAULT 'local', UNIQUE(database_id,name));
     CREATE TABLE IF NOT EXISTS usage_events (id {integer}, tenant_id TEXT NOT NULL REFERENCES tenants(id), kind TEXT NOT NULL, quantity INTEGER NOT NULL, unit TEXT NOT NULL, occurred_at TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{{}}', idempotency_key TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS audit_log (id {integer}, tenant_id TEXT, action TEXT NOT NULL, actor TEXT NOT NULL, details TEXT NOT NULL DEFAULT '{{}}', created_at TEXT NOT NULL);
     """)
+    columns = (
+        [row["column_name"] for row in c.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name='branches'"
+        ).fetchall()]
+        if c.postgres
+        else [row["name"] for row in c.execute("PRAGMA table_info(branches)").fetchall()]
+    )
+    if "host_id" not in columns:
+        c.execute("ALTER TABLE branches ADD COLUMN host_id TEXT NOT NULL DEFAULT 'local'")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS usage_idempotency ON usage_events(tenant_id,idempotency_key) WHERE idempotency_key <> ''")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS branches_port_unique ON branches(port)")
     c.commit()
@@ -139,8 +202,8 @@ CommandRunner = Callable[[list[str]], Any]
 
 
 class BranchEngine(Protocol):
-    def create_database(self, path: Path, password: str, port: int) -> None: ...
-    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None, target_port: int | None = None) -> None: ...
+    def create_database(self, path: Path, password: str, port: int, host_id: str = "local") -> None: ...
+    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None, target_port: int | None = None, parent_host_id: str = "local", target_host_id: str = "local") -> None: ...
     def destroy(self, path: Path) -> None: ...
 
 
@@ -156,18 +219,18 @@ class ZfsBranchEngine:
             relative = Path(path.parent.name) / path.name
         return "/".join((self.pool, *relative.parts))
 
-    def create_database(self, path: Path, password: str, port: int):
+    def create_database(self, path: Path, password: str, port: int, host_id: str = "local"):
         self.run(["zfs", "create", "-p", "-o", f"mountpoint={path.resolve()}", self._dataset(path)])
-        _initdb(path, password, port, self.run)
+        _initdb(path, password, port, self.run, host_id)
 
-    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None, target_port: int | None = None):
+    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None, target_port: int | None = None, parent_host_id: str = "local", target_host_id: str = "local"):
         snap = f"{self._dataset(parent)}@branch-{target.name}"
         if parent_port:
-            _checkpoint(parent_port, parent_password)
+            _checkpoint(parent_host_id, parent_port, parent_password)
         self.run(["zfs", "snapshot", snap])
         self.run(["zfs", "clone", "-o", f"mountpoint={target.resolve()}", snap, self._dataset(target)])
         if target_port is not None:
-            _rewrite_postgres_config(target, target_port)
+            _rewrite_postgres_config(target, target_port, target_host_id)
 
     def destroy(self, path: Path):
         self.run(["zfs", "destroy", "-r", self._dataset(path)])
@@ -178,14 +241,14 @@ class CopyBranchEngine:
     def __init__(self, runner: CommandRunner | None = None):
         self.run = runner or (lambda argv: subprocess.run(argv, check=True))
 
-    def create_database(self, path: Path, password: str, port: int):
-        _initdb(path, password, port, self.run)
+    def create_database(self, path: Path, password: str, port: int, host_id: str = "local"):
+        _initdb(path, password, port, self.run, host_id)
 
-    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None, target_port: int | None = None):
+    def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None, target_port: int | None = None, parent_host_id: str = "local", target_host_id: str = "local"):
         target.parent.mkdir(parents=True, exist_ok=True)
         if parent_port:
-            _checkpoint(parent_port, parent_password)
-            argv = [pg_bin("pg_basebackup"), "-D", str(target), "-h", "127.0.0.1", "-p", str(parent_port), "-U", "postgres", "-Fp", "-X", "stream", "-R"]
+            _checkpoint(parent_host_id, parent_port, parent_password)
+            argv = [pg_bin("pg_basebackup"), "-D", str(target), "-h", node_address(parent_host_id), "-p", str(parent_port), "-U", "postgres", "-Fp", "-X", "stream", "-R"]
             old_password = os.environ.get("PGPASSWORD")
             if parent_password:
                 os.environ["PGPASSWORD"] = parent_password
@@ -199,7 +262,7 @@ class CopyBranchEngine:
         else:
             shutil.copytree(parent, target)
         if target_port is not None:
-            _rewrite_postgres_config(target, target_port)
+            _rewrite_postgres_config(target, target_port, target_host_id)
 
     def destroy(self, path: Path):
         shutil.rmtree(path, ignore_errors=True)
@@ -209,7 +272,7 @@ def engine() -> BranchEngine:
     return ZfsBranchEngine() if BRANCH_ENGINE_NAME == "zfs" else CopyBranchEngine()
 
 
-def _initdb(path: Path, password: str, port: int, run: CommandRunner):
+def _initdb(path: Path, password: str, port: int, run: CommandRunner, host_id: str = "local"):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", prefix="mosaic-pw-", delete=False) as pwfile:
@@ -220,28 +283,49 @@ def _initdb(path: Path, password: str, port: int, run: CommandRunner):
         run([pg_bin("initdb"), "-D", str(path), "-U", "postgres", "--auth=scram-sha-256", "--pwfile", str(pwfile_path)])
     finally:
         pwfile_path.unlink(missing_ok=True)
-    _rewrite_postgres_config(path, port)
+    _rewrite_postgres_config(path, port, host_id)
 
 
-def _rewrite_postgres_config(path: Path, port: int):
+def _rewrite_postgres_config(path: Path, port: int, host_id: str = "local"):
     config = path / "postgresql.conf"
     if not config.exists():
         return
+    listen_address = node_address(host_id)
     lines = config.read_text().splitlines()
     settings = re.compile(r"^\s*(?:port|listen_addresses|unix_socket_directories)\s*=")
     retained = [line for line in lines if not settings.match(line)]
     retained.extend([
         f"port = {port}",
-        "listen_addresses = '127.0.0.1'",
+        f"listen_addresses = '{listen_address}'",
         f"unix_socket_directories = '{path.resolve()}'",
     ])
     config.write_text("\n".join(retained) + "\n")
+    if len(node_ids()) > 1:
+        addresses = node_private_addresses()
+        if set(node_ids()) - set(addresses):
+            raise RuntimeError("MOSAIC_NODE_PRIVATE_ADDRESSES must map every configured node for multi-host deployment")
+        hba = path / "pg_hba.conf"
+        hba_lines = hba.read_text().splitlines() if hba.exists() else []
+        begin = "# BEGIN MOSAIC DATABASE PEERS"
+        end = "# END MOSAIC DATABASE PEERS"
+        try:
+            start = hba_lines.index(begin)
+            finish = hba_lines.index(end, start)
+            hba_lines = hba_lines[:start] + hba_lines[finish + 1:]
+        except ValueError:
+            pass
+        managed = [begin, *(
+            f"host all postgres {address}/32 scram-sha-256"
+            for address in addresses.values()
+        ), end]
+        hba_lines.extend(managed)
+        hba.write_text("\n".join(hba_lines) + "\n")
 
 
-def _checkpoint(port: int, password: str | None):
+def _checkpoint(host_id: str, port: int, password: str | None):
     if psycopg is None or not password:
         return
-    with psycopg.connect(host="127.0.0.1", port=port, user="postgres", password=password, dbname="postgres", connect_timeout=5) as connection:
+    with psycopg.connect(host=node_address(host_id), port=port, user="postgres", password=password, dbname="postgres", connect_timeout=5) as connection:
         connection.execute("CHECKPOINT")
 
 
@@ -255,6 +339,36 @@ def alive(pid: int | None) -> bool:
         return False
 
 
+def branch_start_payload(c: Conn, row) -> dict:
+    try:
+        password = cipher().decrypt(row["credential_encrypted"].encode()).decode()
+    except InvalidToken as exc:
+        raise RuntimeError(f"branch {row['id']} credentials cannot be decrypted") from exc
+    parent_passwords = []
+    if row["parent_id"]:
+        parent = c.execute("SELECT credential_encrypted FROM branches WHERE id=?", (row["parent_id"],)).fetchone()
+        if parent:
+            try:
+                parent_passwords.append(cipher().decrypt(parent["credential_encrypted"].encode()).decode())
+            except InvalidToken as exc:
+                raise RuntimeError(f"parent credentials for branch {row['id']} cannot be decrypted") from exc
+    return {
+        "branch_id": row["id"],
+        "path": row["path"],
+        "port": row["port"],
+        "pid": row["pid"],
+        "status": row["status"],
+        "host_id": row["host_id"],
+        "password": password,
+        "parent_passwords": parent_passwords,
+    }
+
+
+def record_stop(c: Conn, row, result: dict):
+    c.execute("UPDATE branches SET status=?,pid=? WHERE id=?", (result["status"], result["pid"], row["id"]))
+    c.commit()
+
+
 class Supervisor:
     def allocate_port(self, c: Conn) -> int:
         used = {int(row["port"]) for row in c.execute("SELECT port FROM branches").fetchall()}
@@ -263,48 +377,50 @@ class Supervisor:
             port += 1
         return port
 
-    def start(self, row, c: Conn):
-        if row["status"] == "running" and alive(row["pid"]):
-            return
-        path = Path(row["path"])
+    def start_local(self, payload: dict):
+        path = Path(payload["path"])
+        branch_id = payload["branch_id"]
+        port = int(payload["port"])
+        host_id = payload["host_id"]
+        if payload.get("status") == "running" and alive(payload.get("pid")):
+            return {"status": "running", "pid": payload["pid"]}
         if not (path / "PG_VERSION").exists():
-            raise RuntimeError(f"branch {row['id']} has no PostgreSQL cluster at {path}")
+            raise RuntimeError(f"branch {branch_id} has no PostgreSQL cluster at {path}")
         if psycopg is None:
             raise RuntimeError("psycopg is required to supervise PostgreSQL branches")
-        subprocess.run([pg_bin("pg_ctl"), "-D", str(path), "-o", f"-p {row['port']}", "-l", str(path / "postgres.log"), "-w", "start"], check=True, capture_output=True)
+        subprocess.run([pg_bin("pg_ctl"), "-D", str(path), "-o", f"-p {port}", "-l", str(path / "postgres.log"), "-w", "start"], check=True, capture_output=True)
         if (path / "standby.signal").exists():
             subprocess.run([pg_bin("pg_ctl"), "-D", str(path), "promote", "-w"], check=True, capture_output=True)
-        try:
-            branch_password = cipher().decrypt(row["credential_encrypted"].encode()).decode()
-        except InvalidToken as exc:
-            raise RuntimeError(f"branch {row['id']} credentials cannot be decrypted") from exc
-        passwords = [branch_password]
-        if row["parent_id"]:
-            parent = c.execute("SELECT credential_encrypted FROM branches WHERE id=?", (row["parent_id"],)).fetchone()
-            if parent:
-                try:
-                    passwords.append(cipher().decrypt(parent["credential_encrypted"].encode()).decode())
-                except InvalidToken as exc:
-                    raise RuntimeError(f"parent credentials for branch {row['id']} cannot be decrypted") from exc
-        for candidate in passwords:
+        branch_password = payload["password"]
+        for candidate in [branch_password, *payload.get("parent_passwords", [])]:
             try:
-                with psycopg.connect(host="127.0.0.1", port=row["port"], user="postgres", password=candidate, dbname="postgres", connect_timeout=5) as connection:
+                with psycopg.connect(host=node_address(host_id), port=port, user="postgres", password=candidate, dbname="postgres", connect_timeout=5) as connection:
                     connection.execute(psycopg_sql.SQL("ALTER ROLE postgres PASSWORD {}").format(psycopg_sql.Literal(branch_password)))
                     connection.commit()
                 break
             except Exception:
                 continue
         else:
-            raise RuntimeError(f"unable to set password for branch {row['id']}")
+            raise RuntimeError(f"unable to set password for branch {branch_id}")
         pid = int((path / "postmaster.pid").read_text().splitlines()[0])
-        c.execute("UPDATE branches SET status='running',pid=? WHERE id=?", (pid, row["id"]))
+        return {"status": "running", "pid": pid}
+
+    def stop_local(self, payload: dict):
+        if alive(payload.get("pid")):
+            subprocess.run([pg_bin("pg_ctl"), "-D", payload["path"], "-m", "fast", "-w", "stop"], check=False, capture_output=True)
+        return {"status": "stopped", "pid": None}
+
+    def start(self, row, c: Conn):
+        payload = branch_start_payload(c, row)
+        result = self.start_local(payload)
+        c.execute("UPDATE branches SET status=?,pid=? WHERE id=?", (result["status"], result["pid"], row["id"]))
         c.commit()
+        return result
 
     def stop(self, row, c: Conn):
-        if alive(row["pid"]):
-            subprocess.run([pg_bin("pg_ctl"), "-D", row["path"], "-m", "fast", "-w", "stop"], check=False, capture_output=True)
-        c.execute("UPDATE branches SET status='stopped',pid=NULL WHERE id=?", (row["id"],))
-        c.commit()
+        result = self.stop_local({"path": row["path"], "pid": row["pid"]})
+        record_stop(c, row, result)
+        return result
 
     def reap(self, c: Conn, idle_seconds: int | None = None) -> int:
         if idle_seconds is None:
@@ -318,7 +434,70 @@ class Supervisor:
         return count
 
 
+class NodeAgent:
+    def handle(self, operation: str, payload: dict):
+        if operation == "provision":
+            engine().create_database(
+                Path(payload["path"]),
+                payload["password"],
+                int(payload["port"]),
+                payload.get("host_id", current_node_id()),
+            )
+            return {"status": "provisioned"}
+        if operation == "clone":
+            engine().clone(
+                Path(payload["parent"]),
+                Path(payload["target"]),
+                parent_port=payload.get("parent_port"),
+                parent_password=payload.get("parent_password"),
+                target_port=payload.get("target_port"),
+                parent_host_id=payload.get("parent_host_id", current_node_id()),
+                target_host_id=payload.get("target_host_id", current_node_id()),
+            )
+            return {"status": "cloned"}
+        if operation == "start":
+            return supervisor.start_local(payload)
+        if operation == "stop":
+            return supervisor.stop_local(payload)
+        if operation == "inspect":
+            return {"status": payload.get("status"), "pid": payload.get("pid"), "alive": alive(payload.get("pid"))}
+        if operation == "destroy":
+            engine().destroy(Path(payload["path"]))
+            return {"status": "destroyed"}
+        raise RuntimeError(f"unknown node operation {operation}")
+
+
+def current_node_id() -> str:
+    return NODE_ID
+
+
+class NodeTransport:
+    def __init__(self, agent: NodeAgent):
+        self.agent = agent
+
+    def call(self, node_id: str, operation: str, payload: dict):
+        if len(node_ids()) == 1 or node_id == current_node_id():
+            return self.agent.handle(operation, payload)
+        base_url = node_url(node_id)
+        if not base_url:
+            raise RuntimeError(f"no node agent URL configured for {node_id}")
+        body = json.dumps(payload).encode()
+        request = urllib.request.Request(
+            f"{base_url.rstrip('/')}/internal/node/{operation}",
+            data=body,
+            headers={"Content-Type": "application/json", "X-Mosaic-Node-Token": os.getenv("MOSAIC_NODE_AGENT_TOKEN", NODE_AGENT_TOKEN)},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                return json.loads(response.read())
+        except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+            raise RuntimeError(f"node agent {node_id} unavailable: {exc}") from exc
+
+
 supervisor = Supervisor()
+node_agent = NodeAgent()
+node_transport = NodeTransport(node_agent)
 app = FastAPI(title="Mosaic Database", version="0.1.0")
 _reaper_task: asyncio.Task | None = None
 _branch_mutation_lock = threading.Lock()
@@ -329,9 +508,21 @@ async def _reaper_loop():
         await asyncio.sleep(max(1, int(os.getenv("MOSAIC_BRANCH_REAPER_INTERVAL", "60"))))
         c = db()
         try:
-            supervisor.reap(c)
+            reap_branches(c)
         finally:
             c.close()
+
+
+def reap_branches(c: Conn) -> int:
+    cutoff = time.time() - int(os.getenv("MOSAIC_BRANCH_IDLE_SECONDS", str(IDLE_REAPER_SECONDS)))
+    count = 0
+    for row in c.execute("SELECT * FROM branches WHERE status='running'").fetchall():
+        if datetime.fromisoformat(row["last_query_at"]).timestamp() >= cutoff:
+            continue
+        result = node_transport.call(row["host_id"], "stop", {"path": row["path"], "pid": row["pid"]})
+        record_stop(c, row, result)
+        count += 1
+    return count
 
 
 @app.on_event("startup")
@@ -437,6 +628,26 @@ def audit(c: Conn, tenant_id: str | None, action: str, details: dict):
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
+
+
+def require_node_agent_token(token: str | None):
+    expected = os.getenv("MOSAIC_NODE_AGENT_TOKEN", NODE_AGENT_TOKEN)
+    if not expected:
+        raise HTTPException(503, "node agent token is not configured")
+    if not token or not secrets.compare_digest(token, expected):
+        raise HTTPException(401, "invalid node agent token")
+
+
+@app.post("/internal/node/{operation}")
+def internal_node(request: Request, operation: str, payload: dict, x_node_token: str | None = Header(default=None, alias="X-Mosaic-Node-Token")):
+    require_node_agent_token(x_node_token)
+    allowed = {"127.0.0.1", "::1", *node_private_addresses().values()}
+    if not request.client or request.client.host not in allowed:
+        raise HTTPException(403, "node agent traffic must use the configured private network")
+    try:
+        return node_agent.handle(operation, payload)
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
 
 
 @app.get("/readyz")
@@ -568,9 +779,15 @@ def create_database(tid: str, payload: DatabaseCreate, tenant=Depends(tenant_aut
         password, bid = secrets.token_urlsafe(24), token("br_")
         with _branch_mutation_lock:
             main_port = supervisor.allocate_port(c)
-            engine().create_database(root / "main", password, main_port)
+            host_id = placement_node(did)
+            node_transport.call(host_id, "provision", {
+                "path": str(root / "main"),
+                "password": password,
+                "port": main_port,
+                "host_id": host_id,
+            })
             c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", (did, tid, payload.name, str(root), "ready", now()))
-            c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?)", (bid, did, "main", None, str(root / "main"), main_port, None, "stopped", cipher().encrypt(password.encode()).decode(), now(), now()))
+            c.execute("INSERT INTO branches(id,database_id,name,parent_id,path,port,pid,status,credential_encrypted,last_query_at,created_at,host_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (bid, did, "main", None, str(root / "main"), main_port, None, "stopped", cipher().encrypt(password.encode()).decode(), now(), now(), host_id))
         audit(c, tid, "database.created", {"database_id": did})
         c.commit()
         return {"id": did, "name": payload.name, "status": "ready", "main_branch": {"id": bid, "name": "main", "password": password}}
@@ -609,17 +826,19 @@ def _create_branch(c: Conn, tid: str, did: str, payload: BranchCreate, tenant):
     with _branch_mutation_lock:
         port = supervisor.allocate_port(c)
         parent_password = cipher().decrypt(parent["credential_encrypted"].encode()).decode()
-        engine().clone(
-            Path(parent["path"]),
-            path,
-            parent_port=parent["port"] if parent["status"] == "running" else None,
-            parent_password=parent_password,
-            target_port=port,
-        )
-        c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?)", (bid, did, payload.name, parent["id"], str(path), port, None, "stopped", cipher().encrypt(password.encode()).decode(), now(), now()))
+        node_transport.call(parent["host_id"], "clone", {
+            "parent": str(parent["path"]),
+            "target": str(path),
+            "parent_port": parent["port"] if parent["status"] == "running" else None,
+            "parent_password": parent_password,
+            "target_port": port,
+            "parent_host_id": parent["host_id"],
+            "target_host_id": parent["host_id"],
+        })
+        c.execute("INSERT INTO branches(id,database_id,name,parent_id,path,port,pid,status,credential_encrypted,last_query_at,created_at,host_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (bid, did, payload.name, parent["id"], str(path), port, None, "stopped", cipher().encrypt(password.encode()).decode(), now(), now(), parent["host_id"]))
     audit(c, tid, "branch.created", {"branch_id": bid, "parent": parent["id"]})
     c.commit()
-    return {"id": bid, "name": payload.name, "parent": parent["name"], "status": "stopped", "password": password}
+    return {"id": bid, "name": payload.name, "parent": parent["name"], "status": "stopped", "password": password, "host_id": parent["host_id"]}
 
 
 @app.post("/v1/tenants/{tid}/databases/{did}/branches")
@@ -635,7 +854,7 @@ def list_branches(tid: str, did: str, tenant):
     c = db()
     try:
         database(c, tid, did)
-        return {"branches": [dict(row) for row in c.execute("SELECT id,name,parent_id,status,port,last_query_at,created_at FROM branches WHERE database_id=?", (did,)).fetchall()]}
+        return {"branches": [dict(row) for row in c.execute("SELECT id,name,parent_id,status,port,host_id,last_query_at,created_at FROM branches WHERE database_id=?", (did,)).fetchall()]}
     finally:
         c.close()
 
@@ -653,8 +872,8 @@ def delete_branch(tid: str, did: str, bid: str, tenant=Depends(tenant_auth)):
         row = branch(c, did, bid)
         if row["name"] == "main":
             raise HTTPException(400, "main branch is protected")
-        supervisor.stop(row, c)
-        engine().destroy(Path(row["path"]))
+        node_transport.call(row["host_id"], "stop", {"path": row["path"], "pid": row["pid"]})
+        node_transport.call(row["host_id"], "destroy", {"path": row["path"]})
         c.execute("DELETE FROM branches WHERE id=?", (bid,))
         audit(c, tid, "branch.deleted", {"branch_id": bid})
         c.commit()
@@ -717,7 +936,9 @@ def execute_query(tid: str, did: str, payload: Query, tenant):
         database(c, tid, did)
         row = branch(c, did, payload.branch)
         try:
-            supervisor.start(row, c)
+            start_result = node_transport.call(row["host_id"], "start", branch_start_payload(c, row))
+            c.execute("UPDATE branches SET status=?,pid=? WHERE id=?", (start_result["status"], start_result["pid"], row["id"]))
+            c.commit()
         except RuntimeError as exc:
             raise HTTPException(503, f"branch unavailable: {exc}") from exc
         if psycopg is None:
@@ -726,7 +947,7 @@ def execute_query(tid: str, did: str, payload: Query, tenant):
             password = cipher().decrypt(row["credential_encrypted"].encode()).decode()
         except InvalidToken as exc:
             raise HTTPException(503, "branch credentials cannot be decrypted") from exc
-        conn = psycopg.connect(host="127.0.0.1", port=row["port"], user="postgres", password=password, dbname="postgres", connect_timeout=5)
+        conn = psycopg.connect(host=node_address(row["host_id"]), port=row["port"], user="postgres", password=password, dbname="postgres", connect_timeout=5)
         try:
             conn.execute(f"SET statement_timeout = {PLANS[tenant['plan']]['statement_timeout_ms']}")
             cur = conn.execute(payload.sql, payload.params)
