@@ -63,4 +63,7 @@ API. It first fences the old primary when reachable; if that host is
 unreachable, `force=true` records the operator's assertion that it is dead.
 The API reports the last observed standby lag as the promotion event's RPO.
 After promotion, surviving standbys and the old primary are rebuilt from fresh
-base backups rather than reattached to the divergent timeline.
+base backups rather than reattached to the divergent timeline. When the old
+primary host is reachable, its stopped data directory is destroyed before the
+transition completes. A forced promotion records an unreachable old-primary
+path as abandoned and reserves its port until an operator cleans it up.

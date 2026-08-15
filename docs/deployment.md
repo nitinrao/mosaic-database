@@ -148,3 +148,8 @@ base backup instead of being reattached to the new timeline.
 Promotion rejects missing or stale lag samples and lag above
 `MOSAIC_PROMOTION_MAX_LAG_BYTES` (10 GiB by default); configure the freshness
 window with `MOSAIC_PROMOTION_MAX_LAG_AGE_SECONDS` (five minutes by default).
+After promotion, the main branch intentionally lives at the promoted
+standby's `.replicas/<host>` path. A reachable old primary is stopped and its
+old data directory is destroyed. With `force=true`, the old host may be
+unreachable; its abandoned path and port are recorded and the operator must
+remove that stale cluster before the reserved port can be released.

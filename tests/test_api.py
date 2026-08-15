@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -505,6 +506,49 @@ def test_standby_build_argv(tmp_path, monkeypatch):
     assert calls[2] == [main.pg_bin("pg_ctl"), "-D", str(target), "status"]
 
 
+def test_zfs_standby_dataset_is_reusable_and_promoted_path_can_clone(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local")
+    calls = []
+    dataset_exists = [False]
+    standby = root / "cluster" / ".replicas" / "sv2"
+    branch = root / "cluster" / ".replicas" / "sv2-branch"
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[:3] == ["zfs", "list", "-H"]:
+            if not dataset_exists[0]:
+                raise subprocess.CalledProcessError(
+                    1, argv, stderr="dataset does not exist"
+                )
+        elif argv[:2] == ["zfs", "create"]:
+            Path(argv[-1]).parent.mkdir(parents=True, exist_ok=True)
+            Path(argv[-1]).mkdir(parents=True, exist_ok=True)
+            (Path(argv[-1]) / "postgresql.conf").write_text("")
+        elif argv[:2] == ["zfs", "clone"]:
+            branch.mkdir(parents=True, exist_ok=True)
+            (branch / "postgresql.conf").write_text("")
+
+    zfs = main.ZfsBranchEngine("mosaic/db", run)
+    zfs.prepare_standby(standby)
+    dataset_exists[0] = True
+    zfs.prepare_standby(standby)
+    zfs.clone(standby, branch, target_port=55440)
+    assert [
+        "zfs", "create", "-p", "-o",
+        f"mountpoint={standby.resolve()}",
+        "mosaic/db/cluster/.replicas/sv2",
+    ] in calls
+    assert ["zfs", "destroy", "-r", "mosaic/db/cluster/.replicas/sv2"] in calls
+    assert [
+        "zfs", "clone", "-o", f"mountpoint={branch.resolve()}",
+        "mosaic/db/cluster/.replicas/sv2@branch-sv2-branch",
+        "mosaic/db/cluster/.replicas/sv2-branch",
+    ] in calls
+
+
 def test_promote_standby_clears_standby_configuration_and_is_idempotent(tmp_path, monkeypatch):
     root = tmp_path / "branches"
     root.mkdir()
@@ -647,6 +691,12 @@ def test_promotion_requires_admin(client, monkeypatch):
 
 def test_promotion_fences_before_promoting_and_rebuilds_replicas(client, monkeypatch):
     _, database = promotion_database(client, monkeypatch)
+    c = main.db()
+    old_path = Path(c.execute(
+        "SELECT path FROM branches WHERE database_id=? AND name='main'",
+        (database["id"],),
+    ).fetchone()["path"])
+    c.close()
     calls = []
 
     class Transport:
@@ -656,6 +706,9 @@ def test_promotion_fences_before_promoting_and_rebuilds_replicas(client, monkeyp
                 return {"status": "promoted", "pid": 222, "port": payload["target_port"]}
             if operation == "stop":
                 return {"status": "stopped", "pid": None}
+            if operation == "destroy":
+                shutil.rmtree(payload["path"])
+                return {"status": "destroyed"}
             raise AssertionError(operation)
 
     monkeypatch.setattr(main, "node_transport", Transport())
@@ -665,7 +718,12 @@ def test_promotion_fences_before_promoting_and_rebuilds_replicas(client, monkeyp
         json={"host_id": "sv2"},
     )
     assert response.status_code == 200
-    assert calls == [("local", "stop"), ("sv2", "promote_standby")]
+    assert calls == [
+        ("local", "stop"),
+        ("sv2", "promote_standby"),
+        ("local", "destroy"),
+    ]
+    assert not old_path.exists()
     c = main.db()
     try:
         main_row = c.execute(
@@ -687,6 +745,10 @@ def test_promotion_fences_before_promoting_and_rebuilds_replicas(client, monkeyp
             ("local", "pending"),
             ("sv3", "pending"),
         ]
+        assert c.execute(
+            "SELECT 1 FROM abandoned_clusters WHERE database_id=?",
+            (database["id"],),
+        ).fetchone() is None
         audit_row = c.execute(
             "SELECT action,actor,details FROM audit_log WHERE action='database.promoted' ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -730,6 +792,57 @@ def test_promotion_requires_force_when_old_primary_unreachable(client, monkeypat
         ("local", "stop"),
         ("sv2", "promote_standby"),
     ]
+    c = main.db()
+    try:
+        abandoned = c.execute(
+            "SELECT host_id,path,port FROM abandoned_clusters WHERE database_id=?",
+            (database["id"],),
+        ).fetchone()
+        assert abandoned["host_id"] == "local"
+        audit_row = c.execute(
+            "SELECT details FROM audit_log WHERE action='database.promoted' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        details = main.json.loads(audit_row["details"])
+        assert details["abandoned"]["path"] == abandoned["path"]
+    finally:
+        c.close()
+
+
+def test_promotion_failure_after_fencing_commits_stopped_ledger_and_audit(client, monkeypatch):
+    _, database = promotion_database(client, monkeypatch)
+
+    class Transport:
+        def call(self, host_id, operation, payload):
+            if operation == "stop":
+                return {"status": "stopped", "pid": None}
+            if operation == "promote_standby":
+                raise RuntimeError("promotion timeout")
+            raise AssertionError(operation)
+
+    monkeypatch.setattr(main, "node_transport", Transport())
+    response = client.post(
+        f"/v1/admin/databases/{database['id']}/promote",
+        headers={"X-Admin-Key": "test-admin"},
+        json={"host_id": "sv2"},
+    )
+    assert response.status_code == 503
+    c = main.db()
+    try:
+        row = c.execute(
+            "SELECT status,pid FROM branches WHERE database_id=? AND name='main'",
+            (database["id"],),
+        ).fetchone()
+        assert (row["status"], row["pid"]) == ("stopped", None)
+        actions = [
+            item["action"]
+            for item in c.execute(
+                "SELECT action FROM audit_log ORDER BY id DESC LIMIT 2"
+            ).fetchall()
+        ]
+        assert "database.promotion_fenced" in actions
+        assert "database.promotion_failed" in actions
+    finally:
+        c.close()
 
 
 def test_promotion_is_idempotent_when_main_already_on_target(client, monkeypatch):

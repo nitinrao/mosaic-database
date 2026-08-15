@@ -203,6 +203,7 @@ def initialize_schema(c: Conn):
     CREATE TABLE IF NOT EXISTS branches (id TEXT PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id), name TEXT NOT NULL, parent_id TEXT, path TEXT NOT NULL, port INTEGER NOT NULL, pid INTEGER, status TEXT NOT NULL, credential_encrypted TEXT NOT NULL, last_query_at TEXT NOT NULL, created_at TEXT NOT NULL, host_id TEXT NOT NULL DEFAULT 'local', UNIQUE(database_id,name));
     CREATE TABLE IF NOT EXISTS replication_credentials (database_id TEXT PRIMARY KEY REFERENCES databases(id), username TEXT NOT NULL, credential_encrypted TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS replicas (id TEXT PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id), primary_branch_id TEXT NOT NULL REFERENCES branches(id), host_id TEXT NOT NULL, path TEXT NOT NULL, port INTEGER NOT NULL, status TEXT NOT NULL, lag_bytes INTEGER, lag_sampled_at TEXT, created_at TEXT NOT NULL, slot_name TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT, last_error TEXT, UNIQUE(database_id,host_id));
+    CREATE TABLE IF NOT EXISTS abandoned_clusters (id TEXT PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id), host_id TEXT NOT NULL, path TEXT NOT NULL, port INTEGER NOT NULL, created_at TEXT NOT NULL, reason TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS usage_events (id {integer}, tenant_id TEXT NOT NULL REFERENCES tenants(id), kind TEXT NOT NULL, quantity INTEGER NOT NULL, unit TEXT NOT NULL, occurred_at TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{{}}', idempotency_key TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS audit_log (id {integer}, tenant_id TEXT, action TEXT NOT NULL, actor TEXT NOT NULL, details TEXT NOT NULL DEFAULT '{{}}', created_at TEXT NOT NULL);
     """)
@@ -254,6 +255,7 @@ class BranchEngine(Protocol):
     def create_database(self, path: Path, password: str, port: int, host_id: str = "local") -> None: ...
     def clone(self, parent: Path, target: Path, *, parent_port: int | None = None, parent_password: str | None = None, target_port: int | None = None, parent_host_id: str = "local", target_host_id: str = "local") -> None: ...
     def destroy(self, path: Path) -> None: ...
+    def prepare_standby(self, path: Path) -> None: ...
 
 
 class ZfsBranchEngine:
@@ -289,6 +291,23 @@ class ZfsBranchEngine:
     def destroy(self, path: Path):
         self.run(["zfs", "destroy", "-r", self._dataset(path)])
 
+    def prepare_standby(self, path: Path):
+        dataset = self._dataset(path)
+        try:
+            self.run(["zfs", "list", "-H", "-o", "name", dataset])
+        except subprocess.CalledProcessError as exc:
+            detail = " ".join(
+                part for part in (exc.stdout or "", exc.stderr or "", str(exc))
+                if part
+            ).lower()
+            if "does not exist" not in detail and "dataset not found" not in detail:
+                raise
+            if path.exists():
+                shutil.rmtree(path)
+        else:
+            self.run(["zfs", "destroy", "-r", dataset])
+        self.run(["zfs", "create", "-p", "-o", f"mountpoint={path.resolve()}", dataset])
+
 
 class CopyBranchEngine:
     """CI engine: pg_basebackup is consistent; cp -a of a running PG dir is not."""
@@ -317,6 +336,9 @@ class CopyBranchEngine:
             _clear_standby_configuration(target, target_port, target_host_id)
 
     def destroy(self, path: Path):
+        shutil.rmtree(path, ignore_errors=True)
+
+    def prepare_standby(self, path: Path):
         shutil.rmtree(path, ignore_errors=True)
 
 
@@ -466,7 +488,10 @@ def record_stop(c: Conn, row, result: dict):
 
 class Supervisor:
     def allocate_port(self, c: Conn) -> int:
-        used = {int(row["port"]) for row in c.execute("SELECT port FROM branches UNION ALL SELECT port FROM replicas").fetchall()}
+        used = {int(row["port"]) for row in c.execute(
+            "SELECT port FROM branches UNION ALL SELECT port FROM replicas "
+            "UNION ALL SELECT port FROM abandoned_clusters"
+        ).fetchall()}
         port = PORT_MIN
         while port in used:
             port += 1
@@ -643,7 +668,9 @@ class NodeAgent:
                             f"cannot remove standby target {target}: "
                             f"postmaster pid {postmaster_pid} is still alive{detail}"
                         )
-                shutil.rmtree(target)
+                engine().prepare_standby(target)
+            else:
+                engine().prepare_standby(target)
             argv = [
                 pg_bin("pg_basebackup"), "-D", str(target),
                 "-h", payload["primary_address"], "-p", str(payload["primary_port"]),
@@ -1486,7 +1513,13 @@ def promote_database(
         except InvalidToken as exc:
             raise HTTPException(503, "primary credentials cannot be decrypted") from exc
 
+        old_primary = {
+            "host_id": main_row["host_id"],
+            "path": main_row["path"],
+            "port": main_row["port"],
+        }
         fence_outcome = "reachable and stopped"
+        abandoned = None
         try:
             node_transport.call(main_row["host_id"], "stop", {
                 "path": main_row["path"],
@@ -1499,10 +1532,44 @@ def promote_database(
                     "old primary is unreachable; set force=true only after asserting it is dead",
                 ) from exc
             fence_outcome = f"unreachable; force asserted: {type(exc).__name__}"
+            abandoned = {
+                **old_primary,
+                "reason": "old primary unreachable during forced promotion",
+            }
         c.execute(
             "UPDATE branches SET status='stopped',pid=NULL WHERE id=?",
             (main_row["id"],),
         )
+        if abandoned:
+            c.execute(
+                "INSERT INTO abandoned_clusters(id,database_id,host_id,path,port,created_at,reason) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (
+                    token("abn_"),
+                    database_id,
+                    abandoned["host_id"],
+                    abandoned["path"],
+                    abandoned["port"],
+                    now(),
+                    abandoned["reason"],
+                ),
+            )
+        audit(
+            c,
+            None,
+            "database.promotion_fenced",
+            {
+                "database_id": database_id,
+                "fence": fence_outcome,
+                "old_primary_host": old_primary["host_id"],
+                "old_primary_path": old_primary["path"],
+                "old_primary_port": old_primary["port"],
+                "force": payload.force,
+                "abandoned": abandoned,
+            },
+            actor="admin",
+        )
+        c.commit()
         try:
             promoted = node_transport.call(payload.host_id, "promote_standby", {
                 "target_path": replica["path"],
@@ -1511,7 +1578,52 @@ def promote_database(
                 "postgres_password": postgres_password,
             })
         except Exception as exc:
+            audit(
+                c,
+                None,
+                "database.promotion_failed",
+                {
+                    "database_id": database_id,
+                    "fence": fence_outcome,
+                    "promoted_host": payload.host_id,
+                    "error": type(exc).__name__,
+                    "old_primary_host": old_primary["host_id"],
+                    "old_primary_path": old_primary["path"],
+                    "old_primary_port": old_primary["port"],
+                    "abandoned": abandoned,
+                },
+                actor="admin",
+            )
+            c.commit()
             raise HTTPException(503, f"promotion failed: {exc}") from exc
+
+        cleanup = "destroyed"
+        cleanup_error = None
+        if not abandoned:
+            try:
+                node_transport.call(old_primary["host_id"], "destroy", {
+                    "path": old_primary["path"],
+                })
+            except Exception as exc:
+                cleanup = "failed"
+                cleanup_error = type(exc).__name__
+                abandoned = {
+                    **old_primary,
+                    "reason": "old primary cleanup failed after promotion",
+                }
+                c.execute(
+                    "INSERT INTO abandoned_clusters(id,database_id,host_id,path,port,created_at,reason) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (
+                        token("abn_"),
+                        database_id,
+                        abandoned["host_id"],
+                        abandoned["path"],
+                        abandoned["port"],
+                        now(),
+                        abandoned["reason"],
+                    ),
+                )
 
         c.execute(
             "UPDATE branches SET host_id=?,path=?,port=?,status='running',pid=? WHERE id=?",
@@ -1543,6 +1655,12 @@ def promote_database(
                 "lag_bytes": replica["lag_bytes"],
                 "lag_sampled_at": replica["lag_sampled_at"],
                 "force": payload.force,
+                "old_primary_host": old_primary["host_id"],
+                "old_primary_path": old_primary["path"],
+                "old_primary_port": old_primary["port"],
+                "old_primary_cleanup": cleanup,
+                "old_primary_cleanup_error": cleanup_error,
+                "abandoned": abandoned,
             },
             actor="admin",
         )
