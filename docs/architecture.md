@@ -63,6 +63,10 @@ PITR in this scope. Promotion is an operator-only action through the admin
 API. It first fences the old primary when reachable; if that host is
 unreachable, `force=true` records the operator's assertion that it is dead.
 The API reports the last observed standby lag as the promotion event's RPO.
+Recovery detection during promotion is connection-free: the node agent reads
+`pg_controldata` because dark standbys reject SQL connections. An unmounted or
+otherwise unusable old-primary data directory is unverifiable, so promotion
+refuses without `force=true`.
 After promotion, surviving standbys and the old primary are marked
 `rebuild_required` and forced through a full teardown and fresh `pg_basebackup`
 rather than reusing anything found at the target path or reattaching to the

@@ -154,6 +154,9 @@ This prevents a stale standby on a diverged timeline from being reported
 healthy. If that forced rebuild fails, it remains `rebuild_required` and
 retries with backoff. Slot-invalidated replicas are automatically reconciled
 through the same rebuild path.
+Recovery detection is connection-free and reads `pg_controldata`, because dark
+standbys reject SQL connections. An unmounted or otherwise unusable old-primary
+data directory is unverifiable and refuses promotion without `force=true`.
 Promotion rejects missing or stale lag samples and lag above
 `MOSAIC_PROMOTION_MAX_LAG_BYTES` (10 GiB by default); configure the freshness
 window with `MOSAIC_PROMOTION_MAX_LAG_AGE_SECONDS` (five minutes by default).

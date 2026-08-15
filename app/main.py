@@ -565,9 +565,15 @@ class Supervisor:
             if (
                 "no server running" in detail
                 or "not running" in detail
-                or "not a database cluster directory" in detail
                 or "does not exist" in detail
             ):
+                return False
+            if "not a database cluster directory" in detail:
+                if require_path:
+                    raise RuntimeError(
+                        f"cannot verify PostgreSQL cluster at {path}: "
+                        "data directory is not a usable cluster"
+                    ) from exc
                 return False
             else:
                 raise RuntimeError(
@@ -660,19 +666,30 @@ class NodeAgent:
         return False
 
     def _is_in_recovery(self, target: Path, payload: dict) -> bool:
-        if psycopg is None:
-            raise RuntimeError("psycopg is required to promote a standby")
-        with psycopg.connect(
-            host=node_address(payload["target_host_id"]),
-            port=int(payload["target_port"]),
-            user="postgres",
-            password=payload["postgres_password"],
-            dbname="postgres",
-            connect_timeout=5,
-        ) as connection:
-            row = connection.execute("SELECT pg_is_in_recovery()").fetchone()
-        value = row[0] if not isinstance(row, dict) else next(iter(row.values()))
-        return bool(value)
+        result = self.run([pg_bin("pg_controldata"), "-D", str(target)])
+        output = getattr(result, "stdout", result)
+        if isinstance(output, bytes):
+            output = output.decode()
+        state = None
+        for line in str(output).splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key.strip() == "Database cluster state":
+                state = value.strip().lower()
+                break
+        if state == "in production":
+            return False
+        if state and "recovery" in state:
+            return True
+        signal_state = "present" if (target / "standby.signal").exists() else "absent"
+        if state is None:
+            raise RuntimeError(
+                f"could not determine PostgreSQL recovery state from {target} "
+                f"(standby.signal {signal_state})"
+            )
+        raise RuntimeError(
+            f"unsupported PostgreSQL cluster state {state!r} at {target} "
+            f"(standby.signal {signal_state})"
+        )
 
     def promote_standby(self, target: Path, payload: dict) -> dict:
         with self._standby_jobs_lock:
@@ -694,6 +711,7 @@ class NodeAgent:
             int(payload["target_port"]),
             payload["target_host_id"],
         )
+        self.run([pg_bin("pg_ctl"), "-D", str(target), "reload"])
         pid = int((target / "postmaster.pid").read_text().splitlines()[0])
         return {
             "status": "promoted",
@@ -858,7 +876,7 @@ class NodeAgent:
                 listen_setting is not None
                 and listen_setting.group(1) != node_address(payload["host_id"])
             )
-            was_running = alive(payload.get("pid"))
+            was_running = supervisor._cluster_is_running(str(primary_path))
             _rewrite_postgres_config(
                 primary_path,
                 int(payload["port"]),

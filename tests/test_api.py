@@ -717,31 +717,12 @@ def test_promote_standby_clears_standby_configuration_and_is_idempotent(tmp_path
     )
     (target / "standby.signal").write_text("")
     calls = []
-    recovery = iter([True, False, False])
-
-    class Connection:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def execute(self, query):
-            assert query == "SELECT pg_is_in_recovery()"
-            return type(
-                "Result",
-                (),
-                {"fetchone": lambda self: (next(recovery),)},
-            )()
-
-    class FakePsycopg:
-        def connect(self, **kwargs):
-            return Connection()
-
-    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    recovery = iter(["in archive recovery", "in production", "in production"])
 
     def run(argv, env=None):
         calls.append(argv)
+        if argv[0] == main.pg_bin("pg_controldata"):
+            return type("Result", (), {"stdout": f"Database cluster state: {next(recovery)}\n"})()
 
     agent = main.NodeAgent(run)
     payload = {
@@ -761,6 +742,41 @@ def test_promote_standby_clears_standby_configuration_and_is_idempotent(tmp_path
     assert "primary_conninfo" not in auto
     assert "primary_slot_name" not in auto
     assert "hot_standby = on" in (target / "postgresql.conf").read_text()
+    assert sum(call[-1] == "reload" for call in calls) == 2
+
+
+def test_promote_dark_standby_does_not_connect_to_postgres(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
+    target.mkdir()
+    (target / "PG_VERSION").write_text("14\n")
+    (target / "postmaster.pid").write_text("321\n")
+    (target / "postgresql.conf").write_text("port = 55433\nhot_standby = off\n")
+    (target / "standby.signal").write_text("")
+    calls = []
+    recovery = iter(["in archive recovery", "in production"])
+
+    class RefusingPsycopg:
+        def connect(self, **kwargs):
+            raise AssertionError("dark standby recovery detection must not connect")
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[0] == main.pg_bin("pg_controldata"):
+            return type("Result", (), {"stdout": f"Database cluster state: {next(recovery)}\n"})()
+
+    monkeypatch.setattr(main, "psycopg", RefusingPsycopg())
+    result = main.NodeAgent(run).handle("promote_standby", {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "local",
+        "postgres_password": "secret",
+        "promotion_timeout": 1,
+    })
+    assert result == {"status": "promoted", "pid": 321, "port": 55433}
+    assert any(call[-1] == "promote" for call in calls)
 
 
 def test_starting_standby_signal_does_not_promote(tmp_path, monkeypatch):
@@ -1227,6 +1243,24 @@ def test_promotion_refuses_absent_old_primary_without_force(client, monkeypatch)
     assert response.status_code == 409
     assert calls[0][1] == "stop"
     assert calls[0][2]["require_path"] is True
+
+
+def test_strict_stop_refuses_unusable_cluster_directory_but_lenient_stop_succeeds(tmp_path, monkeypatch):
+    path = tmp_path / "not-a-cluster"
+    path.mkdir()
+
+    def run(argv, **kwargs):
+        raise subprocess.CalledProcessError(
+            4,
+            argv,
+            stderr='pg_ctl: directory is not a database cluster directory',
+        )
+
+    monkeypatch.setattr(main.subprocess, "run", run)
+    supervisor = main.Supervisor()
+    assert supervisor.stop_local({"path": str(path)}) == {"status": "stopped", "pid": None}
+    with pytest.raises(RuntimeError, match="not a usable cluster"):
+        supervisor.stop_local({"path": str(path), "require_path": True})
 
 
 def test_standby_build_stops_before_removing_target(tmp_path, monkeypatch):
@@ -1970,7 +2004,7 @@ def test_prepare_primary_refreshes_pid_after_restart(tmp_path, monkeypatch):
 
     monkeypatch.setattr(main, "psycopg", FakePsycopg())
     monkeypatch.setattr(main.supervisor, "start_local", lambda payload: {"status": "running", "pid": 111})
-    monkeypatch.setattr(main, "alive", lambda pid: True)
+    monkeypatch.setattr(main.supervisor, "_cluster_is_running", lambda path: True)
 
     def run(argv, env=None):
         calls.append(argv)
