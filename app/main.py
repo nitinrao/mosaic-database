@@ -692,7 +692,7 @@ class NodeAgent:
     def _standby_status(self, target: Path) -> dict:
         with self._standby_jobs_lock:
             job = self._standby_jobs.get(target)
-            if job:
+            if job and job.get("status") in {"building", "failed"}:
                 return dict(job)
         if not (target / "postmaster.pid").exists():
             return {"status": "failed", "error": "standby postmaster is not running"}
