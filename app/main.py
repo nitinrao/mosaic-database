@@ -2062,10 +2062,15 @@ class _CheckExpressionParser:
             return True
         return False
 
-    def parse(self) -> None:
+    def parse(self) -> str:
         self.parse_or()
         if self.current()[0] != "eof":
             raise HTTPException(400, "constraint expression is not a supported predicate")
+        expression = " ".join(value for kind, value in self.tokens if kind != "eof")
+        expression = re.sub(r"\s+\(", "(", expression)
+        expression = re.sub(r"\(\s+", "(", expression)
+        expression = re.sub(r"\s+\)", ")", expression)
+        return re.sub(r",\s+", ",", expression)
 
     def parse_or(self) -> None:
         self.parse_and()
@@ -2135,8 +2140,8 @@ class _CheckExpressionParser:
         raise HTTPException(400, "constraint expression requires a literal")
 
 
-def validate_check_expression(expression: str) -> None:
-    _CheckExpressionParser(expression).parse()
+def validate_check_expression(expression: str) -> str:
+    return _CheckExpressionParser(expression).parse()
 
 
 def compile_deploy_operations(operations: list[DeployOperation]) -> list[str]:
@@ -2159,12 +2164,12 @@ def compile_deploy_operations(operations: list[DeployOperation]) -> list[str]:
                 f"ON {quote_identifier(operation.table)} ({', '.join(columns)})"
             )
         elif isinstance(operation, AddConstraintOperation):
-            validate_check_expression(operation.expression)
+            rendered_expression = validate_check_expression(operation.expression)
             suffix = hashlib.sha256(operation.expression.encode()).hexdigest()[:10]
             name = f"ck_{operation.table}_{suffix}"[:63]
             compiled.append(
                 f"ALTER TABLE {quote_identifier(operation.table)} ADD CONSTRAINT {quote_identifier(name)} "
-                f"CHECK ({operation.expression})"
+                f"CHECK ({rendered_expression})"
             )
         elif isinstance(operation, RenameColumnOperation):
             compiled.append(
@@ -3107,7 +3112,7 @@ def _begin_deploy(c: Conn, tid: str, deploy_id: str):
     with _deploy_lock:
         row = deploy_row(c, deploy_id, tid)
         if row["status"] != "pending":
-            return row
+            return row, False
         active = c.execute(
             "SELECT 1 FROM deploy_requests WHERE database_id=? AND status='applying' AND id<>?",
             (row["database_id"], deploy_id),
@@ -3121,7 +3126,7 @@ def _begin_deploy(c: Conn, tid: str, deploy_id: str):
         )
         audit(c, tid, "deploy.applying", {"deploy_id": deploy_id, "database_id": row["database_id"], "branch_id": row["branch_id"]})
         c.commit()
-        return deploy_row(c, deploy_id, tid)
+        return deploy_row(c, deploy_id, tid), True
 
 
 def _finish_deploy(c: Conn, row, status: str, schema_version: int, error: str | None = None):
@@ -3239,13 +3244,10 @@ def _apply_deploy(deploy_id: str, tid: str):
                     logger.warning("failed to close deploy connection for %s", deploy_id)
     except Exception:
         logger.exception("deploy apply failed for %s", deploy_id)
-        try:
-            row = deploy_row(c, deploy_id, tid)
-            if row["status"] == "applying":
-                _finish_deploy(c, row, "failed", row["schema_version"], "deploy failed")
-        finally:
-            c.close()
-    else:
+        row = deploy_row(c, deploy_id, tid)
+        if row["status"] == "applying":
+            _finish_deploy(c, row, "failed", row["schema_version"], "deploy failed")
+    finally:
         c.close()
 
 
@@ -3268,9 +3270,11 @@ def apply_deploy(tid: str, did: str, deploy_id: str, response: Response, backgro
         row = deploy_row(c, deploy_id, tid)
         if row["database_id"] != did:
             raise HTTPException(404, "deploy request not found")
-        row = _begin_deploy(c, tid, deploy_id)
+        row, transitioned = _begin_deploy(c, tid, deploy_id)
+        if row["status"] in {"applied", "failed"}:
+            raise HTTPException(409, f"deploy request is already {row['status']}")
         response.status_code = 202
-        if row["status"] == "applying":
+        if transitioned:
             background_tasks.add_task(_apply_deploy, deploy_id, tid)
         return deploy_response(row)
     finally:
