@@ -17,16 +17,18 @@ dedicated ZFS pool below.
 For public database signup, expose the control plane at
 `MOSAIC_PUBLIC_ENDPOINT` (default `https://database-api.mosaicos.com`). The
 unauthenticated `POST /v1/public/signup` route provisions shared tenants and
-rotates keys for repeat email signups; dedicated plans remain an operator
-conversation. Set `MOSAIC_PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS` for its
+refuses repeat signups for an email that already has a tenant; dedicated plans
+remain an operator conversation. Set `MOSAIC_PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS` for its
 per-minute IP and email limit (default `5`). Set
 `MOSAIC_MAX_DATABASES_TOTAL` for the global database ceiling (default `50`);
 the service returns `503` and audits the refusal when that ceiling is reached.
 When the control plane is reachable only through a Cloudflare tunnel, set
 `MOSAIC_TRUST_CLOUDFLARE_IP=true` to bucket signup requests by Cloudflare's
-`CF-Connecting-IP` header. It is off by default; when off, or when the header
-is absent, the service uses the socket peer address. This setting affects only
-signup rate-limit bucketing, not authentication or authorization.
+`CF-Connecting-IP` header. The header is honored only when the socket peer is a
+loopback/private address and the value parses as an IP address. It is off by
+default; when off or invalid, the service uses the socket peer address. This
+setting affects only signup rate-limit bucketing, not authentication or
+authorization.
 
 ## Storage
 

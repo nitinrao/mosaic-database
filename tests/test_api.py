@@ -28,7 +28,7 @@ def client(tmp_path, monkeypatch):
         def clone(self, parent, target, parent_port=None, parent_password=None, target_port=None, parent_host_id="local", target_host_id="local"): Path(target).mkdir(parents=True, exist_ok=True)
         def destroy(self, path): return None
     monkeypatch.setattr(main, "engine", lambda: FakeEngine())
-    with TestClient(main.app) as test_client:
+    with TestClient(main.app, client=("127.0.0.1", 12345)) as test_client:
         yield test_client
 
 
@@ -38,7 +38,7 @@ def tenant(client, plan="shared"):
     return response.json()
 
 
-def test_public_signup_authenticates_and_rotates_one_tenant(client, monkeypatch):
+def test_public_signup_authenticates_and_refuses_existing_email(client, monkeypatch):
     monkeypatch.setattr(main, "MOSAIC_PUBLIC_ENDPOINT", "https://database-api.test")
     first = client.post(
         "/v1/public/signup",
@@ -57,25 +57,42 @@ def test_public_signup_authenticates_and_rotates_one_tenant(client, monkeypatch)
         headers={"X-API-Key": old_key},
     ).status_code == 200
 
+    c = main.db()
+    try:
+        before = c.execute(
+            "SELECT api_key_hash,name,status FROM tenants WHERE id=?",
+            (tenant_id,),
+        ).fetchone()
+        before_signup = c.execute(
+            "SELECT tenant_name,last_key_created_at,updated_at FROM public_signups WHERE email=?",
+            ("ops@example.com",),
+        ).fetchone()
+    finally:
+        c.close()
+
     second = client.post(
         "/v1/public/signup",
         json={"email": "ops@example.com", "tenant_name": "Ops Database"},
     )
-    assert second.status_code == 200
-    rotated = second.json()
-    assert rotated["status"] == "rotated"
-    assert rotated["tenant_id"] == tenant_id
+    assert second.status_code == 409
+    assert "already exists" in second.json()["detail"]
     assert client.get(
         f"/v1/tenants/{tenant_id}/usage",
         headers={"X-API-Key": old_key},
-    ).status_code == 401
-    assert client.get(
-        f"/v1/tenants/{tenant_id}/usage",
-        headers={"X-API-Key": rotated["api_key"]},
     ).status_code == 200
     c = main.db()
     try:
         assert c.execute("SELECT COUNT(*) AS n FROM tenants").fetchone()["n"] == 1
+        after = c.execute(
+            "SELECT api_key_hash,name,status FROM tenants WHERE id=?",
+            (tenant_id,),
+        ).fetchone()
+        after_signup = c.execute(
+            "SELECT tenant_name,last_key_created_at,updated_at FROM public_signups WHERE email=?",
+            ("ops@example.com",),
+        ).fetchone()
+        assert tuple(after) == tuple(before)
+        assert tuple(after_signup) == tuple(before_signup)
         actions = [
             row["action"]
             for row in c.execute(
@@ -83,7 +100,7 @@ def test_public_signup_authenticates_and_rotates_one_tenant(client, monkeypatch)
                 (tenant_id,),
             ).fetchall()
         ]
-        assert actions == ["public_signup.created", "public_signup.rotated"]
+        assert actions == ["public_signup.created", "public_signup.refused_existing"]
     finally:
         c.close()
 
@@ -144,6 +161,30 @@ def test_public_signup_honors_forwarded_ip_when_trusted(client, monkeypatch):
     assert limited.status_code == 429
 
 
+def test_public_signup_rejects_forwarded_ip_from_untrusted_peer():
+    request = main.Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/public/signup",
+        "headers": [(b"cf-connecting-ip", b"198.51.100.20")],
+        "client": ("8.8.8.8", 443),
+        "scheme": "http",
+        "server": ("control-plane", 80),
+    })
+    old = main.TRUST_CLOUDFLARE_IP
+    main.TRUST_CLOUDFLARE_IP = True
+    try:
+        assert main.public_signup_client_ip(request) == "8.8.8.8"
+    finally:
+        main.TRUST_CLOUDFLARE_IP = old
+
+
+def test_rate_limit_drops_expired_bucket(client, monkeypatch):
+    main._rate["expired"] = [time.time() - 61]
+    main.check_rate_limit("expired", 2)
+    assert len(main._rate["expired"]) == 1
+
+
 def test_database_capacity_ceiling_applies_to_all_callers(client, monkeypatch):
     first = tenant(client)
     created = client.post(
@@ -168,6 +209,26 @@ def test_database_capacity_ceiling_applies_to_all_callers(client, monkeypatch):
             (second["tenant_id"],),
         ).fetchone()
         assert row["action"] == "database.creation_refused_capacity"
+    finally:
+        c.close()
+
+
+def test_database_provisioning_failure_does_not_commit_database(client, monkeypatch):
+    created = tenant(client)
+
+    def fail_provision(*args, **kwargs):
+        raise RuntimeError("provision failed")
+
+    monkeypatch.setattr(main.node_transport, "call", fail_provision)
+    with pytest.raises(RuntimeError, match="provision failed"):
+        client.post(
+            f"/v1/tenants/{created['tenant_id']}/databases",
+            headers={"X-API-Key": created["api_key"]},
+            json={"name": "failed"},
+        )
+    c = main.db()
+    try:
+        assert c.execute("SELECT COUNT(*) AS n FROM databases").fetchone()["n"] == 0
     finally:
         c.close()
 

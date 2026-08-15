@@ -2,8 +2,8 @@
 
 Each database has an independent PostgreSQL data directory and a `main` branch.
 The unauthenticated `POST /v1/public/signup` endpoint supports self-serve
-`shared` tenants, returns an API key once, and rotates that key when the same
-email signs up again. Its public base URL is configured with
+`shared` tenants and returns an API key exactly once. An email that already has
+a tenant is refused with `409`; no tenant or key state is changed. Its public base URL is configured with
 `MOSAIC_PUBLIC_ENDPOINT` (default `https://database-api.mosaicos.com`).
 Self-serve signup is rate-limited independently by IP and email.
 

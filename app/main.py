@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -67,6 +68,7 @@ MCP_TOOLS = [{"name": n, "description": d, "inputSchema": {"type": "object"}} fo
     ("inspect_schema", "Inspect branch schema"), ("query", "Execute one governed statement"),
     ("create_branch", "Create a branch"), ("list_branches", "List branches"))]
 _rate: dict[str, list[float]] = {}
+_rate_lock = threading.Lock()
 logger = logging.getLogger(__name__)
 
 
@@ -1646,18 +1648,32 @@ def tenant_auth(tid: str, x_api_key: str | None = Header(default=None, alias="X-
 
 def check_rate_limit(tid: str, limit: int | None = None):
     limit = RATE_LIMIT_REQUESTS if limit is None else limit
-    values = [x for x in _rate.get(tid, []) if x > time.time() - 60]
-    if len(values) >= limit:
-        raise HTTPException(429, "rate limit exceeded")
-    _rate[tid] = values + [time.time()]
+    current = time.time()
+    with _rate_lock:
+        values = [x for x in _rate.get(tid, []) if x > current - 60]
+        if not values:
+            _rate.pop(tid, None)
+        if len(values) >= limit:
+            raise HTTPException(429, "rate limit exceeded")
+        _rate[tid] = values + [current]
 
 
 def public_signup_client_ip(request: Request) -> str:
     peer = request.client.host if request.client else "unknown"
     if TRUST_CLOUDFLARE_IP:
-        forwarded = request.headers.get("CF-Connecting-IP", "").strip()
-        if forwarded:
-            return forwarded
+        try:
+            peer_ip = ipaddress.ip_address(peer)
+        except ValueError:
+            peer_ip = None
+        if peer_ip and (peer_ip.is_loopback or peer_ip.is_private):
+            try:
+                forwarded = ipaddress.ip_address(
+                    request.headers.get("CF-Connecting-IP", "").strip()
+                )
+            except ValueError:
+                forwarded = None
+            if forwarded:
+                return str(forwarded)
     return peer
 
 
@@ -1815,8 +1831,6 @@ def public_signup(payload: PublicSignupCreate, request: Request):
         raise HTTPException(400, "dedicated plans require you to get in touch with Mosaic")
     tenant_name = derive_tenant_name(email, payload.tenant_name)
     key_name = payload.key_name.strip() or "Self-serve key"
-    api_key = token("mdb_live_")
-    created = now()
     c = db()
     try:
         signup = c.execute(
@@ -1831,17 +1845,17 @@ def public_signup(payload: PublicSignupCreate, request: Request):
             ).fetchone()
             if not tenant:
                 raise HTTPException(500, "signup record is missing its tenant")
-            effective_name = tenant_name if payload.tenant_name.strip() else tenant["name"]
-            c.execute(
-                "UPDATE tenants SET name=?,api_key_hash=?,status='active' WHERE id=?",
-                (effective_name, digest(api_key), tenant_id),
+            audit(c, tenant_id, "public_signup.refused_existing", {
+                "reason": "email already has a tenant",
+            }, actor=email)
+            c.commit()
+            raise HTTPException(
+                409,
+                "an account already exists for that email; use your existing key or contact Mosaic",
             )
-            c.execute(
-                "UPDATE public_signups SET tenant_name=?,last_key_created_at=?,updated_at=? WHERE email=?",
-                (effective_name, created, created, email),
-            )
-            status_text = "rotated"
         else:
+            api_key = token("mdb_live_")
+            created = now()
             tenant_id = token("ten_")
             effective_name = tenant_name
             c.execute(
@@ -2230,8 +2244,8 @@ def create_database(tid: str, payload: DatabaseCreate, tenant=Depends(tenant_aut
             c.execute("INSERT INTO branches(id,database_id,name,parent_id,path,port,pid,status,credential_encrypted,last_query_at,created_at,host_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (bid, did, "main", None, str(root / "main"), main_port, None, "stopped", cipher().encrypt(password.encode()).decode(), now(), now(), host_id))
             main_row = c.execute("SELECT * FROM branches WHERE id=?", (bid,)).fetchone()
             create_replicas(c, did, main_row, password)
-        audit(c, tid, "database.created", {"database_id": did})
-        c.commit()
+            audit(c, tid, "database.created", {"database_id": did})
+            c.commit()
         return {"id": did, "name": payload.name, "status": "ready", "main_branch": {"id": bid, "name": "main", "password": password}}
     finally:
         c.close()
