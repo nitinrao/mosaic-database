@@ -35,7 +35,9 @@ reaper cannot stop its postmaster. A deploy to `main` must reference an earlier
 matching deploy that succeeded on a branch of the same database. Destructive
 operations require explicit confirmation and are refused on `main` until WAL
 archiving exists. Each deploy records a monotonically increasing database
-`schema_version` for future query pinning.
+branch-local `schema_version` for future query pinning. Deploy leases are
+reconciled on startup and during reaper sweeps; an expired apply is marked
+failed and its branch lock is released.
 
 Production ZFS datasets are created and cloned with an explicit mountpoint equal
 to the branch's absolute path under `MOSAIC_BRANCH_ROOT`; relying on ZFS's

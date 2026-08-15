@@ -152,7 +152,7 @@ export default function DocsPage() {
             <p>
               Schema changes use declarative deploy requests rather than SQL text. Create a deploy to inspect its
               server-compiled preview, then apply it with <code>POST …/deploys/&#123;id&#125;/apply</code>. Deploys run
-              transactionally and return a monotonically increasing <code>schema_version</code>. Apply schema changes
+              transactionally and return a branch-local <code>schema_version</code>. Apply schema changes
               on a branch first; a deploy to <code>main</code> must reference the matching successful branch deploy.
             </p>
             <CodeBlock value={deploy} />

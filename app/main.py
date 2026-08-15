@@ -731,6 +731,7 @@ class Supervisor:
         for row in c.execute(
             "SELECT b.* FROM branches b "
             "WHERE b.status='running' "
+            "AND NOT EXISTS (SELECT 1 FROM deploy_locks l WHERE l.branch_id=b.id) "
             "AND NOT EXISTS ("
             "SELECT 1 FROM replicas r WHERE r.primary_branch_id=b.id"
             ")"
@@ -1686,6 +1687,10 @@ async def _replication_loop():
 def _run_reaper_sweep():
     c = db()
     try:
+        try:
+            reconcile_deploy_locks(c)
+        except Exception:
+            logger.exception("deploy lease reconciliation failed")
         reap_branches(c)
     except Exception:
         logger.exception("branch reaper sweep failed")
@@ -1744,6 +1749,7 @@ async def startup():
     c = db()
     try:
         initialize_schema(c)
+        reconcile_deploy_locks(c)
         BRANCH_ROOT.mkdir(parents=True, exist_ok=True)
     finally:
         c.close()
@@ -1971,7 +1977,19 @@ DEPLOY_TYPES = {
     "jsonb",
 }
 DEPLOY_DEFAULT = re.compile(r"^(?:now\(\)|current_timestamp|true|false|null|-?\d+(?:\.\d+)?|'(?:[^']|'')*')$", re.IGNORECASE)
-DEPLOY_EXPRESSION = re.compile(r"^[A-Za-z0-9_.'\"()\s=<>!+\-*/%,:]+$")
+DEPLOY_CHECK_FUNCTIONS = {
+    "abs",
+    "char_length",
+    "jsonb_typeof",
+    "length",
+    "lower",
+    "upper",
+}
+DEPLOY_CHECK_TOKEN = re.compile(
+    r"\s*(?:(?P<string>'(?:[^']|'')*')|(?P<number>-?\d+(?:\.\d+)?)|"
+    r"(?P<identifier>[A-Za-z_][A-Za-z0-9_]*)|(?P<operator><>|<=|>=|!=|=|<|>)|"
+    r"(?P<punct>[(),]))"
+)
 
 
 def quote_identifier(value: str) -> str:
@@ -2006,6 +2024,121 @@ def deploy_column_sql(column: DeployColumn) -> str:
     return " ".join(parts)
 
 
+def _check_tokens(expression: str) -> list[tuple[str, str]]:
+    tokens = []
+    position = 0
+    while position < len(expression):
+        if not expression[position:].strip():
+            break
+        match = DEPLOY_CHECK_TOKEN.match(expression, position)
+        if not match:
+            raise HTTPException(400, "constraint expression is not a supported predicate")
+        position = match.end()
+        kind = "string" if match.group("string") else "number" if match.group("number") else "identifier" if match.group("identifier") else "operator" if match.group("operator") else "punct"
+        value = next(value for value in match.groups() if value is not None)
+        tokens.append((kind, value))
+    tokens.append(("eof", ""))
+    return tokens
+
+
+class _CheckExpressionParser:
+    def __init__(self, expression: str):
+        self.tokens = _check_tokens(expression)
+        self.position = 0
+
+    def current(self) -> tuple[str, str]:
+        return self.tokens[self.position]
+
+    def take(self, value: str | None = None) -> tuple[str, str]:
+        token = self.current()
+        if value is not None and token[1].upper() != value:
+            raise HTTPException(400, "constraint expression is not a supported predicate")
+        self.position += 1
+        return token
+
+    def accept(self, value: str) -> bool:
+        if self.current()[1].upper() == value:
+            self.position += 1
+            return True
+        return False
+
+    def parse(self) -> None:
+        self.parse_or()
+        if self.current()[0] != "eof":
+            raise HTTPException(400, "constraint expression is not a supported predicate")
+
+    def parse_or(self) -> None:
+        self.parse_and()
+        while self.accept("OR"):
+            self.parse_and()
+
+    def parse_and(self) -> None:
+        self.parse_not()
+        while self.accept("AND"):
+            self.parse_not()
+
+    def parse_not(self) -> None:
+        if self.accept("NOT"):
+            self.parse_not()
+        else:
+            self.parse_primary()
+
+    def parse_primary(self) -> None:
+        if self.accept("("):
+            self.parse_or()
+            self.take(")")
+            return
+        self.parse_predicate()
+
+    def parse_predicate(self) -> None:
+        self.parse_value(allow_literal=False)
+        if self.accept("IS"):
+            self.accept("NOT")
+            self.take("NULL")
+            return
+        if self.accept("IN"):
+            self.take("(")
+            self.parse_literal()
+            while self.accept(","):
+                self.parse_literal()
+            self.take(")")
+            return
+        if self.accept("BETWEEN"):
+            self.parse_literal()
+            self.take("AND")
+            self.parse_literal()
+            return
+        if self.current()[0] != "operator":
+            raise HTTPException(400, "constraint expression is not a supported predicate")
+        self.take()
+        self.parse_literal()
+
+    def parse_value(self, *, allow_literal: bool) -> None:
+        kind, value = self.current()
+        if kind != "identifier":
+            if allow_literal:
+                self.parse_literal()
+                return
+            raise HTTPException(400, "constraint expression is not a supported predicate")
+        self.take()
+        if self.accept("("):
+            if value.lower() not in DEPLOY_CHECK_FUNCTIONS:
+                raise HTTPException(400, f"constraint function is not allowed: {value}")
+            self.parse_value(allow_literal=False)
+            self.take(")")
+
+    def parse_literal(self) -> None:
+        kind, value = self.current()
+        if kind in {"string", "number"} or (kind == "identifier" and value.lower() in {"false", "null", "true"}):
+            self.position += 1
+            return
+        raise HTTPException(400, "constraint expression requires a literal")
+
+
+def validate_check_expression(expression: str) -> None:
+    _CheckExpressionParser(expression).parse()
+
+
 def compile_deploy_operations(operations: list[DeployOperation]) -> list[str]:
     compiled = []
     for operation in operations:
@@ -2026,10 +2159,7 @@ def compile_deploy_operations(operations: list[DeployOperation]) -> list[str]:
                 f"ON {quote_identifier(operation.table)} ({', '.join(columns)})"
             )
         elif isinstance(operation, AddConstraintOperation):
-            if not DEPLOY_EXPRESSION.fullmatch(operation.expression) or any(
-                marker in operation.expression.lower() for marker in ("--", "/*", "*/", ";")
-            ):
-                raise HTTPException(400, "constraint expression contains unsupported SQL")
+            validate_check_expression(operation.expression)
             suffix = hashlib.sha256(operation.expression.encode()).hexdigest()[:10]
             name = f"ck_{operation.table}_{suffix}"[:63]
             compiled.append(
@@ -2946,13 +3076,27 @@ def create_deploy_request(c: Conn, tid: str, did: str, payload: DeployCreate, te
         raise HTTPException(403, "daily deploy limit exceeded")
     deploy_id = token("dep_")
     created_at = now()
-    c.execute(
-        "INSERT INTO deploy_requests(id,tenant_id,database_id,branch_id,operations,sql_preview,status,schema_version,error,idempotency_key,source_deploy_id,created_at,applied_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (deploy_id, tid, did, branch_row["id"], operations_json, json.dumps(sql_preview), "pending", 0, None, payload.idempotency_key, payload.source_deploy_id, created_at, None),
-    )
-    audit(c, tid, "deploy.created", {"deploy_id": deploy_id, "database_id": did, "branch_id": branch_row["id"]})
-    c.commit()
+    try:
+        c.execute(
+            "INSERT INTO deploy_requests(id,tenant_id,database_id,branch_id,operations,sql_preview,status,schema_version,error,idempotency_key,source_deploy_id,created_at,applied_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (deploy_id, tid, did, branch_row["id"], operations_json, json.dumps(sql_preview), "pending", 0, None, payload.idempotency_key, payload.source_deploy_id, created_at, None),
+        )
+        audit(c, tid, "deploy.created", {"deploy_id": deploy_id, "database_id": did, "branch_id": branch_row["id"]})
+        c.commit()
+    except Exception as exc:
+        if not is_unique_violation(exc):
+            raise
+        c.rollback()
+        if payload.idempotency_key:
+            existing = c.execute(
+                "SELECT r.*, b.name AS branch_name FROM deploy_requests r JOIN branches b ON b.id=r.branch_id "
+                "WHERE r.tenant_id=? AND r.idempotency_key=?",
+                (tid, payload.idempotency_key),
+            ).fetchone()
+            if existing:
+                return deploy_response(existing, duplicate=True)
+        raise
     return deploy_response(c.execute(
         "SELECT r.*, b.name AS branch_name FROM deploy_requests r JOIN branches b ON b.id=r.branch_id WHERE r.id=?",
         (deploy_id,),
@@ -2996,6 +3140,37 @@ def _finish_deploy(c: Conn, row, status: str, schema_version: int, error: str | 
     c.commit()
 
 
+def deploy_lock_lease_seconds() -> int:
+    return max(1, int(os.getenv("MOSAIC_DEPLOY_LOCK_LEASE_SECONDS", "900")))
+
+
+def reconcile_deploy_locks(c: Conn) -> int:
+    cutoff = time.time() - deploy_lock_lease_seconds()
+    recovered = 0
+    rows = c.execute(
+        "SELECT r.*, l.started_at FROM deploy_requests r "
+        "LEFT JOIN deploy_locks l ON l.deploy_id=r.id "
+        "WHERE r.status='applying'"
+    ).fetchall()
+    for row in rows:
+        stale = not row["started_at"]
+        if row["started_at"]:
+            try:
+                stale = datetime.fromisoformat(row["started_at"]).timestamp() < cutoff
+            except ValueError:
+                stale = True
+        if stale:
+            _finish_deploy(
+                c,
+                row,
+                "failed",
+                row["schema_version"],
+                "deploy interrupted before completion",
+            )
+            recovered += 1
+    return recovered
+
+
 def _apply_deploy(deploy_id: str, tid: str):
     c = db()
     conn = None
@@ -3027,8 +3202,9 @@ def _apply_deploy(deploy_id: str, tid: str):
                 conn.execute(statement)
             conn.commit()
             database_row = c.execute(
-                "SELECT COALESCE(MAX(schema_version),0) AS schema_version FROM deploy_requests WHERE database_id=? AND status='applied'",
-                (row["database_id"],),
+                "SELECT COALESCE(MAX(schema_version),0) AS schema_version FROM deploy_requests "
+                "WHERE branch_id=? AND status='applied'",
+                (row["branch_id"],),
             ).fetchone()
             schema_version = database_row["schema_version"] + 1
             _finish_deploy(c, row, "applied", schema_version)
@@ -3074,10 +3250,13 @@ def _apply_deploy(deploy_id: str, tid: str):
 
 
 @app.post("/v1/tenants/{tid}/databases/{did}/deploys", status_code=201)
-def create_deploy(tid: str, did: str, payload: DeployCreate, tenant=Depends(tenant_auth)):
+def create_deploy(tid: str, did: str, payload: DeployCreate, response: Response, tenant=Depends(tenant_auth)):
     c = db()
     try:
-        return create_deploy_request(c, tid, did, payload, tenant)
+        result = create_deploy_request(c, tid, did, payload, tenant)
+        if result.get("duplicate"):
+            response.status_code = 200
+        return result
     finally:
         c.close()
 

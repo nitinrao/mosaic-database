@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -3477,6 +3478,270 @@ def test_reaper_does_not_stop_branch_with_deploy_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "node_transport", Transport())
     assert main.reap_branches(c) == 0
     c.close()
+
+
+def test_deploy_check_grammar_rejects_unbounded_functions():
+    for expression in (
+        "pg_sleep(10) IS NULL",
+        "pg_read_file('/etc/passwd') IS NOT NULL",
+        "id = (SELECT 1)",
+        "lower(name) = 'alice' AND id BETWEEN 1 AND 10",
+    )[:2]:
+        with pytest.raises(main.HTTPException):
+            main.validate_check_expression(expression)
+    main.validate_check_expression("lower(name) = 'alice' AND id BETWEEN 1 AND 10")
+    main.validate_check_expression("(id IN (1, 2, 3) OR id IS NULL) AND NOT active = false")
+
+
+def test_stranded_deploy_lease_is_recovered_and_branch_reaped(tmp_path, monkeypatch):
+    main.DB_PATH = tmp_path / "lease-recovery.db"
+    c = main.db()
+    main.initialize_schema(c)
+    c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_l", "l", "shared", "h", "active", main.now()))
+    c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_l", "ten_l", "l", str(tmp_path), "ready", main.now()))
+    c.execute(
+        "INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("br_l", "db_l", "main", None, str(tmp_path / "main"), 55432, 123, "running", "x", "2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00", "local"),
+    )
+    c.execute(
+        "INSERT INTO deploy_requests(id,tenant_id,database_id,branch_id,operations,sql_preview,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        ("dep_l", "ten_l", "db_l", "br_l", "[]", "[]", "applying", main.now()),
+    )
+    c.execute("INSERT INTO deploy_locks VALUES(?,?,?)", ("br_l", "dep_l", "2000-01-01T00:00:00+00:00"))
+    c.commit()
+    assert main.reconcile_deploy_locks(c) == 1
+    assert c.execute("SELECT status,error FROM deploy_requests WHERE id='dep_l'").fetchone()["status"] == "failed"
+    assert c.execute("SELECT COUNT(*) AS n FROM deploy_locks").fetchone()["n"] == 0
+    stopped = []
+    class Transport:
+        def call(self, host_id, operation, payload):
+            stopped.append(operation)
+            return {"status": "stopped", "pid": None}
+    monkeypatch.setattr(main, "node_transport", Transport())
+    assert main.reap_branches(c) == 1
+    assert stopped == ["stop"]
+    c.close()
+
+
+def test_supervisor_reap_also_respects_deploy_lock(tmp_path, monkeypatch):
+    main.DB_PATH = tmp_path / "supervisor-reaper.db"
+    c = main.db()
+    main.initialize_schema(c)
+    c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_s", "s", "shared", "h", "active", main.now()))
+    c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_s", "ten_s", "s", str(tmp_path), "ready", main.now()))
+    c.execute(
+        "INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("br_s", "db_s", "main", None, str(tmp_path / "main"), 55432, 123, "running", "x", "2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00", "local"),
+    )
+    c.execute(
+        "INSERT INTO deploy_requests(id,tenant_id,database_id,branch_id,operations,sql_preview,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        ("dep_s", "ten_s", "db_s", "br_s", "[]", "[]", "applying", main.now()),
+    )
+    c.execute("INSERT INTO deploy_locks VALUES(?,?,?)", ("br_s", "dep_s", main.now()))
+    c.commit()
+    monkeypatch.setattr(main.supervisor, "stop", lambda row, conn: pytest.fail("locked branch was reaped"))
+    assert main.supervisor.reap(c, idle_seconds=1) == 0
+    c.close()
+
+
+def test_deploy_rest_applies_every_operation_and_branch_version(client, monkeypatch):
+    created, database, branch = _deploy_database(client, monkeypatch)
+    headers = {"X-API-Key": created["api_key"]}
+
+    class Connection:
+        def __init__(self):
+            self.statements = []
+        def execute(self, statement, params=()):
+            self.statements.append(statement)
+            return self
+        def commit(self):
+            return None
+        def rollback(self):
+            return None
+        def close(self):
+            return None
+
+    connection = Connection()
+    class FakePsycopg:
+        def connect(self, **kwargs):
+            return connection
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    operations = [
+        {"op": "create_table", "name": "events", "columns": [{"name": "id", "type": "bigint"}]},
+        {"op": "add_column", "table": "events", "column": {"name": "name", "type": "text"}},
+        {"op": "create_index", "table": "events", "columns": ["name"]},
+        {"op": "add_constraint", "table": "events", "kind": "check", "expression": "length(name) > 0"},
+        {"op": "rename_column", "table": "events", "from": "name", "to": "label"},
+        {"op": "drop_column", "table": "events", "column": "label", "confirm_destructive": True},
+        {"op": "drop_table", "name": "events", "confirm_destructive": True},
+    ]
+    created_deploy = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys",
+        headers=headers,
+        json={"branch": branch["id"], "operations": operations, "idempotency_key": "all-ops"},
+    )
+    assert created_deploy.status_code == 201
+    deploy_id = created_deploy.json()["id"]
+    applied = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys/{deploy_id}/apply",
+        headers=headers,
+    )
+    assert applied.status_code == 202
+    fetched = client.get(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys/{deploy_id}",
+        headers=headers,
+    ).json()
+    assert fetched["status"] == "applied"
+    assert fetched["schema_version"] == 1
+    assert all("SET " not in statement for statement in fetched["sql_preview"])
+    assert any("CREATE TABLE" in statement for statement in connection.statements)
+
+
+def test_deploy_branch_then_main_and_duplicate_is_200(client, monkeypatch):
+    created, database, branch = _deploy_database(client, monkeypatch)
+    headers = {"X-API-Key": created["api_key"]}
+    class Connection:
+        def execute(self, statement, params=()):
+            return self
+        def commit(self):
+            return None
+        def rollback(self):
+            return None
+        def close(self):
+            return None
+    class FakePsycopg:
+        def connect(self, **kwargs):
+            return Connection()
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    operation = {"op": "create_table", "name": "events", "columns": [{"name": "id", "type": "bigint"}]}
+    branch_deploy = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys",
+        headers=headers,
+        json={"branch": branch["id"], "operations": [operation], "idempotency_key": "branch-once"},
+    )
+    deploy_id = branch_deploy.json()["id"]
+    client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys/{deploy_id}/apply",
+        headers=headers,
+    )
+    main_deploy = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys",
+        headers=headers,
+        json={"branch": "main", "source_deploy_id": deploy_id, "operations": [operation], "idempotency_key": "main-once"},
+    )
+    assert main_deploy.status_code == 201
+    main_id = main_deploy.json()["id"]
+    client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys/{main_id}/apply",
+        headers=headers,
+    )
+    main_result = client.get(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys/{main_id}",
+        headers=headers,
+    ).json()
+    assert main_result["status"] == "applied"
+    assert main_result["schema_version"] == 1
+    duplicate = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys",
+        headers=headers,
+        json={"branch": "main", "source_deploy_id": deploy_id, "operations": [operation], "idempotency_key": "main-once"},
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()["duplicate"] is True
+
+
+def test_failed_deploy_is_redacted_and_list_get_are_database_scoped(client, monkeypatch):
+    created, database, branch = _deploy_database(client, monkeypatch)
+    headers = {"X-API-Key": created["api_key"]}
+    second = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers=headers,
+        json={"name": "second"},
+    ).json()
+    operation = {"op": "create_table", "name": "events", "columns": [{"name": "id", "type": "bigint"}]}
+    deploy = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys",
+        headers=headers,
+        json={"branch": branch["id"], "operations": [operation]},
+    ).json()
+    c = main.db()
+    try:
+        branch_row = c.execute("SELECT path,credential_encrypted FROM branches WHERE id=?", (branch["id"],)).fetchone()
+        branch_path = branch_row["path"]
+        branch_password = main.cipher().decrypt(branch_row["credential_encrypted"].encode()).decode()
+    finally:
+        c.close()
+    class ProgrammingFailure(Exception):
+        class Diag:
+            message_primary = f"bad at {branch_path}"
+            message_hint = f"password={branch_password}"
+            statement_position = None
+        diag = Diag()
+    class Errors:
+        ProgrammingError = ProgrammingFailure
+    class Connection:
+        def execute(self, statement, params=()):
+            if statement.startswith("SET "):
+                return self
+            raise ProgrammingFailure("failed")
+        def commit(self):
+            return None
+        def rollback(self):
+            return None
+        def close(self):
+            return None
+    class FakePsycopg:
+        errors = Errors()
+        def connect(self, **kwargs):
+            return Connection()
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    c = main.db()
+    try:
+        main._begin_deploy(c, created["tenant_id"], deploy["id"])
+    finally:
+        c.close()
+    main._apply_deploy(deploy["id"], created["tenant_id"])
+    failed = client.get(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/deploys/{deploy['id']}",
+        headers=headers,
+    ).json()
+    assert failed["status"] == "failed"
+    assert str(main.BRANCH_ROOT) not in failed["error"]
+    assert "password=hidden" not in failed["error"]
+    c = main.db()
+    try:
+        assert c.execute("SELECT COUNT(*) AS n FROM deploy_locks").fetchone()["n"] == 0
+    finally:
+        c.close()
+    assert client.get(
+        f"/v1/tenants/{created['tenant_id']}/databases/{second['id']}/deploys",
+        headers=headers,
+    ).json()["deploys"] == []
+    assert client.get(
+        f"/v1/tenants/{created['tenant_id']}/databases/{second['id']}/deploys/{deploy['id']}",
+        headers=headers,
+    ).status_code == 404
+
+
+def test_mcp_deploy_and_get_deploy_use_same_path(client, monkeypatch):
+    created, database, branch = _deploy_database(client, monkeypatch)
+    args = {
+        "database_id": database["id"],
+        "branch": branch["id"],
+        "operations": [{"op": "create_table", "name": "events", "columns": [{"name": "id", "type": "bigint"}]}],
+    }
+    def call(name, arguments):
+        return client.post(
+            "/mcp",
+            headers={"X-API-Key": created["api_key"]},
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}},
+        )
+    deploy = call("deploy", args)
+    assert deploy.status_code == 200
+    result = json.loads(deploy.json()["result"]["content"][0]["text"])
+    fetched = call("get_deploy", {"database_id": database["id"], "deploy_id": result["id"]})
+    assert fetched.status_code == 200
+    assert json.loads(fetched.json()["result"]["content"][0]["text"])["id"] == result["id"]
 
 
 def _query_database(client, monkeypatch):
