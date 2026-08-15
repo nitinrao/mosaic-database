@@ -919,7 +919,7 @@ async def _reaper_loop():
 async def _replication_loop():
     while True:
         try:
-            await asyncio.sleep(max(1, int(os.getenv("MOSAIC_REPLICATION_RETRY_INTERVAL", "10"))))
+            await asyncio.sleep(background_interval("MOSAIC_REPLICATION_RETRY_INTERVAL", 10))
             c = db()
             try:
                 reconcile_replicas(c)
