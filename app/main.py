@@ -47,6 +47,7 @@ IDLE_REAPER_SECONDS = int(os.getenv("MOSAIC_BRANCH_IDLE_SECONDS", "900"))
 PORT_MIN = int(os.getenv("MOSAIC_POSTGRES_PORT_MIN", "55432"))
 RATE_LIMIT_REQUESTS = int(os.getenv("MOSAIC_RATE_LIMIT_REQUESTS", "120"))
 PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS = int(os.getenv("MOSAIC_PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS", "5"))
+PUBLIC_LISTENER = os.getenv("MOSAIC_PUBLIC_LISTENER", "").lower() == "true"
 RATE_LIMIT_SWEEP_THRESHOLD = 256
 RATE_LIMIT_SWEEP_INTERVAL_SECONDS = 60.0
 MAX_DATABASES_TOTAL = int(os.getenv("MOSAIC_MAX_DATABASES_TOTAL", "50"))
@@ -1853,6 +1854,8 @@ def require_node_agent_token(token: str | None):
 
 @app.post("/internal/node/{operation}")
 def internal_node(request: Request, operation: str, payload: dict, x_node_token: str | None = Header(default=None, alias="X-Mosaic-Node-Token")):
+    if PUBLIC_LISTENER:
+        raise HTTPException(404, "not found")
     require_node_agent_token(x_node_token)
     allowed = {"127.0.0.1", "::1", *node_private_addresses().values()}
     if not request.client or request.client.host not in allowed:
@@ -1893,11 +1896,13 @@ def mcp_get():
 
 
 @app.post("/mcp")
-def mcp(payload: dict, response: Response, x_api_key: str | None = Header(default=None, alias="X-API-Key"), authorization: str | None = Header(default=None)):
+def mcp(payload: dict, request: Request, response: Response, x_api_key: str | None = Header(default=None, alias="X-API-Key"), authorization: str | None = Header(default=None)):
     if len(json.dumps(payload)) > 1000000:
         raise HTTPException(413, "MCP payload too large")
     response.headers["MCP-Protocol-Version"] = MCP_PROTOCOL_VERSION
     if payload.get("method") == "initialize":
+        client_ip = public_signup_client_ip(request)
+        check_rate_limit(f"public-mcp-ip:{client_ip}", PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS)
         return {"jsonrpc": "2.0", "id": payload.get("id"), "result": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "mosaic-database", "version": "0.1.0"}}}
     key = x_api_key or (authorization or "").removeprefix("Bearer ").strip()
     c = db()

@@ -122,6 +122,24 @@ The node agent does not access the control-plane ledger; the control plane
 passes operation details and remains the only ledger writer. Existing branch
 rows migrate to the `local` node.
 
+## Public API process
+
+The internet-facing API is a separate process from the node agent. Keep the
+node-agent process bound to its host's WireGuard address and port, and run the
+public process with a loopback bind behind `cloudflared`, for example:
+
+```text
+MOSAIC_PUBLIC_LISTENER=true
+MOSAIC_TRUST_CLOUDFLARE_IP=true
+```
+
+The public process must not be a tunnel target for the node-agent listener.
+With `MOSAIC_PUBLIC_LISTENER=true`, it refuses `/internal/node/{operation}`
+before checking the node token, so a tunnel misconfiguration cannot expose
+cluster lifecycle or data-directory operations. `MOSAIC_TRUST_CLOUDFLARE_IP`
+lets public rate limits use the validated Cloudflare client address instead of
+putting every caller behind the tunnel in one socket-peer bucket.
+
 ## Co-tenancy
 
 ZFS ARC is capped at 8 GiB through

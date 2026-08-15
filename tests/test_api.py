@@ -375,6 +375,64 @@ def test_auth_limits_and_key_rotation(client):
     assert client.get(f"/v1/tenants/{tid}/usage", headers={"X-API-Key": rotated}).status_code == 200
 
 
+def request_with_client(client_ip, forwarded_ip=None):
+    headers = []
+    if forwarded_ip:
+        headers.append((b"cf-connecting-ip", forwarded_ip.encode()))
+    return main.Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp",
+        "headers": headers,
+        "client": (client_ip, 443),
+        "scheme": "https",
+        "server": ("public-api", 443),
+    })
+
+
+def test_public_listener_hides_internal_node_route(client, monkeypatch):
+    monkeypatch.setattr(main, "NODE_AGENT_TOKEN", "test-node-token")
+    monkeypatch.setattr(main, "PUBLIC_LISTENER", True)
+    request = request_with_client("127.0.0.1")
+    with pytest.raises(main.HTTPException) as exc_info:
+        main.internal_node(
+            request,
+            "destroy",
+            {"path": "/var/lib/mosaic-database/example"},
+            "test-node-token",
+        )
+    assert exc_info.value.status_code == 404
+
+
+def test_internal_node_allows_loopback_when_public_listener_is_off(client, monkeypatch):
+    monkeypatch.setattr(main, "NODE_AGENT_TOKEN", "test-node-token")
+    monkeypatch.setattr(main, "PUBLIC_LISTENER", False)
+    monkeypatch.setattr(main.node_agent, "handle", lambda operation, payload: {"operation": operation})
+    request = request_with_client("127.0.0.1")
+    assert main.internal_node(request, "health", {}, "test-node-token") == {"operation": "health"}
+
+
+def test_mcp_initialize_uses_forwarded_ip_buckets(client, monkeypatch):
+    monkeypatch.setattr(main, "PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS", 1)
+    monkeypatch.setattr(main, "TRUST_CLOUDFLARE_IP", True)
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "initialize"}
+
+    first = main.mcp(payload, request_with_client("127.0.0.1", "198.51.100.10"), main.Response())
+    second = main.mcp(payload, request_with_client("127.0.0.1", "198.51.100.11"), main.Response())
+    assert first["result"]["protocolVersion"] == main.MCP_PROTOCOL_VERSION
+    assert second["result"]["protocolVersion"] == main.MCP_PROTOCOL_VERSION
+    with pytest.raises(main.HTTPException) as exc_info:
+        main.mcp(payload, request_with_client("127.0.0.1", "198.51.100.10"), main.Response())
+    assert exc_info.value.status_code == 429
+
+
+def test_public_read_only_routes_remain_public(client):
+    assert client.get("/healthz").status_code == 200
+    assert client.get("/readyz").status_code == 200
+    assert client.get("/v1/plans").status_code == 200
+    assert client.get("/.well-known/mcp.json").status_code == 200
+
+
 def test_revoke_key_does_not_revoke_tenant(client):
     created = tenant(client)
     tid, key = created["tenant_id"], created["api_key"]
