@@ -253,6 +253,26 @@ def test_reaper_stop_cycle(tmp_path, monkeypatch):
     c.close()
 
 
+def test_reaper_treats_missing_branch_directory_as_stopped(tmp_path):
+    main.DB_PATH = tmp_path / "reaper-missing.db"
+    c = main.db()
+    main.initialize_schema(c)
+    main_path = tmp_path / "gone"
+    main_path.mkdir()
+    c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_x", "x", "shared", "h", "active", main.now()))
+    c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_x", "ten_x", "x", str(tmp_path), "ready", main.now()))
+    old = "2000-01-01T00:00:00+00:00"
+    c.execute(
+        "INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("br_x", "db_x", "main", None, str(main_path), 55432, 999999, "running", "x", old, old, "local"),
+    )
+    main_path.rmdir()
+    c.commit()
+    assert main.Supervisor().reap(c, idle_seconds=1) == 1
+    assert c.execute("SELECT status,pid FROM branches").fetchone()["status"] == "stopped"
+    c.close()
+
+
 def test_placement_is_deterministic(monkeypatch):
     monkeypatch.setenv("MOSAIC_NODE_HOSTS", "sv1,sv2,sv3")
     first = main.placement_node("db_fixed")
@@ -542,6 +562,52 @@ def test_explicit_standby_rebuild_bypasses_ready_cache(tmp_path, monkeypatch):
     }
     assert agent.handle("build_standby", payload) == {"status": "building"}
     assert rebuilt.wait(timeout=2)
+    assert sum(call[0] == main.pg_bin("pg_basebackup") for call in calls) == 1
+
+
+def test_forced_standby_rebuild_supersedes_inflight_build(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
+    target.mkdir()
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[0] == main.pg_bin("pg_basebackup"):
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "postgresql.conf").write_text("")
+            started.set()
+            release.wait(timeout=2)
+
+    agent = main.NodeAgent(run)
+    payload = {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "local",
+        "primary_address": "127.0.0.1",
+        "primary_port": 55432,
+        "replication_user": "mosaic_repl_db",
+        "replication_password": "secret",
+        "force_rebuild": True,
+    }
+    assert agent.handle("build_standby", payload) == {"status": "building"}
+    assert started.wait(timeout=2)
+    assert agent.handle("build_standby", payload) == {
+        "status": "building",
+        "superseded": True,
+    }
+    release.set()
+    for _ in range(100):
+        result = agent.handle("inspect_standby", {"target_path": str(target)})
+        if result["status"] == "failed":
+            break
+        time.sleep(0.01)
+    assert result["status"] == "failed"
+    assert "superseded" in result["error"]
     assert sum(call[0] == main.pg_bin("pg_basebackup") for call in calls) == 1
 
 
@@ -962,6 +1028,55 @@ def test_promotion_is_idempotent_when_main_already_on_target(client, monkeypatch
     )
     assert response.status_code == 200
     assert calls == [("sv2", "promote_standby")]
+
+
+def test_already_primary_promotion_reports_bad_credentials_as_503(client, monkeypatch):
+    _, database = promotion_database(client, monkeypatch)
+    c = main.db()
+    c.execute(
+        "UPDATE branches SET credential_encrypted=? WHERE database_id=? AND name='main'",
+        ("not-a-fernet-token", database["id"]),
+    )
+    c.commit()
+    c.close()
+    response = client.post(
+        f"/v1/admin/databases/{database['id']}/promote",
+        headers={"X-Admin-Key": "test-admin"},
+        json={"host_id": "local"},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "primary credentials cannot be decrypted"
+
+
+def test_promotion_refuses_absent_old_primary_without_force(client, monkeypatch):
+    _, database = promotion_database(client, monkeypatch)
+    c = main.db()
+    main_path = Path(
+        c.execute(
+            "SELECT path FROM branches WHERE database_id=? AND name='main'",
+            (database["id"],),
+        ).fetchone()["path"]
+    )
+    c.close()
+    shutil.rmtree(main_path)
+    calls = []
+
+    class Transport:
+        def call(self, host_id, operation, payload):
+            calls.append((host_id, operation, payload))
+            if operation == "stop":
+                return main.Supervisor().stop_local(payload)
+            raise AssertionError("promotion must not run")
+
+    monkeypatch.setattr(main, "node_transport", Transport())
+    response = client.post(
+        f"/v1/admin/databases/{database['id']}/promote",
+        headers={"X-Admin-Key": "test-admin"},
+        json={"host_id": "sv2"},
+    )
+    assert response.status_code == 409
+    assert calls[0][1] == "stop"
+    assert calls[0][2]["require_path"] is True
 
 
 def test_standby_build_stops_before_removing_target(tmp_path, monkeypatch):

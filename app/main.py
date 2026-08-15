@@ -523,8 +523,12 @@ class Supervisor:
         pid = int((path / "postmaster.pid").read_text().splitlines()[0])
         return {"status": "running", "pid": pid}
 
-    def _cluster_is_running(self, path: str) -> bool:
+    def _cluster_is_running(self, path: str, require_path: bool = False) -> bool:
         if not Path(path).exists():
+            if require_path:
+                raise RuntimeError(
+                    f"cannot verify PostgreSQL cluster at {path}: data directory is absent"
+                )
             return False
         status_argv = [pg_bin("pg_ctl"), "-D", path, "status"]
         try:
@@ -548,14 +552,15 @@ class Supervisor:
                 ) from exc
 
     def stop_local(self, payload: dict):
-        running = self._cluster_is_running(payload["path"])
+        require_path = bool(payload.get("require_path"))
+        running = self._cluster_is_running(payload["path"], require_path=require_path)
         if running:
             subprocess.run(
                 [pg_bin("pg_ctl"), "-D", payload["path"], "-m", "fast", "-w", "stop"],
                 check=False,
                 capture_output=True,
             )
-            running = self._cluster_is_running(payload["path"])
+            running = self._cluster_is_running(payload["path"], require_path=require_path)
             if running:
                 raise RuntimeError(
                     f"PostgreSQL cluster at {payload['path']} is still running after stop"
@@ -733,13 +738,23 @@ class NodeAgent:
         except Exception as exc:
             result = {"status": "failed", "error": str(exc)}
         with self._standby_jobs_lock:
-            self._standby_jobs[target] = result
+            job = self._standby_jobs.get(target)
+            if job and job.get("superseded"):
+                self._standby_jobs[target] = {
+                    "status": "failed",
+                    "error": "standby build superseded by forced rebuild",
+                }
+            else:
+                self._standby_jobs[target] = result
 
     def _start_standby_build(self, target: Path, payload: dict) -> dict:
         force_rebuild = bool(payload.get("force_rebuild"))
         with self._standby_jobs_lock:
             job = self._standby_jobs.get(target)
             if force_rebuild:
+                if job and job["status"] == "building":
+                    job["superseded"] = True
+                    return {"status": "building", "superseded": True}
                 self._standby_jobs.pop(target, None)
             elif job and job["status"] == "building":
                 return {"status": "building"}
@@ -1098,10 +1113,11 @@ def _reconcile_database_replicas(c: Conn, due: list):
                     (replica["id"],),
                 )
             elif status == "building":
-                c.execute(
-                    "UPDATE replicas SET status='building',next_attempt_at=NULL,last_error=NULL WHERE id=?",
-                    (replica["id"],),
-                )
+                if not result.get("superseded"):
+                    c.execute(
+                        "UPDATE replicas SET status='building',next_attempt_at=NULL,last_error=NULL WHERE id=?",
+                        (replica["id"],),
+                    )
             elif status == "failed":
                 raise RuntimeError(result.get("error", "standby build failed"))
             else:
@@ -1529,6 +1545,9 @@ def _promote_database_locked(database_id: str, payload: PromotionRequest):
                 postgres_password = cipher().decrypt(
                     main_row["credential_encrypted"].encode()
                 ).decode()
+            except InvalidToken as exc:
+                raise HTTPException(503, "primary credentials cannot be decrypted") from exc
+            try:
                 result = node_transport.call(payload.host_id, "promote_standby", {
                     "target_path": main_row["path"],
                     "target_port": main_row["port"],
@@ -1590,6 +1609,7 @@ def _promote_database_locked(database_id: str, payload: PromotionRequest):
             node_transport.call(main_row["host_id"], "stop", {
                 "path": main_row["path"],
                 "pid": main_row["pid"],
+                "require_path": True,
             })
         except Exception as exc:
             if not payload.force:
