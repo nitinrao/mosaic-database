@@ -194,6 +194,9 @@ class Conn:
     def commit(self):
         self.raw.commit()
 
+    def rollback(self):
+        self.raw.rollback()
+
     def close(self):
         self.raw.close()
 
@@ -1733,6 +1736,36 @@ def audit(c: Conn, tenant_id: str | None, action: str, details: dict, actor: str
     c.execute("INSERT INTO audit_log(tenant_id,action,actor,details,created_at) VALUES(?,?,?,?,?)", (tenant_id, action, actor, json.dumps(details), now()))
 
 
+def is_unique_violation(exc: Exception) -> bool:
+    return isinstance(exc, sqlite3.IntegrityError) or (
+        psycopg is not None and isinstance(exc, psycopg.errors.UniqueViolation)
+    )
+
+
+def refuse_existing_signup(c: Conn, email: str):
+    signup = c.execute(
+        "SELECT * FROM public_signups WHERE email=?",
+        (email,),
+    ).fetchone()
+    if not signup:
+        raise HTTPException(500, "signup could not be completed")
+    tenant_id = signup["tenant_id"]
+    tenant = c.execute(
+        "SELECT * FROM tenants WHERE id=?",
+        (tenant_id,),
+    ).fetchone()
+    if not tenant:
+        raise HTTPException(500, "signup record is missing its tenant")
+    audit(c, tenant_id, "public_signup.refused_existing", {
+        "reason": "email already has a tenant",
+    }, actor=email)
+    c.commit()
+    raise HTTPException(
+        409,
+        "an account already exists for that email; use your existing key or contact Mosaic",
+    )
+
+
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
@@ -1851,34 +1884,26 @@ def public_signup(payload: PublicSignupCreate, request: Request):
             (email,),
         ).fetchone()
         if signup:
-            tenant_id = signup["tenant_id"]
-            tenant = c.execute(
-                "SELECT * FROM tenants WHERE id=?",
-                (tenant_id,),
-            ).fetchone()
-            if not tenant:
-                raise HTTPException(500, "signup record is missing its tenant")
-            audit(c, tenant_id, "public_signup.refused_existing", {
-                "reason": "email already has a tenant",
-            }, actor=email)
-            c.commit()
-            raise HTTPException(
-                409,
-                "an account already exists for that email; use your existing key or contact Mosaic",
-            )
+            refuse_existing_signup(c, email)
         else:
             api_key = token("mdb_live_")
             created = now()
             tenant_id = token("ten_")
             effective_name = tenant_name
-            c.execute(
-                "INSERT INTO tenants VALUES(?,?,?,?,?,?)",
-                (tenant_id, effective_name, "shared", digest(api_key), "active", created),
-            )
-            c.execute(
-                "INSERT INTO public_signups VALUES(?,?,?,?,?,?)",
-                (email, tenant_id, effective_name, created, created, created),
-            )
+            try:
+                c.execute(
+                    "INSERT INTO tenants VALUES(?,?,?,?,?,?)",
+                    (tenant_id, effective_name, "shared", digest(api_key), "active", created),
+                )
+                c.execute(
+                    "INSERT INTO public_signups VALUES(?,?,?,?,?,?)",
+                    (email, tenant_id, effective_name, created, created, created),
+                )
+            except Exception as exc:
+                if not is_unique_violation(exc):
+                    raise
+                c.rollback()
+                refuse_existing_signup(c, email)
             status_text = "created"
         audit(c, tenant_id, f"public_signup.{status_text}", {
             "plan": "shared",

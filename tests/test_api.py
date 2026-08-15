@@ -106,6 +106,68 @@ def test_public_signup_authenticates_and_refuses_existing_email(client, monkeypa
         c.close()
 
 
+def test_public_signup_insert_collision_refuses_existing_email(client, monkeypatch):
+    competing_key = "mdb_live_competing"
+    injected = False
+    original_execute = main.Conn.execute
+
+    def inject_competing_signup(conn, sql, params=()):
+        nonlocal injected
+        result = original_execute(conn, sql, params)
+        if not injected and "SELECT * FROM public_signups WHERE email=?" in sql:
+            injected = True
+            competing = main.db()
+            try:
+                competing_tenant_id = "ten_competing"
+                created = main.now()
+                competing.execute(
+                    "INSERT INTO tenants VALUES(?,?,?,?,?,?)",
+                    (
+                        competing_tenant_id,
+                        "Competing workspace",
+                        "shared",
+                        main.digest(competing_key),
+                        "active",
+                        created,
+                    ),
+                )
+                competing.execute(
+                    "INSERT INTO public_signups VALUES(?,?,?,?,?,?)",
+                    (
+                        "collision@example.com",
+                        competing_tenant_id,
+                        "Competing workspace",
+                        created,
+                        created,
+                        created,
+                    ),
+                )
+                competing.commit()
+            finally:
+                competing.close()
+        return result
+
+    monkeypatch.setattr(main.Conn, "execute", inject_competing_signup)
+    response = client.post(
+        "/v1/public/signup",
+        json={"email": "collision@example.com"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "an account already exists for that email; use your existing key or contact Mosaic"
+    )
+    c = main.db()
+    try:
+        assert c.execute("SELECT COUNT(*) AS n FROM tenants").fetchone()["n"] == 1
+        assert c.execute("SELECT COUNT(*) AS n FROM public_signups").fetchone()["n"] == 1
+        assert c.execute(
+            "SELECT action FROM audit_log WHERE tenant_id=?",
+            ("ten_competing",),
+        ).fetchone()["action"] == "public_signup.refused_existing"
+    finally:
+        c.close()
+
+
 def test_public_signup_rejects_dedicated_plan(client):
     response = client.post(
         "/v1/public/signup",
