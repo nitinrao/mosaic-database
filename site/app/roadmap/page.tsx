@@ -23,7 +23,7 @@ export default function RoadmapPage() {
 
           <h2 id="now">Now</h2>
           <ul>
-            <li>Self-serve shared signup returns a tenant API key once; repeating signup rotates and invalidates the previous key.</li>
+            <li>Self-serve shared signup returns a tenant API key exactly once; existing signup emails are refused rather than issuing another secret.</li>
             <li>PostgreSQL databases with a main branch, child branches, and per-tenant database and branch quotas.</li>
             <li>Governed SQL over HTTP for one parameterized read or DML statement, with plan-specific row and timeout limits.</li>
             <li>Asynchronous physical replication of each main branch to dark standbys on the other configured hosts.</li>

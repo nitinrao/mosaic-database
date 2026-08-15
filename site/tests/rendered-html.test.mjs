@@ -43,11 +43,11 @@ test("keeps the API contract and operational boundaries visible", async () => {
   assert.match(pricing, /ceiling of 50 databases/);
 });
 
-test("renders signup rotation and capacity guidance", async () => {
+test("renders signup reuse refusal and capacity guidance", async () => {
   const html = await (await render("/start")).text();
   assert.match(html, /database-api\.mosaicos\.com\/v1\/public\/signup/);
   assert.match(html, /returned exactly once/);
-  assert.match(html, /rotates that tenant/);
+  assert.match(html, /signup is refused/);
   assert.match(html, /at capacity/);
 });
 

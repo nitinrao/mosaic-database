@@ -10,7 +10,7 @@ Mosaic Database is managed PostgreSQL with instant branches, governed SQL over H
 - API: https://database-api.mosaicos.com/
 - MCP manifest: https://database-api.mosaicos.com/.well-known/mcp.json
 - Plans: Shared $100/month with 5 databases and 20 branches; Dedicated $500/month with 20 databases and 100 branches.
-- Public self-serve signup accepts Shared only. Repeating signup for the same email rotates the tenant key and invalidates the old key.
+- Public self-serve signup accepts Shared only. An email that already has a tenant is refused to prevent account takeover.
 - Query API: POST /v1/tenants/{tenant_id}/databases/{database_id}/query.
 - Governed SQL accepts one SELECT, INSERT, UPDATE, DELETE, WITH, VALUES, or SHOW statement, with plan-specific row and timeout limits.
 - Databases have a main branch and can have child branches.

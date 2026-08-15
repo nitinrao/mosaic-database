@@ -98,7 +98,7 @@ export default function DocsPage() {
             <p>Signup is unauthenticated and returns the tenant API key exactly once. Store it before creating a database.</p>
             <CodeBlock value={signup} />
             <CodeBlock value={quickstart} />
-            <p>If the same normalized email signs up again, the response is <code>status: &quot;rotated&quot;</code> and the old key is invalid.</p>
+            <p>An email that already has a tenant cannot sign up again. Use the existing key or contact Mosaic; this prevents an unverified email from taking over an account.</p>
           </section>
 
           <section id="plans">
@@ -118,8 +118,7 @@ export default function DocsPage() {
             <Heading level={2} id="authentication-heading">Authentication</Heading>
             <p>
               Tenant routes accept <code>X-API-Key</code> or <code>Authorization: Bearer</code>. Keys use the{" "}
-              <code>mdb_live_</code> prefix; only a SHA-256 hash is persisted. Signup rotation updates the same tenant
-              and invalidates the previous key. Keep the returned secret in a secret manager.
+              <code>mdb_live_</code> prefix; only a SHA-256 hash is persisted. Keep the returned secret in a secret manager.
             </p>
           </section>
 

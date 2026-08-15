@@ -13,7 +13,7 @@ type SignupResult = {
   plan: string;
   token_prefix: string;
   quickstart: { endpoint: string; command: string; docs_path: string; signup_path: string };
-  status: "created" | "rotated";
+  status: "created";
 };
 
 const API_ENDPOINT = "https://database-api.mosaicos.com/v1/public/signup";
@@ -64,7 +64,7 @@ export default function StartPage() {
       <h1>Create your PostgreSQL key.</h1>
       <p className="lead">
         Enter an email and Mosaic will create a shared tenant. The API key is returned exactly once. If you sign up
-        again with the same email, Mosaic rotates that tenant&apos;s key and invalidates the old one.
+        again with the same email, signup is refused and the existing key remains unchanged. Use your existing key or contact Mosaic.
       </p>
       <p className="result-note">Signup endpoint: <code>{API_ENDPOINT}</code>. A <code>503</code> response means the shared database capacity ceiling is currently at capacity.</p>
 
@@ -83,13 +83,11 @@ export default function StartPage() {
       {result && (
         <section className="demo shell" aria-label="Signup result" style={{ marginTop: "36px" }}>
           <div className="demo-head">
-            <span>{result.status === "created" ? "Key created" : "Key rotated"}</span>
+            <span>Key created</span>
             <span>{result.tenant_name}</span>
           </div>
           <p className="result-note">
-            {result.status === "rotated"
-              ? "This repeat signup rotated the tenant key. The previous key is now invalid."
-              : "This key is shown once. Store it in a secret manager; Mosaic retains only its hash."}
+            This key is shown once. Store it in a secret manager; Mosaic retains only its hash.
           </p>
           <p className="form-success">API key: <code>{result.api_key}</code></p>
           <pre><CopyButton value={result.quickstart.command} /><code>{result.quickstart.command}</code></pre>
