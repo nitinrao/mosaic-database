@@ -1,3 +1,4 @@
+import asyncio
 import os
 from pathlib import Path
 
@@ -203,6 +204,133 @@ def test_hba_managed_block_is_idempotent(tmp_path, monkeypatch):
     assert text.count("# END MOSAIC DATABASE PEERS") == 1
     assert text.count("host all postgres 10.0.0.1/32 scram-sha-256") == 1
     assert text.count("host all postgres 10.0.0.2/32 scram-sha-256") == 1
+
+
+def test_local_node_private_address_is_used_for_single_explicit_node(tmp_path, monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local")
+    monkeypatch.setenv("MOSAIC_NODE_PRIVATE_ADDRESSES", "local=10.0.0.1")
+    (tmp_path / "postgresql.conf").write_text("")
+    hba = tmp_path / "pg_hba.conf"
+    hba.write_text("local all all trust\n")
+    main._rewrite_postgres_config(tmp_path, 55432, "local")
+    assert "listen_addresses = '10.0.0.1'" in (tmp_path / "postgresql.conf").read_text()
+    assert "host all postgres 10.0.0.1/32 scram-sha-256" in hba.read_text()
+
+
+def test_node_agent_rejects_paths_outside_branch_root(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    with pytest.raises(RuntimeError, match="MOSAIC_BRANCH_ROOT"):
+        main.NodeAgent().handle("destroy", {"path": str(tmp_path / "outside")})
+
+
+def test_transport_rejects_unknown_node_for_single_host(monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local")
+    transport = main.NodeTransport(main.NodeAgent())
+    with pytest.raises(RuntimeError, match="unknown database node"):
+        transport.call("sv2", "stop", {"path": "/tmp/nope", "pid": None})
+    with pytest.raises(RuntimeError, match="unknown database node"):
+        transport.call("sv2", "destroy", {"path": "/tmp/nope"})
+
+
+def test_reaper_skips_unreachable_host_and_continues(tmp_path, monkeypatch):
+    main.DB_PATH = tmp_path / "reaper-unreachable.db"
+    c = main.db()
+    main.initialize_schema(c)
+    c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_r", "r", "shared", "h", "active", main.now()))
+    c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_r", "ten_r", "r", str(tmp_path), "ready", main.now()))
+    old = "2000-01-01T00:00:00+00:00"
+    for bid, host, port in (("br_bad", "sv2", 55432), ("br_good", "local", 55433)):
+        c.execute(
+            "INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (bid, "db_r", bid, None, str(tmp_path / bid), port, 123, "running", "x", old, old, host),
+        )
+    c.commit()
+
+    class FakeTransport:
+        def call(self, host_id, operation, payload):
+            if host_id == "sv2":
+                raise RuntimeError("node unavailable")
+            return {"status": "stopped", "pid": None}
+
+    monkeypatch.setattr(main, "node_transport", FakeTransport())
+    assert main.reap_branches(c) == 1
+    assert c.execute("SELECT status FROM branches WHERE id='br_bad'").fetchone()["status"] == "running"
+    assert c.execute("SELECT status FROM branches WHERE id='br_good'").fetchone()["status"] == "stopped"
+    c.close()
+
+
+def test_reaper_loop_survives_unexpected_sweep_error(tmp_path, monkeypatch):
+    main.DB_PATH = tmp_path / "reaper-loop.db"
+    c = main.db()
+    main.initialize_schema(c)
+    c.close()
+    calls = {"sleep": 0, "reap": 0}
+
+    async def fake_sleep(_):
+        calls["sleep"] += 1
+        if calls["sleep"] > 1:
+            raise asyncio.CancelledError
+
+    def fake_reap(connection):
+        calls["reap"] += 1
+        raise RuntimeError("unexpected sweep error")
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(main, "reap_branches", fake_reap)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(main._reaper_loop())
+    assert calls["reap"] == 1
+
+
+def test_reaper_loop_survives_ledger_connection_error(monkeypatch):
+    calls = {"sleep": 0, "db": 0, "reap": 0}
+
+    async def fake_sleep(_):
+        calls["sleep"] += 1
+        if calls["sleep"] > 2:
+            raise asyncio.CancelledError
+
+    class Connection:
+        def close(self):
+            return None
+
+    def fake_db():
+        calls["db"] += 1
+        if calls["db"] == 1:
+            raise RuntimeError("ledger unavailable")
+        return Connection()
+
+    def fake_reap(connection):
+        calls["reap"] += 1
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(main, "db", fake_db)
+    monkeypatch.setattr(main, "reap_branches", fake_reap)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(main._reaper_loop())
+    assert calls["db"] == 2
+    assert calls["reap"] == 1
+
+
+def test_reaper_loop_invalid_interval_still_yields(monkeypatch):
+    monkeypatch.setenv("MOSAIC_BRANCH_REAPER_INTERVAL", "60s")
+    calls = {"sleep": 0}
+
+    async def fake_sleep(_):
+        calls["sleep"] += 1
+        if calls["sleep"] > 1:
+            raise asyncio.CancelledError
+
+    def unavailable_db():
+        raise RuntimeError("ledger unavailable")
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(main, "db", unavailable_db)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(main._reaper_loop())
+    assert calls["sleep"] == 2
 
 
 def test_existing_ledger_migrates_branch_host(tmp_path):
