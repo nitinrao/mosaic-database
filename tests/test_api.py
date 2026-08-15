@@ -506,6 +506,39 @@ def test_standby_build_argv(tmp_path, monkeypatch):
     assert calls[2] == [main.pg_bin("pg_ctl"), "-D", str(target), "status"]
 
 
+def test_explicit_standby_rebuild_bypasses_ready_cache(tmp_path, monkeypatch):
+    root = tmp_path / "branches"
+    root.mkdir()
+    monkeypatch.setattr(main, "BRANCH_ROOT", root)
+    target = root / "standby"
+    target.mkdir()
+    calls = []
+    rebuilt = threading.Event()
+
+    def run(argv, env=None):
+        calls.append(argv)
+        if argv[0] == main.pg_bin("pg_basebackup"):
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "postgresql.conf").write_text("")
+            rebuilt.set()
+
+    agent = main.NodeAgent(run)
+    agent._standby_jobs[target] = {"status": "ready"}
+    payload = {
+        "target_path": str(target),
+        "target_port": 55433,
+        "target_host_id": "local",
+        "primary_address": "127.0.0.1",
+        "primary_port": 55432,
+        "replication_user": "mosaic_repl_db",
+        "replication_password": "secret",
+        "force_rebuild": True,
+    }
+    assert agent.handle("build_standby", payload) == {"status": "building"}
+    assert rebuilt.wait(timeout=2)
+    assert sum(call[0] == main.pg_bin("pg_basebackup") for call in calls) == 1
+
+
 def test_zfs_standby_dataset_is_reusable_and_promoted_path_can_clone(tmp_path, monkeypatch):
     root = tmp_path / "branches"
     root.mkdir()
@@ -702,6 +735,7 @@ def test_promotion_fences_before_promoting_and_rebuilds_replicas(client, monkeyp
     class Transport:
         def call(self, host_id, operation, payload):
             calls.append((host_id, operation))
+            assert main._branch_mutation_lock.locked()
             if operation == "promote_standby":
                 return {"status": "promoted", "pid": 222, "port": payload["target_port"]}
             if operation == "stop":
@@ -742,8 +776,8 @@ def test_promotion_fences_before_promoting_and_rebuilds_replicas(client, monkeyp
             (database["id"],),
         ).fetchall()
         assert [(row["host_id"], row["status"]) for row in replicas] == [
-            ("local", "pending"),
-            ("sv3", "pending"),
+            ("local", "rebuild_required"),
+            ("sv3", "rebuild_required"),
         ]
         assert c.execute(
             "SELECT 1 FROM abandoned_clusters WHERE database_id=?",
@@ -810,13 +844,21 @@ def test_promotion_requires_force_when_old_primary_unreachable(client, monkeypat
 
 def test_promotion_failure_after_fencing_commits_stopped_ledger_and_audit(client, monkeypatch):
     _, database = promotion_database(client, monkeypatch)
+    c = main.db()
+    secret = main.cipher().decrypt(
+        c.execute(
+            "SELECT credential_encrypted FROM branches WHERE database_id=? AND name='main'",
+            (database["id"],),
+        ).fetchone()["credential_encrypted"].encode()
+    ).decode()
+    c.close()
 
     class Transport:
         def call(self, host_id, operation, payload):
             if operation == "stop":
                 return {"status": "stopped", "pid": None}
             if operation == "promote_standby":
-                raise RuntimeError("promotion timeout")
+                raise RuntimeError(f"promotion timeout password={secret}")
             raise AssertionError(operation)
 
     monkeypatch.setattr(main, "node_transport", Transport())
@@ -826,6 +868,7 @@ def test_promotion_failure_after_fencing_commits_stopped_ledger_and_audit(client
         json={"host_id": "sv2"},
     )
     assert response.status_code == 503
+    assert secret not in response.text
     c = main.db()
     try:
         row = c.execute(
@@ -843,6 +886,44 @@ def test_promotion_failure_after_fencing_commits_stopped_ledger_and_audit(client
         assert "database.promotion_failed" in actions
     finally:
         c.close()
+
+
+def test_promotion_fence_checks_live_cluster_not_recorded_pid(client, monkeypatch):
+    _, database = promotion_database(client, monkeypatch)
+    c = main.db()
+    c.execute(
+        "UPDATE branches SET pid=NULL WHERE database_id=? AND name='main'",
+        (database["id"],),
+    )
+    c.commit()
+    c.close()
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if argv[-1] == "status":
+            return None
+        return None
+
+    monkeypatch.setattr(main.subprocess, "run", run)
+
+    class Transport:
+        def call(self, host_id, operation, payload):
+            if operation == "stop":
+                return main.Supervisor().stop_local(payload)
+            if operation == "promote_standby":
+                raise AssertionError("promotion must not run while primary is live")
+            raise AssertionError(operation)
+
+    monkeypatch.setattr(main, "node_transport", Transport())
+    response = client.post(
+        f"/v1/admin/databases/{database['id']}/promote",
+        headers={"X-Admin-Key": "test-admin"},
+        json={"host_id": "sv2"},
+    )
+    assert response.status_code == 409
+    assert any(call[-1] == "status" for call in calls)
+    assert not any(call[-1] == "promote_standby" for call in calls)
 
 
 def test_promotion_is_idempotent_when_main_already_on_target(client, monkeypatch):
