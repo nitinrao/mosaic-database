@@ -18,8 +18,8 @@ def client(tmp_path, monkeypatch):
     main.DATABASE_URLS = []
     main._rate.clear()
     class FakeEngine:
-        def create_database(self, path, password, port): Path(path).mkdir(parents=True, exist_ok=True)
-        def clone(self, parent, target, parent_port=None, parent_password=None, target_port=None): Path(target).mkdir(parents=True, exist_ok=True)
+        def create_database(self, path, password, port, host_id="local"): Path(path).mkdir(parents=True, exist_ok=True)
+        def clone(self, parent, target, parent_port=None, parent_password=None, target_port=None, parent_host_id="local", target_host_id="local"): Path(target).mkdir(parents=True, exist_ok=True)
         def destroy(self, path): return None
     monkeypatch.setattr(main, "engine", lambda: FakeEngine())
     with TestClient(main.app) as test_client:
@@ -107,8 +107,8 @@ def test_branch_ports_are_unique(client):
         main_port = c.execute("SELECT port FROM branches WHERE database_id=?", (database["id"],)).fetchone()["port"]
         with pytest.raises(Exception):
             c.execute(
-                "INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                ("br_duplicate", database["id"], "other", None, "/tmp/other", main_port, None, "stopped", "x", main.now(), main.now()),
+                "INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("br_duplicate", database["id"], "other", None, "/tmp/other", main_port, None, "stopped", "x", main.now(), main.now(), "local"),
             )
     finally:
         c.close()
@@ -169,9 +169,89 @@ def test_reaper_stop_cycle(tmp_path, monkeypatch):
     c.execute("INSERT INTO tenants VALUES(?,?,?,?,?,?)", ("ten_x", "x", "shared", "h", "active", main.now()))
     c.execute("INSERT INTO databases VALUES(?,?,?,?,?,?)", ("db_x", "ten_x", "x", str(tmp_path), "ready", main.now()))
     old = "2000-01-01T00:00:00+00:00"
-    c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("br_x", "db_x", "main", None, str(tmp_path), 55432, 999999, "running", "x", old, old))
+    c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("br_x", "db_x", "main", None, str(tmp_path), 55432, 999999, "running", "x", old, old, "local"))
     c.commit()
     stopped = main.Supervisor().reap(c, idle_seconds=1)
     assert stopped == 1
     assert c.execute("SELECT status,pid FROM branches").fetchone()["status"] == "stopped"
     c.close()
+
+
+def test_placement_is_deterministic(monkeypatch):
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "sv1,sv2,sv3")
+    first = main.placement_node("db_fixed")
+    assert first == main.placement_node("db_fixed")
+    assert first in {"sv1", "sv2", "sv3"}
+
+
+def test_existing_ledger_migrates_branch_host(tmp_path):
+    path = tmp_path / "legacy.db"
+    raw = main.sqlite3.connect(path)
+    raw.execute("CREATE TABLE branches (id TEXT PRIMARY KEY, database_id TEXT NOT NULL, name TEXT NOT NULL, parent_id TEXT, path TEXT NOT NULL, port INTEGER NOT NULL, pid INTEGER, status TEXT NOT NULL, credential_encrypted TEXT NOT NULL, last_query_at TEXT NOT NULL, created_at TEXT NOT NULL)")
+    raw.commit()
+    raw.close()
+    main.DB_PATH = path
+    c = main.db()
+    try:
+        main.initialize_schema(c)
+        columns = [row["name"] for row in c.execute("PRAGMA table_info(branches)").fetchall()]
+        assert "host_id" in columns
+        c.execute("INSERT INTO branches VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("br_legacy", "db", "main", None, "/tmp/main", 55432, None, "stopped", "x", main.now(), main.now(), "local"))
+        assert c.execute("SELECT host_id FROM branches WHERE id=?", ("br_legacy",)).fetchone()["host_id"] == "local"
+    finally:
+        c.close()
+
+
+def test_query_routes_to_non_local_branch(client, monkeypatch):
+    created = tenant(client)
+    database = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "remote"},
+    ).json()
+    c = main.db()
+    c.execute("UPDATE branches SET host_id='sv2' WHERE database_id=?", (database["id"],))
+    c.commit()
+    c.close()
+    monkeypatch.setenv("MOSAIC_NODE_HOSTS", "local,sv2=http://agent.invalid")
+    monkeypatch.setenv("MOSAIC_NODE_PRIVATE_ADDRESSES", "local=10.0.0.1,sv2=10.0.0.2")
+    seen = []
+
+    class FakeTransport:
+        def call(self, node_id, operation, payload):
+            assert node_id == "sv2"
+            assert operation == "start"
+            return {"status": "running"}
+
+    class Description:
+        name = "answer"
+
+    class Cursor:
+        description = [Description()]
+        def fetchmany(self, size):
+            return [(1,)]
+
+    class Connection:
+        def execute(self, sql, params=()):
+            if sql.startswith("SET statement_timeout"):
+                return self
+            return Cursor()
+        def commit(self):
+            return None
+        def close(self):
+            return None
+
+    class FakePsycopg:
+        def connect(self, **kwargs):
+            seen.append(kwargs["host"])
+            return Connection()
+
+    monkeypatch.setattr(main, "node_transport", FakeTransport())
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    response = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/query",
+        headers={"X-API-Key": created["api_key"]},
+        json={"sql": "select 1"},
+    )
+    assert response.status_code == 200
+    assert seen == ["10.0.0.2"]
