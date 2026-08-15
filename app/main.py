@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 from glob import glob
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -194,7 +194,7 @@ def initialize_schema(c: Conn):
     CREATE TABLE IF NOT EXISTS databases (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id), name TEXT NOT NULL, root_path TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(tenant_id,name));
     CREATE TABLE IF NOT EXISTS branches (id TEXT PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id), name TEXT NOT NULL, parent_id TEXT, path TEXT NOT NULL, port INTEGER NOT NULL, pid INTEGER, status TEXT NOT NULL, credential_encrypted TEXT NOT NULL, last_query_at TEXT NOT NULL, created_at TEXT NOT NULL, host_id TEXT NOT NULL DEFAULT 'local', UNIQUE(database_id,name));
     CREATE TABLE IF NOT EXISTS replication_credentials (database_id TEXT PRIMARY KEY REFERENCES databases(id), username TEXT NOT NULL, credential_encrypted TEXT NOT NULL, created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS replicas (id TEXT PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id), primary_branch_id TEXT NOT NULL REFERENCES branches(id), host_id TEXT NOT NULL, path TEXT NOT NULL, port INTEGER NOT NULL, status TEXT NOT NULL, lag_bytes INTEGER, lag_sampled_at TEXT, created_at TEXT NOT NULL, slot_name TEXT NOT NULL DEFAULT '', UNIQUE(database_id,host_id));
+    CREATE TABLE IF NOT EXISTS replicas (id TEXT PRIMARY KEY, database_id TEXT NOT NULL REFERENCES databases(id), primary_branch_id TEXT NOT NULL REFERENCES branches(id), host_id TEXT NOT NULL, path TEXT NOT NULL, port INTEGER NOT NULL, status TEXT NOT NULL, lag_bytes INTEGER, lag_sampled_at TEXT, created_at TEXT NOT NULL, slot_name TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT, last_error TEXT, UNIQUE(database_id,host_id));
     CREATE TABLE IF NOT EXISTS usage_events (id {integer}, tenant_id TEXT NOT NULL REFERENCES tenants(id), kind TEXT NOT NULL, quantity INTEGER NOT NULL, unit TEXT NOT NULL, occurred_at TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{{}}', idempotency_key TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS audit_log (id {integer}, tenant_id TEXT, action TEXT NOT NULL, actor TEXT NOT NULL, details TEXT NOT NULL DEFAULT '{{}}', created_at TEXT NOT NULL);
     """)
@@ -216,6 +216,13 @@ def initialize_schema(c: Conn):
     )
     if "slot_name" not in replica_columns:
         c.execute("ALTER TABLE replicas ADD COLUMN slot_name TEXT NOT NULL DEFAULT ''")
+    for column, definition in (
+        ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("next_attempt_at", "TEXT"),
+        ("last_error", "TEXT"),
+    ):
+        if column not in replica_columns:
+            c.execute(f"ALTER TABLE replicas ADD COLUMN {column} {definition}")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS usage_idempotency ON usage_events(tenant_id,idempotency_key) WHERE idempotency_key <> ''")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS branches_port_unique ON branches(port)")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS replicas_port_unique ON replicas(port)")
@@ -558,6 +565,19 @@ class NodeAgent:
             ])
             return {"status": "ready"}
         if operation == "prepare_primary":
+            if psycopg is None:
+                raise RuntimeError("psycopg is required for replication setup")
+            config_text = (Path(payload["path"]) / "postgresql.conf").read_text()
+            listen_setting = re.search(
+                r"^\s*listen_addresses\s*=\s*'([^']*)'",
+                config_text,
+                re.MULTILINE,
+            )
+            requires_restart = (
+                listen_setting is not None
+                and listen_setting.group(1) != node_address(payload["host_id"])
+            )
+            was_running = alive(payload.get("pid"))
             _rewrite_postgres_config(
                 Path(payload["path"]),
                 int(payload["port"]),
@@ -583,12 +603,28 @@ class NodeAgent:
                 dbname="postgres",
                 connect_timeout=5,
             ) as connection:
-                connection.execute(
-                    psycopg_sql.SQL("CREATE ROLE {} WITH REPLICATION LOGIN PASSWORD {}").format(
-                        psycopg_sql.Identifier(payload["replication_user"]),
-                        psycopg_sql.Literal(payload["replication_password"]),
+                role = connection.execute(
+                    "SELECT 1 FROM pg_roles WHERE rolname=%s",
+                    (payload["replication_user"],),
+                ).fetchone()
+                if role:
+                    connection.execute(
+                        psycopg_sql.SQL(
+                            "ALTER ROLE {} WITH REPLICATION LOGIN PASSWORD {}"
+                        ).format(
+                            psycopg_sql.Identifier(payload["replication_user"]),
+                            psycopg_sql.Literal(payload["replication_password"]),
+                        )
                     )
-                )
+                else:
+                    connection.execute(
+                        psycopg_sql.SQL(
+                            "CREATE ROLE {} WITH REPLICATION LOGIN PASSWORD {}"
+                        ).format(
+                            psycopg_sql.Identifier(payload["replication_user"]),
+                            psycopg_sql.Literal(payload["replication_password"]),
+                        )
+                    )
                 for slot in payload["replication_slots"]:
                     connection.execute(
                         "SELECT pg_create_physical_replication_slot(%s) "
@@ -596,8 +632,17 @@ class NodeAgent:
                         (slot, slot),
                     )
                 connection.commit()
+            if requires_restart and was_running:
+                self.run([
+                    pg_bin("pg_ctl"), "-D", payload["path"],
+                    "-m", "fast", "-w", "restart",
+                ])
+            else:
+                self.run([pg_bin("pg_ctl"), "-D", payload["path"], "reload"])
             return result
         if operation == "inspect_replication":
+            if psycopg is None:
+                raise RuntimeError("psycopg is required for replication inspection")
             with psycopg.connect(
                 host=node_address(payload["primary_host_id"]),
                 port=payload["primary_port"],
@@ -680,25 +725,10 @@ def create_replicas(c: Conn, database_id: str, main_row, postgres_password: str)
         return
     replication_user = REPLICATION_USER_PREFIX + database_id.removeprefix("db_")[:24]
     replication_password = secrets.token_urlsafe(24)
-    primary_addresses = [node_address(node_id) for node_id in peers]
     slots = {
         node_id: f"mosaic_{database_id.removeprefix('db_')[:16]}_{node_id}".replace("-", "_")
         for node_id in peers
     }
-    prepared = node_transport.call(main_row["host_id"], "prepare_primary", {
-        "branch_id": main_row["id"],
-        "path": main_row["path"],
-        "port": main_row["port"],
-        "pid": main_row["pid"],
-        "status": main_row["status"],
-        "host_id": main_row["host_id"],
-        "postgres_password": postgres_password,
-        "replication_user": replication_user,
-        "replication_password": replication_password,
-        "replication_addresses": primary_addresses,
-        "replication_slots": list(slots.values()),
-    })
-    c.execute("UPDATE branches SET status=?,pid=? WHERE id=?", (prepared["status"], prepared["pid"], main_row["id"]))
     c.execute(
         "INSERT INTO replication_credentials(database_id,username,credential_encrypted,created_at) VALUES(?,?,?,?)",
         (database_id, replication_user, cipher().encrypt(replication_password.encode()).decode(), now()),
@@ -709,19 +739,86 @@ def create_replicas(c: Conn, database_id: str, main_row, postgres_password: str)
         replica_path = Path(main_row["path"]).parent / "replicas" / node_id
         c.execute(
             "INSERT INTO replicas(id,database_id,primary_branch_id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at,slot_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (replica_id, database_id, main_row["id"], node_id, str(replica_path), replica_port, "building", None, None, now(), slots[node_id]),
+            (replica_id, database_id, main_row["id"], node_id, str(replica_path), replica_port, "pending", None, None, now(), slots[node_id]),
         )
-        node_transport.call(node_id, "build_standby", {
-            "target_path": str(replica_path),
-            "target_port": replica_port,
-            "target_host_id": node_id,
-            "primary_address": node_address(main_row["host_id"]),
-            "primary_port": main_row["port"],
-            "replication_user": replication_user,
+
+
+def _retry_replica(c: Conn, replica, exc: Exception):
+    attempts = int(replica["attempts"]) + 1
+    delay = min(300, 5 * (2 ** min(attempts - 1, 6)))
+    next_attempt = datetime.now(timezone.utc) + timedelta(seconds=delay)
+    c.execute(
+        "UPDATE replicas SET status='retryable',attempts=?,next_attempt_at=?,last_error=? WHERE id=?",
+        (attempts, next_attempt.isoformat(), str(exc)[:500], replica["id"]),
+    )
+
+
+def reconcile_replicas(c: Conn):
+    rows = c.execute(
+        "SELECT r.*, b.id AS branch_id, b.path AS primary_path, b.port AS primary_port, "
+        "b.pid AS primary_pid, b.status AS primary_status, b.host_id AS primary_host_id, "
+        "b.credential_encrypted, rc.username, rc.credential_encrypted AS replication_credential "
+        "FROM replicas r JOIN branches b ON b.id=r.primary_branch_id "
+        "JOIN replication_credentials rc ON rc.database_id=r.database_id "
+        "WHERE r.status IN ('pending','retryable')"
+    ).fetchall()
+    due = []
+    for row in rows:
+        if row["next_attempt_at"]:
+            if datetime.fromisoformat(row["next_attempt_at"]) > datetime.now(timezone.utc):
+                continue
+        due.append(row)
+    if not due:
+        return
+    primary = due[0]
+    all_replicas = c.execute(
+        "SELECT host_id,slot_name FROM replicas WHERE database_id=?",
+        (primary["database_id"],),
+    ).fetchall()
+    try:
+        postgres_password = cipher().decrypt(primary["credential_encrypted"].encode()).decode()
+        replication_password = cipher().decrypt(primary["replication_credential"].encode()).decode()
+        prepared = node_transport.call(primary["primary_host_id"], "prepare_primary", {
+            "branch_id": primary["branch_id"],
+            "path": primary["primary_path"],
+            "port": primary["primary_port"],
+            "pid": primary["primary_pid"],
+            "status": primary["primary_status"],
+            "host_id": primary["primary_host_id"],
+            "postgres_password": postgres_password,
+            "replication_user": primary["username"],
             "replication_password": replication_password,
-            "replication_slot": slots[node_id],
+            "replication_addresses": [node_address(row["host_id"]) for row in all_replicas],
+            "replication_slots": [row["slot_name"] for row in all_replicas],
         })
-        c.execute("UPDATE replicas SET status='ready' WHERE id=?", (replica_id,))
+        c.execute(
+            "UPDATE branches SET status=?,pid=? WHERE id=?",
+            (prepared["status"], prepared["pid"], primary["branch_id"]),
+        )
+    except (InvalidToken, RuntimeError) as exc:
+        for row in due:
+            _retry_replica(c, row, exc)
+        c.commit()
+        return
+    for replica in due:
+        try:
+            node_transport.call(replica["host_id"], "build_standby", {
+                "target_path": replica["path"],
+                "target_port": replica["port"],
+                "target_host_id": replica["host_id"],
+                "primary_address": node_address(replica["primary_host_id"]),
+                "primary_port": replica["primary_port"],
+                "replication_user": primary["username"],
+                "replication_password": replication_password,
+                "replication_slot": replica["slot_name"],
+            })
+            c.execute(
+                "UPDATE replicas SET status='ready',next_attempt_at=NULL,last_error=NULL WHERE id=?",
+                (replica["id"],),
+            )
+        except (RuntimeError, OSError) as exc:
+            _retry_replica(c, replica, exc)
+    c.commit()
 
 
 def refresh_replica_lag(c: Conn, database_id: str):
@@ -734,7 +831,7 @@ def refresh_replica_lag(c: Conn, database_id: str):
         (database_id,),
     ).fetchone()
     if not main_row or not credential:
-        return
+        return {"error": "replication lag sampling unavailable"}
     try:
         postgres_password = cipher().decrypt(main_row["credential_encrypted"].encode()).decode()
         sampled = node_transport.call(main_row["host_id"], "inspect_replication", {
@@ -743,7 +840,7 @@ def refresh_replica_lag(c: Conn, database_id: str):
             "postgres_password": postgres_password,
         })
     except (InvalidToken, RuntimeError):
-        return
+        return {"error": "replication lag sampling failed"}
     by_address = {node_address(row["host_id"]): row for row in c.execute(
         "SELECT host_id FROM replicas WHERE database_id=?", (database_id,)
     ).fetchall()}
@@ -762,6 +859,7 @@ def refresh_replica_lag(c: Conn, database_id: str):
             (database_id, *sampled["invalid_slots"]),
         )
     c.commit()
+    return {"sampled_at": sampled["sampled_at"]}
 
 
 supervisor = Supervisor()
@@ -769,6 +867,7 @@ node_agent = NodeAgent()
 node_transport = NodeTransport(node_agent)
 app = FastAPI(title="Mosaic Database", version="0.1.0")
 _reaper_task: asyncio.Task | None = None
+_replication_task: asyncio.Task | None = None
 _branch_mutation_lock = threading.Lock()
 
 
@@ -789,6 +888,16 @@ async def _reaper_loop():
             logger.exception("branch reaper iteration failed")
 
 
+async def _replication_loop():
+    while True:
+        await asyncio.sleep(max(1, int(os.getenv("MOSAIC_REPLICATION_RETRY_INTERVAL", "10"))))
+        c = db()
+        try:
+            reconcile_replicas(c)
+        finally:
+            c.close()
+
+
 def reap_branches(c: Conn) -> int:
     cutoff = time.time() - int(os.getenv("MOSAIC_BRANCH_IDLE_SECONDS", str(IDLE_REAPER_SECONDS)))
     count = 0
@@ -806,7 +915,7 @@ def reap_branches(c: Conn) -> int:
 
 @app.on_event("startup")
 async def startup():
-    global _reaper_task
+    global _reaper_task, _replication_task
     if not CREDENTIAL_ENCRYPTION_KEY:
         if os.getenv("MOSAIC_ALLOW_EPHEMERAL_CREDENTIAL_KEY", "").lower() == "true":
             key_path = BRANCH_ROOT / ".credential.key"
@@ -826,18 +935,21 @@ async def startup():
     finally:
         c.close()
     _reaper_task = asyncio.create_task(_reaper_loop())
+    _replication_task = asyncio.create_task(_replication_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    global _reaper_task
-    if _reaper_task:
-        _reaper_task.cancel()
-        try:
-            await _reaper_task
-        except asyncio.CancelledError:
-            pass
-        _reaper_task = None
+    global _reaper_task, _replication_task
+    for task_name in ("_reaper_task", "_replication_task"):
+        task = globals()[task_name]
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            globals()[task_name] = None
 
 
 @app.middleware("http")
@@ -1150,13 +1262,18 @@ def replicas_get(tid: str, did: str, tenant=Depends(tenant_auth)):
     c = db()
     try:
         database(c, tid, did)
-        refresh_replica_lag(c, did)
+        sampling = refresh_replica_lag(c, did)
         rows = c.execute(
             "SELECT id,host_id,path,port,status,lag_bytes,lag_sampled_at,created_at "
             "FROM replicas WHERE database_id=? ORDER BY host_id",
             (did,),
         ).fetchall()
-        return {"replicas": [dict(row) for row in rows], "lag_unit": "bytes behind primary WAL replay position"}
+        return {
+            "replicas": [dict(row) for row in rows],
+            "lag_unit": "bytes behind primary WAL replay position",
+            "lag_sample_error": sampling.get("error"),
+            "lag_sampled_at": sampling.get("sampled_at"),
+        }
     finally:
         c.close()
 
