@@ -3234,3 +3234,135 @@ def test_query_routes_to_non_local_branch(client, monkeypatch):
     )
     assert response.status_code == 200
     assert seen == ["10.0.0.2"]
+
+
+def _query_database(client, monkeypatch):
+    created = tenant(client)
+    database = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases",
+        headers={"X-API-Key": created["api_key"]},
+        json={"name": "query-errors"},
+    ).json()
+
+    class FakeTransport:
+        def call(self, *args, **kwargs):
+            return {"status": "running", "pid": 1234}
+
+    monkeypatch.setattr(main, "node_transport", FakeTransport())
+    return created, database
+
+
+def test_query_rejected_statement_returns_redacted_diagnostic(client, monkeypatch):
+    created, database = _query_database(client, monkeypatch)
+    c = main.db()
+    try:
+        row = c.execute(
+            "SELECT path,credential_encrypted FROM branches WHERE database_id=?",
+            (database["id"],),
+        ).fetchone()
+        path = str(row["path"])
+        secret = main.cipher().decrypt(row["credential_encrypted"].encode()).decode()
+    finally:
+        c.close()
+
+    class Diag:
+        message_primary = 'relation "t" does not exist'
+        message_detail = f"detail path={path} password={secret}"
+        message_hint = "Check the relation name."
+        statement_position = "23"
+
+    class StatementError(Exception):
+        diag = Diag()
+
+    class Errors:
+        ProgrammingError = StatementError
+
+    class Connection:
+        def execute(self, sql, params=()):
+            if sql.startswith("SET statement_timeout"):
+                return self
+            raise StatementError("relation does not exist")
+
+        def close(self):
+            return None
+
+    class FakePsycopg:
+        errors = Errors()
+
+        def connect(self, **kwargs):
+            return Connection()
+
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    response = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/query",
+        headers={"X-API-Key": created["api_key"]},
+        json={"sql": "SELECT count(*) FROM t"},
+    )
+    assert response.status_code == 400
+    assert "relation" in response.json()["detail"]
+    assert "position 23" in response.json()["detail"]
+    assert path not in response.text
+    assert secret not in response.text
+
+
+def test_query_connection_failure_remains_redacted_503(client, monkeypatch):
+    created, database = _query_database(client, monkeypatch)
+
+    class OperationalFailure(Exception):
+        pass
+
+    class FakePsycopg:
+        OperationalError = OperationalFailure
+
+        def connect(self, **kwargs):
+            raise self.OperationalError("connection failed at /internal/host:55432")
+
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    response = client.post(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/query",
+        headers={"X-API-Key": created["api_key"]},
+        json={"sql": "SELECT 1"},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "database unavailable"
+    assert "connection failed" not in response.text
+    assert "55432" not in response.text
+
+
+def test_schema_uses_statement_error_handling(client, monkeypatch):
+    created, database = _query_database(client, monkeypatch)
+
+    class StatementError(Exception):
+        class Diag:
+            message_primary = "schema query rejected"
+            message_detail = None
+            message_hint = None
+            statement_position = None
+
+        diag = Diag()
+
+    class Errors:
+        ProgrammingError = StatementError
+
+    class Connection:
+        def execute(self, sql, params=()):
+            if sql.startswith("SET statement_timeout"):
+                return self
+            raise StatementError("schema query rejected")
+
+        def close(self):
+            return None
+
+    class FakePsycopg:
+        errors = Errors()
+
+        def connect(self, **kwargs):
+            return Connection()
+
+    monkeypatch.setattr(main, "psycopg", FakePsycopg())
+    response = client.get(
+        f"/v1/tenants/{created['tenant_id']}/databases/{database['id']}/schema",
+        headers={"X-API-Key": created["api_key"]},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "schema query rejected"

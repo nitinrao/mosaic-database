@@ -1294,6 +1294,35 @@ def redact_error(error: str, sensitive: tuple[str, ...] = ()) -> str:
     return error
 
 
+def _is_psycopg_error(exc: Exception, *names: str) -> bool:
+    if psycopg is None:
+        return False
+    classes = []
+    errors = getattr(psycopg, "errors", None)
+    for name in names:
+        candidate = getattr(errors, name, None) if errors else None
+        candidate = candidate or getattr(psycopg, name, None)
+        if isinstance(candidate, type):
+            classes.append(candidate)
+    return bool(classes) and isinstance(exc, tuple(classes))
+
+
+def _statement_error_detail(exc: Exception, sensitive: tuple[str, ...] = ()) -> str:
+    diagnostic = getattr(exc, "diag", None)
+    values = []
+    for name in ("message_primary", "message_hint"):
+        value = getattr(diagnostic, name, None) if diagnostic else None
+        if value:
+            values.append(str(value))
+    position = getattr(diagnostic, "statement_position", None) if diagnostic else None
+    if position:
+        values.append(f"position {position}")
+    if not values:
+        values.append(str(exc).splitlines()[0])
+    message = " ".join(" ".join(value.split()) for value in values)
+    return redact_error(message, sensitive)[:500]
+
+
 def _command_error_detail(exc: Exception) -> str:
     parts = [str(part).strip() for part in (
         getattr(exc, "stderr", None),
@@ -2572,16 +2601,39 @@ def execute_query(tid: str, did: str, payload: Query, tenant):
             password = cipher().decrypt(row["credential_encrypted"].encode()).decode()
         except InvalidToken as exc:
             raise HTTPException(503, "branch credentials cannot be decrypted") from exc
-        conn = psycopg.connect(host=node_address(row["host_id"]), port=row["port"], user="postgres", password=password, dbname="postgres", connect_timeout=5)
         try:
-            conn.execute(f"SET statement_timeout = {PLANS[tenant['plan']]['statement_timeout_ms']}")
-            cur = conn.execute(payload.sql, payload.params)
-            max_rows = PLANS[tenant["plan"]]["max_rows"]
-            rows = cur.fetchmany(max_rows + 1) if cur.description else []
-            if len(rows) > max_rows:
-                raise HTTPException(413, "row limit exceeded")
-            result = {"rows": [list(x) for x in rows], "columns": [x.name for x in (cur.description or [])], "row_count": len(rows)}
-            conn.commit()
+            conn = psycopg.connect(host=node_address(row["host_id"]), port=row["port"], user="postgres", password=password, dbname="postgres", connect_timeout=5)
+        except Exception as exc:
+            if _is_psycopg_error(exc, "OperationalError", "InterfaceError", "InternalError"):
+                raise HTTPException(503, "database unavailable") from exc
+            raise
+        try:
+            try:
+                conn.execute(f"SET statement_timeout = {PLANS[tenant['plan']]['statement_timeout_ms']}")
+                try:
+                    cur = conn.execute(payload.sql, payload.params)
+                except Exception as exc:
+                    if _is_psycopg_error(exc, "DataError", "IntegrityError", "ProgrammingError", "NotSupportedError"):
+                        sensitive = (
+                            password,
+                            str(row["path"]),
+                            node_address(row["host_id"]),
+                            str(row["port"]),
+                        )
+                        raise HTTPException(400, _statement_error_detail(exc, sensitive)) from exc
+                    raise
+                max_rows = PLANS[tenant["plan"]]["max_rows"]
+                rows = cur.fetchmany(max_rows + 1) if cur.description else []
+                if len(rows) > max_rows:
+                    raise HTTPException(413, "row limit exceeded")
+                result = {"rows": [list(x) for x in rows], "columns": [x.name for x in (cur.description or [])], "row_count": len(rows)}
+                conn.commit()
+            except HTTPException:
+                raise
+            except Exception as exc:
+                if _is_psycopg_error(exc, "OperationalError", "InterfaceError", "InternalError"):
+                    raise HTTPException(503, "database unavailable") from exc
+                raise
         finally:
             conn.close()
         c.execute("UPDATE branches SET last_query_at=? WHERE id=?", (now(), row["id"]))
