@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -45,6 +46,9 @@ BRANCH_ENGINE_NAME = os.getenv("MOSAIC_BRANCH_ENGINE", "copy")
 IDLE_REAPER_SECONDS = int(os.getenv("MOSAIC_BRANCH_IDLE_SECONDS", "900"))
 PORT_MIN = int(os.getenv("MOSAIC_POSTGRES_PORT_MIN", "55432"))
 RATE_LIMIT_REQUESTS = int(os.getenv("MOSAIC_RATE_LIMIT_REQUESTS", "120"))
+PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS = int(os.getenv("MOSAIC_PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS", "5"))
+PUBLIC_LISTENER = os.getenv("MOSAIC_PUBLIC_LISTENER", "").lower() == "true"
+TRUST_CLOUDFLARE_IP = os.getenv("MOSAIC_TRUST_CLOUDFLARE_IP", "").lower() == "true"
 NODE_ID = os.getenv("MOSAIC_NODE_ID", "local")
 PROMOTION_MAX_LAG_BYTES = int(os.getenv("MOSAIC_PROMOTION_MAX_LAG_BYTES", str(10 * 1024 * 1024 * 1024)))
 PROMOTION_MAX_LAG_AGE_SECONDS = int(os.getenv("MOSAIC_PROMOTION_MAX_LAG_AGE_SECONDS", "300"))
@@ -63,6 +67,10 @@ MCP_TOOLS = [{"name": n, "description": d, "inputSchema": {"type": "object"}} fo
     ("inspect_schema", "Inspect branch schema"), ("query", "Execute one governed statement"),
     ("create_branch", "Create a branch"), ("list_branches", "List branches"))]
 _rate: dict[str, list[float]] = {}
+_rate_lock = threading.Lock()
+_rate_last_sweep = 0.0
+RATE_LIMIT_SWEEP_THRESHOLD = 256
+RATE_LIMIT_SWEEP_INTERVAL_SECONDS = 60.0
 logger = logging.getLogger(__name__)
 
 
@@ -1627,11 +1635,45 @@ def tenant_auth(tid: str, x_api_key: str | None = Header(default=None, alias="X-
         c.close()
 
 
-def check_rate_limit(tid: str):
-    values = [x for x in _rate.get(tid, []) if x > time.time() - 60]
-    if len(values) >= RATE_LIMIT_REQUESTS:
-        raise HTTPException(429, "rate limit exceeded")
-    _rate[tid] = values + [time.time()]
+def check_rate_limit(tid: str, limit: int | None = None):
+    global _rate_last_sweep
+    limit = RATE_LIMIT_REQUESTS if limit is None else limit
+    current = time.time()
+    with _rate_lock:
+        if (
+            len(_rate) >= RATE_LIMIT_SWEEP_THRESHOLD
+            and current - _rate_last_sweep >= RATE_LIMIT_SWEEP_INTERVAL_SECONDS
+        ):
+            cutoff = current - 60
+            for key, timestamps in list(_rate.items()):
+                if not any(timestamp > cutoff for timestamp in timestamps):
+                    _rate.pop(key, None)
+            _rate_last_sweep = current
+        values = [x for x in _rate.get(tid, []) if x > current - 60]
+        if not values:
+            _rate.pop(tid, None)
+        if len(values) >= limit:
+            raise HTTPException(429, "rate limit exceeded")
+        _rate[tid] = values + [current]
+
+
+def public_signup_client_ip(request: Request) -> str:
+    peer = request.client.host if request.client else "unknown"
+    if TRUST_CLOUDFLARE_IP:
+        try:
+            peer_ip = ipaddress.ip_address(peer)
+        except ValueError:
+            peer_ip = None
+        if peer_ip and (peer_ip.is_loopback or peer_ip.is_private):
+            try:
+                forwarded = ipaddress.ip_address(
+                    request.headers.get("CF-Connecting-IP", "").strip()
+                )
+            except ValueError:
+                forwarded = None
+            if forwarded:
+                return str(forwarded)
+    return peer
 
 
 class TenantCreate(BaseModel):
@@ -1685,6 +1727,8 @@ def require_node_agent_token(token: str | None):
 
 @app.post("/internal/node/{operation}")
 def internal_node(request: Request, operation: str, payload: dict, x_node_token: str | None = Header(default=None, alias="X-Mosaic-Node-Token")):
+    if PUBLIC_LISTENER:
+        raise HTTPException(404, "not found")
     require_node_agent_token(x_node_token)
     allowed = {"127.0.0.1", "::1", *node_private_addresses().values()}
     if not request.client or request.client.host not in allowed:
@@ -1725,11 +1769,13 @@ def mcp_get():
 
 
 @app.post("/mcp")
-def mcp(payload: dict, response: Response, x_api_key: str | None = Header(default=None, alias="X-API-Key"), authorization: str | None = Header(default=None)):
+def mcp(payload: dict, request: Request, response: Response, x_api_key: str | None = Header(default=None, alias="X-API-Key"), authorization: str | None = Header(default=None)):
     if len(json.dumps(payload)) > 1000000:
         raise HTTPException(413, "MCP payload too large")
     response.headers["MCP-Protocol-Version"] = MCP_PROTOCOL_VERSION
     if payload.get("method") == "initialize":
+        client_ip = public_signup_client_ip(request)
+        check_rate_limit(f"public-mcp-ip:{client_ip}", PUBLIC_SIGNUP_RATE_LIMIT_REQUESTS)
         return {"jsonrpc": "2.0", "id": payload.get("id"), "result": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "mosaic-database", "version": "0.1.0"}}}
     key = x_api_key or (authorization or "").removeprefix("Bearer ").strip()
     c = db()
